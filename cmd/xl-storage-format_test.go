@@ -147,7 +147,7 @@ func getSampleXLMeta(totalParts int) xlMetaV1Object {
 
 // Compare the unmarshaled XLMetaV1 with the one obtained from jsoniter parsing.
 func compareXLMetaV1(t *testing.T, unMarshalXLMeta, jsoniterXLMeta xlMetaV1Object) {
-	// Start comparing the fields of xlMetaV1Object obtained from jsoniter parsing with one parsed using json unmarshaling.
+	// Start comparing the fields of xlMetaV1Object obtained from jsoniter parsing with one parsed using json unmarshalling.
 	if unMarshalXLMeta.Version != jsoniterXLMeta.Version {
 		t.Errorf("Expected the Version to be \"%s\", but got \"%s\".", unMarshalXLMeta.Version, jsoniterXLMeta.Version)
 	}
@@ -485,7 +485,7 @@ func BenchmarkXlMetaV2Shallow(b *testing.B) {
 						b.Fatal(err)
 					}
 					// List...
-					_, err = xl.ToFileInfo("volume", "path", ids[rng.Intn(size)], false)
+					_, err = xl.ToFileInfo("volume", "path", ids[rng.Intn(size)], false, true)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -503,7 +503,7 @@ func BenchmarkXlMetaV2Shallow(b *testing.B) {
 						b.Fatal(err)
 					}
 					// List...
-					_, err = xl.ListVersions("volume", "path")
+					_, err = xl.ListVersions("volume", "path", true)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -518,7 +518,7 @@ func BenchmarkXlMetaV2Shallow(b *testing.B) {
 					if buf == nil {
 						b.Fatal("buf == nil")
 					}
-					_, err = buf.ToFileInfo("volume", "path", ids[rng.Intn(size)])
+					_, err = buf.ToFileInfo("volume", "path", ids[rng.Intn(size)], true)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -533,7 +533,7 @@ func BenchmarkXlMetaV2Shallow(b *testing.B) {
 					if buf == nil {
 						b.Fatal("buf == nil")
 					}
-					_, err = buf.ListVersions("volume", "path")
+					_, err = buf.ListVersions("volume", "path", true)
 					if err != nil {
 						b.Fatal(err)
 					}

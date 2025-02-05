@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 )
 
 //go:generate msgp -file=$GOFILE
@@ -90,7 +90,7 @@ func (sm *siteResyncMetrics) init(ctx context.Context) {
 		}
 		duration := time.Duration(r.Float64() * float64(time.Second*10))
 		if duration < time.Second {
-			// Make sure to sleep atleast a second to avoid high CPU ticks.
+			// Make sure to sleep at least a second to avoid high CPU ticks.
 			duration = time.Second
 		}
 		time.Sleep(duration)
@@ -110,7 +110,7 @@ func (sm *siteResyncMetrics) load(ctx context.Context, objAPI ObjectLayer) error
 		return nil
 	}
 	for _, peer := range info.Sites {
-		if peer.DeploymentID == globalDeploymentID {
+		if peer.DeploymentID == globalDeploymentID() {
 			continue
 		}
 		rs, err := loadSiteResyncMetadata(ctx, objAPI, peer.DeploymentID)
@@ -118,11 +118,11 @@ func (sm *siteResyncMetrics) load(ctx context.Context, objAPI ObjectLayer) error
 			return err
 		}
 		sm.Lock()
-		defer sm.Unlock()
 		if _, ok := sm.peerResyncMap[peer.DeploymentID]; !ok {
 			sm.peerResyncMap[peer.DeploymentID] = resyncState{resyncID: rs.ResyncID, LastSaved: time.Time{}}
 			sm.resyncStatus[rs.ResyncID] = rs
 		}
+		sm.Unlock()
 	}
 	return nil
 }
@@ -170,6 +170,7 @@ func (sm *siteResyncMetrics) save(ctx context.Context) {
 		case <-sTimer.C:
 			if globalSiteReplicationSys.isEnabled() {
 				sm.Lock()
+				wg := sync.WaitGroup{}
 				for dID, rs := range sm.peerResyncMap {
 					st, ok := sm.resyncStatus[rs.resyncID]
 					if ok {
@@ -179,9 +180,14 @@ func (sm *siteResyncMetrics) save(ctx context.Context) {
 						}
 						rs.LastSaved = UTCNow()
 						sm.peerResyncMap[dID] = rs
-						go saveSiteResyncMetadata(ctx, st, newObjectLayerFn())
+						wg.Add(1)
+						go func() {
+							defer wg.Done()
+							saveSiteResyncMetadata(ctx, st, newObjectLayerFn())
+						}()
 					}
 				}
+				wg.Wait()
 				sm.Unlock()
 			}
 			sTimer.Reset(siteResyncSaveInterval)
@@ -192,9 +198,9 @@ func (sm *siteResyncMetrics) save(ctx context.Context) {
 }
 
 // update overall site resync state
-func (sm *siteResyncMetrics) updateState(s SiteResyncStatus) {
+func (sm *siteResyncMetrics) updateState(s SiteResyncStatus) error {
 	if !globalSiteReplicationSys.isEnabled() {
-		return
+		return nil
 	}
 	sm.Lock()
 	defer sm.Unlock()
@@ -207,9 +213,12 @@ func (sm *siteResyncMetrics) updateState(s SiteResyncStatus) {
 		if ok {
 			st.LastUpdate = s.LastUpdate
 			st.Status = s.Status
+			return nil
 		}
 		sm.resyncStatus[s.ResyncID] = st
+		return saveSiteResyncMetadata(GlobalContext, st, newObjectLayerFn())
 	}
+	return nil
 }
 
 // increment SyncedBuckets count
@@ -286,22 +295,22 @@ func siteResyncStatus(currSt ResyncStatusType, m map[string]ResyncStatusType) Re
 }
 
 // update resync metrics per object
-func (sm *siteResyncMetrics) updateMetric(roi ReplicateObjectInfo, success bool, resyncID string) {
+func (sm *siteResyncMetrics) updateMetric(r TargetReplicationResyncStatus, resyncID string) {
 	if !globalSiteReplicationSys.isEnabled() {
 		return
 	}
 	sm.Lock()
 	defer sm.Unlock()
 	s := sm.resyncStatus[resyncID]
-	if success {
+	if r.ReplicatedCount > 0 {
 		s.ReplicatedCount++
-		s.ReplicatedSize += roi.Size
+		s.ReplicatedSize += r.ReplicatedSize
 	} else {
 		s.FailedCount++
-		s.FailedSize += roi.Size
+		s.FailedSize += r.FailedSize
 	}
-	s.Bucket = roi.Bucket
-	s.Object = roi.Name
+	s.Bucket = r.Bucket
+	s.Object = r.Object
 	s.LastUpdate = UTCNow()
 	sm.resyncStatus[resyncID] = s
 }

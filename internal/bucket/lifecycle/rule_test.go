@@ -61,6 +61,75 @@ func TestInvalidRules(t *testing.T) {
 	                    </Rule>`,
 			expectedErr: errInvalidRuleStatus,
 		},
+		{ // Rule with negative values for ObjectSizeLessThan
+			inputXML: `<Rule>
+				<ID>negative-obj-size-less-than</ID>
+				<Filter><ObjectSizeLessThan>-1</ObjectSizeLessThan></Filter>
+				<Expiration>
+					<Days>365</Days>
+				</Expiration>
+                            <Status>Enabled</Status>
+	                    </Rule>`,
+			expectedErr: errXMLNotWellFormed,
+		},
+		{ // Rule with negative values for And>ObjectSizeLessThan
+			inputXML: `<Rule>
+				<ID>negative-and-obj-size-less-than</ID>
+				<Filter><And><ObjectSizeLessThan>-1</ObjectSizeLessThan></And></Filter>
+				<Expiration>
+					<Days>365</Days>
+				</Expiration>
+                            <Status>Enabled</Status>
+	                    </Rule>`,
+			expectedErr: errXMLNotWellFormed,
+		},
+		{ // Rule with negative values for ObjectSizeGreaterThan
+			inputXML: `<Rule>
+				<ID>negative-obj-size-greater-than</ID>
+				<Filter><ObjectSizeGreaterThan>-1</ObjectSizeGreaterThan></Filter>
+				<Expiration>
+					<Days>365</Days>
+				</Expiration>
+                            <Status>Enabled</Status>
+	                    </Rule>`,
+			expectedErr: errXMLNotWellFormed,
+		},
+		{ // Rule with negative values for And>ObjectSizeGreaterThan
+			inputXML: `<Rule>
+				<ID>negative-and-obj-size-greater-than</ID>
+				<Filter><And><ObjectSizeGreaterThan>-1</ObjectSizeGreaterThan></And></Filter>
+				<Expiration>
+					<Days>365</Days>
+				</Expiration>
+                            <Status>Enabled</Status>
+	                    </Rule>`,
+			expectedErr: errXMLNotWellFormed,
+		},
+		{
+			inputXML: `<Rule>
+				<ID>Rule with a tag and DelMarkerExpiration</ID>
+				<Filter><Tag><Key>k1</Key><Value>v1</Value></Tag></Filter>
+				<DelMarkerExpiration>
+					<Days>365</Days>
+				</DelMarkerExpiration>
+                            <Status>Enabled</Status>
+	                    </Rule>`,
+			expectedErr: errInvalidRuleDelMarkerExpiration,
+		},
+		{
+			inputXML: `<Rule>
+				<ID>Rule with multiple tags and DelMarkerExpiration</ID>
+				<Filter><And>
+				<Tag><Key>k1</Key><Value>v1</Value></Tag>
+				<Tag><Key>k2</Key><Value>v2</Value></Tag>
+				</And></Filter>
+				<DelMarkerExpiration>
+					<Days>365</Days>
+				</DelMarkerExpiration>
+                            <Status>Enabled</Status>
+	                    </Rule>`,
+			expectedErr: errInvalidRuleDelMarkerExpiration,
+		},
 	}
 
 	for i, tc := range invalidTestCases {

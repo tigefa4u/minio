@@ -26,20 +26,22 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/compress/zstd"
 	gzip "github.com/klauspost/pgzip"
+	"github.com/minio/minio/internal/config"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/s3select/csv"
 	"github.com/minio/minio/internal/s3select/json"
 	"github.com/minio/minio/internal/s3select/parquet"
 	"github.com/minio/minio/internal/s3select/simdj"
 	"github.com/minio/minio/internal/s3select/sql"
+	"github.com/minio/pkg/v3/env"
 	"github.com/minio/simdjson-go"
-	"github.com/pierrec/lz4"
+	"github.com/pierrec/lz4/v4"
 )
 
 type recordReader interface {
@@ -73,6 +75,12 @@ const (
 	maxRecordSize = 1 << 20 // 1 MiB
 )
 
+var parquetSupport bool
+
+func init() {
+	parquetSupport = env.Get("MINIO_API_SELECT_PARQUET", config.EnableOff) == config.EnableOn
+}
+
 var bufPool = sync.Pool{
 	New: func() interface{} {
 		// make a buffer with a reasonable capacity.
@@ -84,7 +92,7 @@ var bufioWriterPool = sync.Pool{
 	New: func() interface{} {
 		// io.Discard is just used to create the writer. Actual destination
 		// writer is set later by Reset() before using it.
-		return bufio.NewWriter(io.Discard)
+		return bufio.NewWriter(xioutil.Discard)
 	},
 }
 
@@ -401,7 +409,8 @@ func (s3Select *S3Select) Open(rsc io.ReadSeekCloser) error {
 				gzip.ErrHeader, gzip.ErrChecksum,
 				s2.ErrCorrupt, s2.ErrUnsupported, s2.ErrCRC,
 				zstd.ErrBlockTooSmall, zstd.ErrMagicMismatch, zstd.ErrWindowSizeExceeded, zstd.ErrUnknownDictionary, zstd.ErrWindowSizeTooSmall,
-				lz4.ErrInvalid, lz4.ErrBlockDependency,
+				lz4.ErrInvalidFrame, lz4.ErrInvalidBlockChecksum, lz4.ErrInvalidFrameChecksum, lz4.ErrInvalidFrameChecksum,
+				lz4.ErrInvalidHeaderChecksum, lz4.ErrInvalidSourceShortBuffer, lz4.ErrInternalUnhandledState,
 			}
 			for _, e := range errs {
 				if errors.Is(err, e) {
@@ -434,12 +443,13 @@ func (s3Select *S3Select) Open(rsc io.ReadSeekCloser) error {
 				s3Select.recordReader = json.NewPReader(s3Select.progressReader, &s3Select.Input.JSONArgs)
 			}
 		} else {
+			// Document mode.
 			s3Select.recordReader = json.NewReader(s3Select.progressReader, &s3Select.Input.JSONArgs)
 		}
 
 		return nil
 	case parquetFormat:
-		if !strings.EqualFold(os.Getenv("MINIO_API_SELECT_PARQUET"), "on") {
+		if !parquetSupport {
 			return errors.New("parquet format parsing not enabled on server")
 		}
 		if offset != 0 || length != -1 {
@@ -460,7 +470,7 @@ func (s3Select *S3Select) marshal(buf *bytes.Buffer, record sql.Record) error {
 		// Use bufio Writer to prevent csv.Writer from allocating a new buffer.
 		bufioWriter := bufioWriterPool.Get().(*bufio.Writer)
 		defer func() {
-			bufioWriter.Reset(io.Discard)
+			bufioWriter.Reset(xioutil.Discard)
 			bufioWriterPool.Put(bufioWriter)
 		}()
 
@@ -698,6 +708,11 @@ type ObjectReadSeekCloser struct {
 	size   int64 // actual object size regardless of compression/encryption
 	offset int64
 	reader io.ReadCloser
+
+	// reader can be closed idempotently multiple times
+	closerOnce sync.Once
+	// Error storing reader.Close()
+	closerErr error
 }
 
 // NewObjectReadSeekCloser creates a new ObjectReadSeekCloser.
@@ -749,12 +764,11 @@ func (rsc *ObjectReadSeekCloser) Read(p []byte) (n int, err error) {
 // object for reading and a subsequent Close call is required to ensure
 // resources are freed.
 func (rsc *ObjectReadSeekCloser) Close() error {
-	if rsc.reader != nil {
-		err := rsc.reader.Close()
-		if err == nil {
+	rsc.closerOnce.Do(func() {
+		if rsc.reader != nil {
+			rsc.closerErr = rsc.reader.Close()
 			rsc.reader = nil
 		}
-		return err
-	}
-	return nil
+	})
+	return rsc.closerErr
 }

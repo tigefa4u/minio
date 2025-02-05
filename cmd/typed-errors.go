@@ -30,9 +30,6 @@ var errMethodNotAllowed = errors.New("Method not allowed")
 // errSignatureMismatch means signature did not match.
 var errSignatureMismatch = errors.New("Signature does not match")
 
-// used when we deal with data larger than expected
-var errSizeUnexpected = errors.New("Data size larger than expected")
-
 // When upload object size is greater than 5G in a single PUT/POST operation.
 var errDataTooLarge = errors.New("Object size larger than allowed limit")
 
@@ -68,6 +65,10 @@ var errInvalidDecompressedSize = errors.New("Invalid Decompressed Size")
 // error returned in IAM subsystem when user doesn't exist.
 var errNoSuchUser = errors.New("Specified user does not exist")
 
+// error returned by IAM when a use a builtin IDP command when they could mean
+// to use a LDAP command.
+var errNoSuchUserLDAPWarn = errors.New("Specified user does not exist. If you meant a user in LDAP please use command under `mc idp ldap`")
+
 // error returned when service account is not found
 var errNoSuchServiceAccount = errors.New("Specified service account does not exist")
 
@@ -88,6 +89,9 @@ var errNoPolicyToAttachOrDetach = errors.New("Specified policy update has no net
 // deleted.
 var errGroupNotEmpty = errors.New("Specified group is not empty - cannot remove it")
 
+// error returned in IAM subsystem when a group is disabled
+var errGroupDisabled = errors.New("Specified group is disabled")
+
 // error returned in IAM subsystem when policy doesn't exist.
 var errNoSuchPolicy = errors.New("Specified canned policy does not exist")
 
@@ -95,20 +99,32 @@ var errNoSuchPolicy = errors.New("Specified canned policy does not exist")
 var errPolicyInUse = errors.New("Specified policy is in use and cannot be deleted.")
 
 // error returned when more than a single policy is specified when only one is
-// expectd.
+// expected.
 var errTooManyPolicies = errors.New("Only a single policy may be specified here.")
 
 // error returned in IAM subsystem when an external users systems is configured.
 var errIAMActionNotAllowed = errors.New("Specified IAM action is not allowed")
 
 // error returned in IAM service account
-var errIAMServiceAccount = errors.New("Specified service account cannot be updated in this API call")
-
-// error returned in IAM service account is already used.
-var errIAMServiceAccountUsed = errors.New("Specified service account is used by another user")
+var errIAMServiceAccountNotAllowed = errors.New("Specified service account action is not allowed")
 
 // error returned in IAM subsystem when IAM sub-system is still being initialized.
 var errIAMNotInitialized = errors.New("IAM sub-system is being initialized, please try again")
 
 // error returned when upload id not found
 var errUploadIDNotFound = errors.New("Specified Upload ID is not found")
+
+// error returned when PartNumber is greater than the maximum allowed 10000 parts
+var errInvalidMaxParts = errors.New("Part number is greater than the maximum allowed 10000 parts")
+
+// error returned for session policies > 2048
+var errSessionPolicyTooLarge = errors.New("Session policy should not exceed 2048 characters")
+
+// error returned in SFTP when user used public key without certificate
+var errSftpPublicKeyWithoutCert = errors.New("public key authentication without certificate is not accepted")
+
+// error returned in SFTP when user used certificate which does not contain principal(s)
+var errSftpCertWithoutPrincipals = errors.New("certificates without principal(s) are not accepted")
+
+// error returned when group name contains reserved characters
+var errGroupNameContainsReservedChars = errors.New("Group name contains reserved characters '=' or ','")

@@ -20,11 +20,12 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 
-	"github.com/minio/minio/internal/logger"
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
 // Reads in parallel from readers.
@@ -37,6 +38,7 @@ type parallelReader struct {
 	shardFileSize int64
 	buf           [][]byte
 	readerToBuf   []int
+	stashBuffer   []byte
 }
 
 // newParallelReader returns parallelReader.
@@ -45,6 +47,21 @@ func newParallelReader(readers []io.ReaderAt, e Erasure, offset, totalLength int
 	for i := range r2b {
 		r2b[i] = i
 	}
+	bufs := make([][]byte, len(readers))
+	shardSize := int(e.ShardSize())
+	var b []byte
+
+	// We should always have enough capacity, but older objects may be bigger
+	// we do not need stashbuffer for them.
+	if globalBytePoolCap.Load().WidthCap() >= len(readers)*shardSize {
+		// Fill buffers
+		b = globalBytePoolCap.Load().Get()
+		// Seed the buffers.
+		for i := range bufs {
+			bufs[i] = b[i*shardSize : (i+1)*shardSize]
+		}
+	}
+
 	return &parallelReader{
 		readers:       readers,
 		orgReaders:    readers,
@@ -54,6 +71,15 @@ func newParallelReader(readers []io.ReaderAt, e Erasure, offset, totalLength int
 		shardFileSize: e.ShardFileSize(totalLength),
 		buf:           make([][]byte, len(readers)),
 		readerToBuf:   r2b,
+		stashBuffer:   b,
+	}
+}
+
+// Done will release any resources used by the parallelReader.
+func (p *parallelReader) Done() {
+	if p.stashBuffer != nil {
+		globalBytePoolCap.Load().Put(p.stashBuffer)
+		p.stashBuffer = nil
 	}
 }
 
@@ -117,13 +143,14 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 	}
 
 	readTriggerCh := make(chan bool, len(p.readers))
-	defer close(readTriggerCh) // close the channel upon return
+	defer xioutil.SafeClose(readTriggerCh) // close the channel upon return
 
 	for i := 0; i < p.dataBlocks; i++ {
 		// Setup read triggers for p.dataBlocks number of reads so that it reads in parallel.
 		readTriggerCh <- true
 	}
 
+	disksNotFound := int32(0)
 	bitrotHeal := int32(0)       // Atomic bool flag.
 	missingPartsHeal := int32(0) // Atomic bool flag.
 	readerIndex := 0
@@ -156,7 +183,7 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 			bufIdx := p.readerToBuf[i]
 			if p.buf[bufIdx] == nil {
 				// Reading first time on this disk, hence the buffer needs to be allocated.
-				// Subsequent reads will re-use this buffer.
+				// Subsequent reads will reuse this buffer.
 				p.buf[bufIdx] = make([]byte, p.shardSize)
 			}
 			// For the last shard, the shardsize might be less than previous shard sizes.
@@ -164,14 +191,20 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 			p.buf[bufIdx] = p.buf[bufIdx][:p.shardSize]
 			n, err := rr.ReadAt(p.buf[bufIdx], p.offset)
 			if err != nil {
-				if errors.Is(err, errFileNotFound) {
+				switch {
+				case errors.Is(err, errFileNotFound):
 					atomic.StoreInt32(&missingPartsHeal, 1)
-				} else if errors.Is(err, errFileCorrupt) {
+				case errors.Is(err, errFileCorrupt):
 					atomic.StoreInt32(&bitrotHeal, 1)
+				case errors.Is(err, errDiskNotFound):
+					atomic.AddInt32(&disksNotFound, 1)
 				}
 
 				// This will be communicated upstream.
 				p.orgReaders[bufIdx] = nil
+				if br, ok := p.readers[i].(io.Closer); ok {
+					br.Close()
+				}
 				p.readers[i] = nil
 
 				// Since ReadAt returned error, trigger another read.
@@ -189,27 +222,25 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 	wg.Wait()
 	if p.canDecode(newBuf) {
 		p.offset += p.shardSize
-		if atomic.LoadInt32(&missingPartsHeal) == 1 {
+		if missingPartsHeal == 1 {
 			return newBuf, errFileNotFound
-		} else if atomic.LoadInt32(&bitrotHeal) == 1 {
+		} else if bitrotHeal == 1 {
 			return newBuf, errFileCorrupt
 		}
 		return newBuf, nil
 	}
 
 	// If we cannot decode, just return read quorum error.
-	return nil, errErasureReadQuorum
+	return nil, fmt.Errorf("%w (offline-disks=%d/%d)", errErasureReadQuorum, disksNotFound, len(p.readers))
 }
 
 // Decode reads from readers, reconstructs data if needed and writes the data to the writer.
 // A set of preferred drives can be supplied. In that case they will be used and the data reconstructed.
 func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.ReaderAt, offset, length, totalLength int64, prefer []bool) (written int64, derr error) {
 	if offset < 0 || length < 0 {
-		logger.LogIf(ctx, errInvalidArgument)
 		return -1, errInvalidArgument
 	}
 	if offset+length > totalLength {
-		logger.LogIf(ctx, errInvalidArgument)
 		return -1, errInvalidArgument
 	}
 
@@ -221,6 +252,7 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 	if len(prefer) == len(readers) {
 		reader.preferReaders(prefer)
 	}
+	defer reader.Done()
 
 	startBlock := offset / e.blockSize
 	endBlock := (offset + length) / e.blockSize
@@ -263,7 +295,6 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 		}
 
 		if err = e.DecodeDataBlocks(bufs); err != nil {
-			logger.LogIf(ctx, err)
 			return -1, err
 		}
 
@@ -276,7 +307,6 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 	}
 
 	if bytesWritten != length {
-		logger.LogIf(ctx, errLessData)
 		return bytesWritten, errLessData
 	}
 
@@ -284,12 +314,16 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 }
 
 // Heal reads from readers, reconstruct shards and writes the data to the writers.
-func (e Erasure) Heal(ctx context.Context, writers []io.Writer, readers []io.ReaderAt, totalLength int64) (derr error) {
+func (e Erasure) Heal(ctx context.Context, writers []io.Writer, readers []io.ReaderAt, totalLength int64, prefer []bool) (derr error) {
 	if len(writers) != e.parityBlocks+e.dataBlocks {
 		return errInvalidArgument
 	}
 
 	reader := newParallelReader(readers, e, 0, totalLength)
+	if len(readers) == len(prefer) {
+		reader.preferReaders(prefer)
+	}
+	defer reader.Done()
 
 	startBlock := int64(0)
 	endBlock := totalLength / e.blockSize
@@ -312,18 +346,16 @@ func (e Erasure) Heal(ctx context.Context, writers []io.Writer, readers []io.Rea
 		}
 
 		if err = e.DecodeDataAndParityBlocks(ctx, bufs); err != nil {
-			logger.LogIf(ctx, err)
 			return err
 		}
 
-		w := parallelWriter{
+		w := multiWriter{
 			writers:     writers,
 			writeQuorum: 1,
 			errs:        make([]error, len(writers)),
 		}
 
 		if err = w.Write(ctx, bufs); err != nil {
-			logger.LogIf(ctx, err)
 			return err
 		}
 	}

@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -26,7 +26,9 @@ import (
 	"time"
 
 	"github.com/minio/dperf/pkg/dperf"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/auth"
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
 const speedTest = "speedtest"
@@ -39,13 +41,16 @@ type speedTestOpts struct {
 	autotune         bool
 	storageClass     string
 	bucketName       string
+	enableSha256     bool
+	enableMultipart  bool
+	creds            auth.Credentials
 }
 
 // Get the max throughput and iops numbers.
 func objectSpeedTest(ctx context.Context, opts speedTestOpts) chan madmin.SpeedTestResult {
 	ch := make(chan madmin.SpeedTestResult, 1)
 	go func() {
-		defer close(ch)
+		defer xioutil.SafeClose(ch)
 
 		concurrency := opts.concurrencyStart
 
@@ -105,12 +110,14 @@ func objectSpeedTest(ctx context.Context, opts speedTestOpts) chan madmin.SpeedT
 
 				// if the default concurrency yields zero results, throw an error.
 				if throughputHighestResults[i].Downloads == 0 && opts.concurrencyStart == concurrency {
-					errStr = fmt.Sprintf("no results for downloads upon first attempt, concurrency %d and duration %s", opts.concurrencyStart, opts.duration)
+					errStr = fmt.Sprintf("no results for downloads upon first attempt, concurrency %d and duration %s",
+						opts.concurrencyStart, opts.duration)
 				}
 
 				// if the default concurrency yields zero results, throw an error.
 				if throughputHighestResults[i].Uploads == 0 && opts.concurrencyStart == concurrency {
-					errStr = fmt.Sprintf("no results for uploads upon first attempt, concurrency %d and duration %s", opts.concurrencyStart, opts.duration)
+					errStr = fmt.Sprintf("no results for uploads upon first attempt, concurrency %d and duration %s",
+						opts.concurrencyStart, opts.duration)
 				}
 
 				result.PUTStats.Servers = append(result.PUTStats.Servers, madmin.SpeedTestStatServer{
@@ -158,11 +165,14 @@ func objectSpeedTest(ctx context.Context, opts speedTestOpts) chan madmin.SpeedT
 			}
 
 			sopts := speedTestOpts{
-				objectSize:   opts.objectSize,
-				concurrency:  concurrency,
-				duration:     opts.duration,
-				storageClass: opts.storageClass,
-				bucketName:   opts.bucketName,
+				objectSize:      opts.objectSize,
+				concurrency:     concurrency,
+				duration:        opts.duration,
+				storageClass:    opts.storageClass,
+				bucketName:      opts.bucketName,
+				enableSha256:    opts.enableSha256,
+				enableMultipart: opts.enableMultipart,
+				creds:           opts.creds,
 			}
 
 			results := globalNotificationSys.SpeedTest(ctx, sopts)
@@ -238,9 +248,15 @@ func driveSpeedTest(ctx context.Context, opts madmin.DriveSpeedTestOpts) madmin.
 	}
 
 	localPaths := globalEndpoints.LocalDisksPaths()
+	var ignoredPaths []string
 	paths := func() (tmpPaths []string) {
 		for _, lp := range localPaths {
-			tmpPaths = append(tmpPaths, pathJoin(lp, minioMetaTmpBucket))
+			if _, err := Lstat(pathJoin(lp, minioMetaBucket, formatConfigFile)); err == nil {
+				tmpPaths = append(tmpPaths, pathJoin(lp, minioMetaTmpBucket))
+			} else {
+				// Use dperf on only formatted drives.
+				ignoredPaths = append(ignoredPaths, lp)
+			}
 		}
 		return tmpPaths
 	}()
@@ -273,6 +289,12 @@ func driveSpeedTest(ctx context.Context, opts madmin.DriveSpeedTestOpts) madmin.
 					}(),
 				}
 				results = append(results, result)
+			}
+			for _, inp := range ignoredPaths {
+				results = append(results, madmin.DrivePerf{
+					Path:  inp,
+					Error: errFaultyDisk.Error(),
+				})
 			}
 			return results
 		}(),

@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -60,10 +60,11 @@ const (
 // getCanonicalHeaders generate a list of request headers with their values
 func getCanonicalHeaders(signedHeaders http.Header) string {
 	var headers []string
-	vals := make(http.Header)
+	vals := make(http.Header, len(signedHeaders))
 	for k, vv := range signedHeaders {
-		headers = append(headers, strings.ToLower(k))
-		vals[strings.ToLower(k)] = vv
+		k = strings.ToLower(k)
+		headers = append(headers, k)
+		vals[k] = vv
 	}
 	sort.Strings(headers)
 
@@ -153,7 +154,7 @@ func getSignature(signingKey []byte, stringToSign string) string {
 // Check to see if Policy is signed correctly.
 func doesPolicySignatureMatch(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	// For SignV2 - Signature field will be valid
-	if _, ok := formValues["Signature"]; ok {
+	if _, ok := formValues[xhttp.AmzSignatureV2]; ok {
 		return doesPolicySignatureV2Match(formValues)
 	}
 	return doesPolicySignatureV4Match(formValues)
@@ -174,7 +175,7 @@ func compareSignatureV4(sig1, sig2 string) bool {
 // returns ErrNone if the signature matches.
 func doesPolicySignatureV4Match(formValues http.Header) (auth.Credentials, APIErrorCode) {
 	// Server region.
-	region := globalSite.Region
+	region := globalSite.Region()
 
 	// Parse credential tag.
 	credHeader, s3Err := parseCredentialHeader("Credential="+formValues.Get(xhttp.AmzCredential), region, serviceS3)
@@ -228,6 +229,12 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 		return errCode
 	}
 
+	// Check if the metadata headers are equal with signedheaders
+	errMetaCode := checkMetaHeaders(extractedSignedHeaders, r)
+	if errMetaCode != ErrNone {
+		return errMetaCode
+	}
+
 	// If the host which signed the request is slightly ahead in time (by less than globalMaxSkewTime) the
 	// request should still be allowed.
 	if pSignValues.Date.After(UTCNow().Add(globalMaxSkewTime)) {
@@ -259,7 +266,7 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	// Construct the query.
 	query.Set(xhttp.AmzDate, t.Format(iso8601Format))
 	query.Set(xhttp.AmzExpires, strconv.Itoa(expireSeconds))
-	query.Set(xhttp.AmzSignedHeaders, getSignedHeaders(extractedSignedHeaders))
+	query.Set(xhttp.AmzSignedHeaders, strings.Join(pSignValues.SignedHeaders, ";"))
 	query.Set(xhttp.AmzCredential, cred.AccessKey+SlashSeparator+pSignValues.Credential.getScope())
 
 	defaultSigParams := set.CreateStringSet(
@@ -327,6 +334,9 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	if !compareSignatureV4(req.Form.Get(xhttp.AmzSignature), newSignature) {
 		return ErrSignatureDoesNotMatch
 	}
+
+	r.Header.Set("x-amz-signature-age", strconv.FormatInt(UTCNow().Sub(pSignValues.Date).Milliseconds(), 10))
+
 	return ErrNone
 }
 

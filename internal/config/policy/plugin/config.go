@@ -26,8 +26,8 @@ import (
 
 	"github.com/minio/minio/internal/config"
 	xhttp "github.com/minio/minio/internal/http"
-	iampolicy "github.com/minio/pkg/iam/policy"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // Authorization Plugin config and env variables
@@ -131,7 +131,7 @@ func LookupConfig(s config.Config, httpSettings xhttp.ConnSettings, closeRespFn 
 	getCfg := func(cfgParam string) string {
 		// As parameters are already validated, we skip checking
 		// if the config param was found.
-		val, _ := s.ResolveConfigParam(config.PolicyPluginSubSys, config.Default, cfgParam)
+		val, _, _ := s.ResolveConfigParam(config.PolicyPluginSubSys, config.Default, cfgParam, false)
 		return val
 	}
 
@@ -179,7 +179,7 @@ func New(args Args) *AuthZPlugin {
 }
 
 // IsAllowed - checks given policy args is allowed to continue the REST API.
-func (o *AuthZPlugin) IsAllowed(args iampolicy.Args) (bool, error) {
+func (o *AuthZPlugin) IsAllowed(args policy.Args) (bool, error) {
 	if o == nil {
 		return false, nil
 	}

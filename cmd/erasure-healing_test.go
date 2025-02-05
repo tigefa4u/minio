@@ -32,7 +32,8 @@ import (
 
 	"github.com/dustin/go-humanize"
 	uuid2 "github.com/google/uuid"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/config/storageclass"
 )
 
 // Tests isObjectDangling function
@@ -40,11 +41,15 @@ func TestIsObjectDangling(t *testing.T) {
 	fi := newFileInfo("test-object", 2, 2)
 	fi.Erasure.Index = 1
 
+	ifi := newFileInfo("test-object", 2, 2)
+	ifi.SetInlineData()
+	ifi.Erasure.Index = 1
+
 	testCases := []struct {
 		name             string
 		metaArr          []FileInfo
 		errs             []error
-		dataErrs         []error
+		dataErrs         map[int][]int
 		expectedMeta     FileInfo
 		expectedDangling bool
 	}{
@@ -129,12 +134,70 @@ func TestIsObjectDangling(t *testing.T) {
 			expectedDangling: false,
 		},
 		{
+			name: "FileInfoUnDecided-case4",
+			metaArr: []FileInfo{
+				{},
+				{},
+				{},
+				ifi,
+			},
+			errs: []error{
+				errFileNotFound,
+				errFileCorrupt,
+				errFileCorrupt,
+				nil,
+			},
+			dataErrs:         nil,
+			expectedMeta:     ifi,
+			expectedDangling: false,
+		},
+		{
+			name: "FileInfoUnDecided-case5-(ignore errFileCorrupt error)",
+			metaArr: []FileInfo{
+				{},
+				{},
+				{},
+				fi,
+			},
+			errs: []error{
+				errFileNotFound,
+				errFileCorrupt,
+				nil,
+				nil,
+			},
+			dataErrs: map[int][]int{
+				0: {checkPartFileCorrupt, checkPartFileNotFound, checkPartSuccess, checkPartFileCorrupt},
+			},
+			expectedMeta:     fi,
+			expectedDangling: false,
+		},
+		{
+			name: "FileInfoUnDecided-case6-(data-dir intact)",
+			metaArr: []FileInfo{
+				{},
+				{},
+				{},
+				fi,
+			},
+			errs: []error{
+				errFileNotFound,
+				errFileNotFound,
+				errFileNotFound,
+				nil,
+			},
+			dataErrs: map[int][]int{
+				0: {checkPartFileNotFound, checkPartFileCorrupt, checkPartSuccess, checkPartSuccess},
+			},
+			expectedMeta:     fi,
+			expectedDangling: false,
+		},
+		{
 			name: "FileInfoDecided-case1",
 			metaArr: []FileInfo{
 				{},
 				{},
 				{},
-				fi,
+				ifi,
 			},
 			errs: []error{
 				errFileNotFound,
@@ -143,25 +206,7 @@ func TestIsObjectDangling(t *testing.T) {
 				nil,
 			},
 			dataErrs:         nil,
-			expectedMeta:     fi,
-			expectedDangling: true,
-		},
-		{
-			name: "FileInfoDecided-case2",
-			metaArr: []FileInfo{
-				{},
-				{},
-				{},
-				fi,
-			},
-			errs: []error{
-				errFileNotFound,
-				errFileCorrupt,
-				errFileCorrupt,
-				nil,
-			},
-			dataErrs:         nil,
-			expectedMeta:     fi,
+			expectedMeta:     ifi,
 			expectedDangling: true,
 		},
 		{
@@ -174,8 +219,8 @@ func TestIsObjectDangling(t *testing.T) {
 			},
 			errs: []error{
 				errFileNotFound,
-				errFileCorrupt,
-				errFileCorrupt,
+				errFileNotFound,
+				errFileNotFound,
 				nil,
 			},
 			dataErrs:         nil,
@@ -183,28 +228,71 @@ func TestIsObjectDangling(t *testing.T) {
 			expectedDangling: true,
 		},
 		{
-			name: "FileInfoDecided-case2-(duplicate data errors)",
+			name: "FileInfoDecided-case3-(enough data-dir missing)",
 			metaArr: []FileInfo{
 				{},
 				{},
 				{},
-				{Deleted: true},
+				fi,
 			},
 			errs: []error{
 				errFileNotFound,
-				errFileCorrupt,
-				errFileCorrupt,
-				nil,
-			},
-			dataErrs: []error{
 				errFileNotFound,
-				errFileCorrupt,
 				nil,
 				nil,
 			},
-			expectedMeta:     FileInfo{Deleted: true},
+			dataErrs: map[int][]int{
+				0: {checkPartFileNotFound, checkPartFileNotFound, checkPartSuccess, checkPartFileNotFound},
+			},
+			expectedMeta:     fi,
 			expectedDangling: true,
 		},
+		{
+			name: "FileInfoDecided-case4-(missing data-dir for part 2)",
+			metaArr: []FileInfo{
+				{},
+				{},
+				{},
+				fi,
+			},
+			errs: []error{
+				errFileNotFound,
+				errFileNotFound,
+				nil,
+				nil,
+			},
+			dataErrs: map[int][]int{
+				0: {checkPartSuccess, checkPartSuccess, checkPartSuccess, checkPartSuccess},
+				1: {checkPartSuccess, checkPartFileNotFound, checkPartFileNotFound, checkPartFileNotFound},
+			},
+			expectedMeta:     fi,
+			expectedDangling: true,
+		},
+
+		{
+			name: "FileInfoDecided-case4-(enough data-dir existing for each part)",
+			metaArr: []FileInfo{
+				{},
+				{},
+				{},
+				fi,
+			},
+			errs: []error{
+				errFileNotFound,
+				errFileNotFound,
+				nil,
+				nil,
+			},
+			dataErrs: map[int][]int{
+				0: {checkPartFileNotFound, checkPartSuccess, checkPartSuccess, checkPartSuccess},
+				1: {checkPartSuccess, checkPartFileNotFound, checkPartSuccess, checkPartSuccess},
+				2: {checkPartSuccess, checkPartSuccess, checkPartFileNotFound, checkPartSuccess},
+				3: {checkPartSuccess, checkPartSuccess, checkPartSuccess, checkPartFileNotFound},
+			},
+			expectedMeta:     fi,
+			expectedDangling: false,
+		},
+
 		// Add new cases as seen
 	}
 	for _, testCase := range testCases {
@@ -265,7 +353,7 @@ func TestHealing(t *testing.T) {
 	}
 
 	disk := er.getDisks()[0]
-	fileInfoPreHeal, err := disk.ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPreHeal, err := disk.ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +376,7 @@ func TestHealing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fileInfoPostHeal, err := disk.ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPostHeal, err := disk.ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +395,7 @@ func TestHealing(t *testing.T) {
 	// gone down when an object was replaced by a new object.
 	fileInfoOutDated := fileInfoPreHeal
 	fileInfoOutDated.ModTime = time.Now()
-	err = disk.WriteMetadata(context.Background(), bucket, object, fileInfoOutDated)
+	err = disk.WriteMetadata(context.Background(), "", bucket, object, fileInfoOutDated)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +405,7 @@ func TestHealing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fileInfoPostHeal, err = disk.ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPostHeal, err = disk.ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +449,7 @@ func TestHealing(t *testing.T) {
 		t.Fatal(err)
 	}
 	// This would create the bucket.
-	_, err = er.HealBucket(ctx, bucket, madmin.HealOpts{
+	_, err = obj.HealBucket(ctx, bucket, madmin.HealOpts{
 		DryRun: false,
 		Remove: false,
 	})
@@ -425,11 +513,11 @@ func TestHealingVersioned(t *testing.T) {
 	}
 
 	disk := er.getDisks()[0]
-	fileInfoPreHeal1, err := disk.ReadVersion(context.Background(), bucket, object, oi1.VersionID, false)
+	fileInfoPreHeal1, err := disk.ReadVersion(context.Background(), "", bucket, object, oi1.VersionID, ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	fileInfoPreHeal2, err := disk.ReadVersion(context.Background(), bucket, object, oi2.VersionID, false)
+	fileInfoPreHeal2, err := disk.ReadVersion(context.Background(), "", bucket, object, oi2.VersionID, ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,11 +540,11 @@ func TestHealingVersioned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fileInfoPostHeal1, err := disk.ReadVersion(context.Background(), bucket, object, oi1.VersionID, false)
+	fileInfoPostHeal1, err := disk.ReadVersion(context.Background(), "", bucket, object, oi1.VersionID, ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	fileInfoPostHeal2, err := disk.ReadVersion(context.Background(), bucket, object, oi2.VersionID, false)
+	fileInfoPostHeal2, err := disk.ReadVersion(context.Background(), "", bucket, object, oi2.VersionID, ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,7 +566,7 @@ func TestHealingVersioned(t *testing.T) {
 	// gone down when an object was replaced by a new object.
 	fileInfoOutDated := fileInfoPreHeal1
 	fileInfoOutDated.ModTime = time.Now()
-	err = disk.WriteMetadata(context.Background(), bucket, object, fileInfoOutDated)
+	err = disk.WriteMetadata(context.Background(), "", bucket, object, fileInfoOutDated)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +576,7 @@ func TestHealingVersioned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fileInfoPostHeal1, err = disk.ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPostHeal1, err = disk.ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,7 +586,7 @@ func TestHealingVersioned(t *testing.T) {
 		t.Fatal("HealObject failed")
 	}
 
-	fileInfoPostHeal2, err = disk.ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPostHeal2, err = disk.ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +630,7 @@ func TestHealingVersioned(t *testing.T) {
 		t.Fatal(err)
 	}
 	// This would create the bucket.
-	_, err = er.HealBucket(ctx, bucket, madmin.HealOpts{
+	_, err = obj.HealBucket(ctx, bucket, madmin.HealOpts{
 		DryRun: false,
 		Remove: false,
 	})
@@ -563,6 +651,17 @@ func TestHealingDanglingObject(t *testing.T) {
 	resetGlobalHealState()
 	defer resetGlobalHealState()
 
+	// Set globalStorageClass.STANDARD to EC:4 for this test
+	saveSC := globalStorageClass
+	defer func() {
+		globalStorageClass.Update(saveSC)
+	}()
+	globalStorageClass.Update(storageclass.Config{
+		Standard: storageclass.StorageClass{
+			Parity: 4,
+		},
+	})
+
 	nDisks := 16
 	fsDirs, err := getRandomDisks(nDisks)
 	if err != nil {
@@ -572,10 +671,12 @@ func TestHealingDanglingObject(t *testing.T) {
 	defer removeRoots(fsDirs)
 
 	// Everything is fine, should return nil
-	objLayer, disks, err := initObjectLayer(ctx, mustGetPoolEndpoints(fsDirs...))
+	objLayer, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, fsDirs...))
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	setObjectLayer(objLayer)
 
 	bucket := getRandomBucketName()
 	object := getRandomObjectName()
@@ -586,7 +687,7 @@ func TestHealingDanglingObject(t *testing.T) {
 		t.Fatalf("Failed to make a bucket - %v", err)
 	}
 
-	disks = objLayer.(*erasureServerPools).serverPools[0].erasureDisks[0]
+	disks := objLayer.(*erasureServerPools).serverPools[0].erasureDisks[0]
 	orgDisks := append([]StorageAPI{}, disks...)
 
 	// Enable versioning.
@@ -623,7 +724,7 @@ func TestHealingDanglingObject(t *testing.T) {
 	// Restore...
 	setDisks(orgDisks[:4]...)
 
-	fileInfoPreHeal, err := disks[0].ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPreHeal, err := disks[0].ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,15 +733,15 @@ func TestHealingDanglingObject(t *testing.T) {
 		t.Fatalf("Expected versions 1, got %d", fileInfoPreHeal.NumVersions)
 	}
 
-	if err = objLayer.HealObjects(ctx, bucket, "", madmin.HealOpts{Remove: true},
-		func(bucket, object, vid string) error {
-			_, err := objLayer.HealObject(ctx, bucket, object, vid, madmin.HealOpts{Remove: true})
+	if err = objLayer.HealObjects(ctx, bucket, "", madmin.HealOpts{Recursive: true, Remove: true},
+		func(bucket, object, vid string, scanMode madmin.HealScanMode) error {
+			_, err := objLayer.HealObject(ctx, bucket, object, vid, madmin.HealOpts{ScanMode: scanMode, Remove: true})
 			return err
 		}); err != nil {
 		t.Fatal(err)
 	}
 
-	fileInfoPostHeal, err := disks[0].ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPostHeal, err := disks[0].ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +771,7 @@ func TestHealingDanglingObject(t *testing.T) {
 
 	setDisks(orgDisks[:4]...)
 	disk := getDisk(0)
-	fileInfoPreHeal, err = disk.ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPreHeal, err = disk.ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -679,16 +780,16 @@ func TestHealingDanglingObject(t *testing.T) {
 		t.Fatalf("Expected versions 1, got %d", fileInfoPreHeal.NumVersions)
 	}
 
-	if err = objLayer.HealObjects(ctx, bucket, "", madmin.HealOpts{Remove: true},
-		func(bucket, object, vid string) error {
-			_, err := objLayer.HealObject(ctx, bucket, object, vid, madmin.HealOpts{Remove: true})
+	if err = objLayer.HealObjects(ctx, bucket, "", madmin.HealOpts{Recursive: true, Remove: true},
+		func(bucket, object, vid string, scanMode madmin.HealScanMode) error {
+			_, err := objLayer.HealObject(ctx, bucket, object, vid, madmin.HealOpts{ScanMode: scanMode, Remove: true})
 			return err
 		}); err != nil {
 		t.Fatal(err)
 	}
 
 	disk = getDisk(0)
-	fileInfoPostHeal, err = disk.ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPostHeal, err = disk.ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,7 +820,7 @@ func TestHealingDanglingObject(t *testing.T) {
 	setDisks(orgDisks[:4]...)
 
 	disk = getDisk(0)
-	fileInfoPreHeal, err = disk.ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPreHeal, err = disk.ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,16 +829,16 @@ func TestHealingDanglingObject(t *testing.T) {
 		t.Fatalf("Expected versions 3, got %d", fileInfoPreHeal.NumVersions)
 	}
 
-	if err = objLayer.HealObjects(ctx, bucket, "", madmin.HealOpts{Remove: true},
-		func(bucket, object, vid string) error {
-			_, err := objLayer.HealObject(ctx, bucket, object, vid, madmin.HealOpts{Remove: true})
+	if err = objLayer.HealObjects(ctx, bucket, "", madmin.HealOpts{Recursive: true, Remove: true},
+		func(bucket, object, vid string, scanMode madmin.HealScanMode) error {
+			_, err := objLayer.HealObject(ctx, bucket, object, vid, madmin.HealOpts{ScanMode: scanMode, Remove: true})
 			return err
 		}); err != nil {
 		t.Fatal(err)
 	}
 
 	disk = getDisk(0)
-	fileInfoPostHeal, err = disk.ReadVersion(context.Background(), bucket, object, "", false)
+	fileInfoPostHeal, err = disk.ReadVersion(context.Background(), "", bucket, object, "", ReadOptions{ReadData: false, Healing: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -762,8 +863,8 @@ func TestHealCorrectQuorum(t *testing.T) {
 
 	defer removeRoots(fsDirs)
 
-	pools := mustGetPoolEndpoints(fsDirs[:16]...)
-	pools = append(pools, mustGetPoolEndpoints(fsDirs[16:]...)...)
+	pools := mustGetPoolEndpoints(0, fsDirs[:16]...)
+	pools = append(pools, mustGetPoolEndpoints(1, fsDirs[16:]...)...)
 
 	// Everything is fine, should return nil
 	objLayer, _, err := initObjectLayer(ctx, pools)
@@ -822,7 +923,7 @@ func TestHealCorrectQuorum(t *testing.T) {
 		er := set.sets[0]
 		erasureDisks := er.getDisks()
 
-		fileInfos, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
+		fileInfos, errs := readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 		nfi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 		if errors.Is(err, errFileNotFound) {
 			continue
@@ -834,7 +935,7 @@ func TestHealCorrectQuorum(t *testing.T) {
 		for i := 0; i < nfi.Erasure.ParityBlocks; i++ {
 			erasureDisks[i].Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
 				Recursive: false,
-				Force:     false,
+				Immediate: false,
 			})
 		}
 
@@ -844,12 +945,12 @@ func TestHealCorrectQuorum(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		fileInfos, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
+		fileInfos, errs = readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 		if countErrs(errs, nil) != len(fileInfos) {
 			t.Fatal("Expected all xl.meta healed, but partial heal detected")
 		}
 
-		fileInfos, errs = readAllFileInfo(ctx, erasureDisks, minioMetaBucket, cfgFile, "", false)
+		fileInfos, errs = readAllFileInfo(ctx, erasureDisks, "", minioMetaBucket, cfgFile, "", false, true)
 		nfi, err = getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 		if errors.Is(err, errFileNotFound) {
 			continue
@@ -861,7 +962,7 @@ func TestHealCorrectQuorum(t *testing.T) {
 		for i := 0; i < nfi.Erasure.ParityBlocks; i++ {
 			erasureDisks[i].Delete(context.Background(), minioMetaBucket, pathJoin(cfgFile, xlStorageFormatFile), DeleteOptions{
 				Recursive: false,
-				Force:     false,
+				Immediate: false,
 			})
 		}
 
@@ -871,7 +972,7 @@ func TestHealCorrectQuorum(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		fileInfos, errs = readAllFileInfo(ctx, erasureDisks, minioMetaBucket, cfgFile, "", false)
+		fileInfos, errs = readAllFileInfo(ctx, erasureDisks, "", minioMetaBucket, cfgFile, "", false, true)
 		if countErrs(errs, nil) != len(fileInfos) {
 			t.Fatal("Expected all xl.meta healed, but partial heal detected")
 		}
@@ -893,8 +994,8 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 
 	defer removeRoots(fsDirs)
 
-	pools := mustGetPoolEndpoints(fsDirs[:16]...)
-	pools = append(pools, mustGetPoolEndpoints(fsDirs[16:]...)...)
+	pools := mustGetPoolEndpoints(0, fsDirs[:16]...)
+	pools = append(pools, mustGetPoolEndpoints(1, fsDirs[16:]...)...)
 
 	// Everything is fine, should return nil
 	objLayer, _, err := initObjectLayer(ctx, pools)
@@ -945,7 +1046,7 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	firstDisk := erasureDisks[0]
 	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
 		Recursive: false,
-		Force:     false,
+		Immediate: false,
 	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
@@ -956,7 +1057,7 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 		t.Fatalf("Failed to heal object - %v", err)
 	}
 
-	fileInfos, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
+	fileInfos, errs := readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 	fi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
@@ -968,7 +1069,7 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 
 	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), DeleteOptions{
 		Recursive: false,
-		Force:     false,
+		Immediate: false,
 	})
 	if err != nil {
 		t.Errorf("Failure during deleting part.1 - %v", err)
@@ -984,21 +1085,19 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 		t.Errorf("Expected nil but received %v", err)
 	}
 
-	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
+	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 	nfi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
 
-	fi.DiskMTime = time.Time{}
-	nfi.DiskMTime = time.Time{}
 	if !reflect.DeepEqual(fi, nfi) {
 		t.Fatalf("FileInfo not equal after healing: %v != %v", fi, nfi)
 	}
 
 	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), DeleteOptions{
 		Recursive: false,
-		Force:     false,
+		Immediate: false,
 	})
 	if err != nil {
 		t.Errorf("Failure during deleting part.1 - %v", err)
@@ -1015,14 +1114,12 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 		t.Errorf("Expected nil but received %v", err)
 	}
 
-	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
+	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 	nfi, err = getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
 
-	fi.DiskMTime = time.Time{}
-	nfi.DiskMTime = time.Time{}
 	if !reflect.DeepEqual(fi, nfi) {
 		t.Fatalf("FileInfo not equal after healing: %v != %v", fi, nfi)
 	}
@@ -1032,7 +1129,7 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	for i := 0; i <= nfi.Erasure.DataBlocks; i++ {
 		erasureDisks[i].Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
 			Recursive: false,
-			Force:     false,
+			Immediate: false,
 		})
 	}
 
@@ -1051,9 +1148,9 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	}
 
 	for i := 0; i < (nfi.Erasure.DataBlocks + nfi.Erasure.ParityBlocks); i++ {
-		_, err = erasureDisks[i].StatInfoFile(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), false)
-		if err == nil {
-			t.Errorf("Expected xl.meta file to be not present, but succeeeded")
+		stats, _ := erasureDisks[i].StatInfoFile(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), false)
+		if len(stats) != 0 {
+			t.Errorf("Expected xl.meta file to be not present, but succeeded")
 		}
 	}
 }
@@ -1074,7 +1171,7 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 	defer removeRoots(fsDirs)
 
 	// Everything is fine, should return nil
-	objLayer, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(fsDirs...))
+	objLayer, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, fsDirs...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1119,7 +1216,7 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 	firstDisk := erasureDisks[0]
 
 	// Test 1: Remove the object backend files from the first disk.
-	fileInfos, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
+	fileInfos, errs := readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 	fi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
@@ -1127,7 +1224,7 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 
 	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
 		Recursive: false,
-		Force:     false,
+		Immediate: false,
 	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
@@ -1142,14 +1239,12 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 		t.Errorf("Expected xl.meta file to be present but stat failed - %v", err)
 	}
 
-	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
+	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 	nfi1, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
 
-	fi.DiskMTime = time.Time{}
-	nfi1.DiskMTime = time.Time{}
 	if !reflect.DeepEqual(fi, nfi1) {
 		t.Fatalf("FileInfo not equal after healing")
 	}
@@ -1165,14 +1260,12 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 		t.Errorf("Expected nil but received %v", err)
 	}
 
-	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
+	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 	nfi2, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
 
-	fi.DiskMTime = time.Time{}
-	nfi2.DiskMTime = time.Time{}
 	if !reflect.DeepEqual(fi, nfi2) {
 		t.Fatalf("FileInfo not equal after healing")
 	}
@@ -1182,7 +1275,7 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 	for i := 0; i <= nfi2.Erasure.DataBlocks; i++ {
 		erasureDisks[i].Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
 			Recursive: false,
-			Force:     false,
+			Immediate: false,
 		})
 	}
 
@@ -1217,7 +1310,7 @@ func TestHealObjectCorruptedParts(t *testing.T) {
 	defer removeRoots(fsDirs)
 
 	// Everything is fine, should return nil
-	objLayer, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(fsDirs...))
+	objLayer, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, fsDirs...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1263,7 +1356,7 @@ func TestHealObjectCorruptedParts(t *testing.T) {
 	firstDisk := erasureDisks[0]
 	secondDisk := erasureDisks[1]
 
-	fileInfos, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
+	fileInfos, errs := readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 	fi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
@@ -1282,7 +1375,7 @@ func TestHealObjectCorruptedParts(t *testing.T) {
 	// Test 1, remove part.1
 	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), DeleteOptions{
 		Recursive: false,
-		Force:     false,
+		Immediate: false,
 	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
@@ -1330,7 +1423,7 @@ func TestHealObjectCorruptedParts(t *testing.T) {
 
 	err = secondDisk.Delete(context.Background(), bucket, object, DeleteOptions{
 		Recursive: true,
-		Force:     false,
+		Immediate: false,
 	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
@@ -1374,7 +1467,7 @@ func TestHealObjectErasure(t *testing.T) {
 	defer removeRoots(fsDirs)
 
 	// Everything is fine, should return nil
-	obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(fsDirs...))
+	obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, fsDirs...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1421,7 +1514,7 @@ func TestHealObjectErasure(t *testing.T) {
 	// Delete the whole object folder
 	err = firstDisk.Delete(context.Background(), bucket, object, DeleteOptions{
 		Recursive: true,
-		Force:     false,
+		Immediate: false,
 	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
@@ -1441,7 +1534,13 @@ func TestHealObjectErasure(t *testing.T) {
 	er.getDisks = func() []StorageAPI {
 		// Nil more than half the disks, to remove write quorum.
 		for i := 0; i <= len(erasureDisks)/2; i++ {
-			erasureDisks[i] = nil
+			err := erasureDisks[i].Delete(context.Background(), bucket, object, DeleteOptions{
+				Recursive: true,
+				Immediate: false,
+			})
+			if err != nil {
+				t.Fatalf("Failed to delete a file - %v", err)
+			}
 		}
 		return erasureDisks
 	}
@@ -1472,7 +1571,7 @@ func TestHealEmptyDirectoryErasure(t *testing.T) {
 	defer removeRoots(fsDirs)
 
 	// Everything is fine, should return nil
-	obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(fsDirs...))
+	obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, fsDirs...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1568,7 +1667,7 @@ func TestHealLastDataShard(t *testing.T) {
 
 			defer removeRoots(fsDirs)
 
-			obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(fsDirs...))
+			obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, fsDirs...))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1589,7 +1688,6 @@ func TestHealLastDataShard(t *testing.T) {
 
 			_, err = obj.PutObject(ctx, bucket, object,
 				mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
-
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1620,11 +1718,11 @@ func TestHealLastDataShard(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			firstGr, err := obj.GetObjectNInfo(ctx, bucket, object, nil, nil, noLock, ObjectOptions{})
-			defer firstGr.Close()
+			firstGr, err := obj.GetObjectNInfo(ctx, bucket, object, nil, nil, ObjectOptions{NoLock: true})
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer firstGr.Close()
 
 			firstHealedH := sha256.New()
 			_, err = io.Copy(firstHealedH, firstGr)
@@ -1650,11 +1748,11 @@ func TestHealLastDataShard(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			secondGr, err := obj.GetObjectNInfo(ctx, bucket, object, nil, nil, noLock, ObjectOptions{})
-			defer secondGr.Close()
+			secondGr, err := obj.GetObjectNInfo(ctx, bucket, object, nil, nil, ObjectOptions{NoLock: true})
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer secondGr.Close()
 
 			secondHealedH := sha256.New()
 			_, err = io.Copy(secondHealedH, secondGr)

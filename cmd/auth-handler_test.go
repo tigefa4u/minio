@@ -28,7 +28,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/auth"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 type nullReader struct{}
@@ -237,7 +237,7 @@ func TestIsRequestPresignedSignatureV2(t *testing.T) {
 	}
 }
 
-// TestIsRequestPresignedSignatureV4 - Test validates the logic for presign signature verision v4 detection.
+// TestIsRequestPresignedSignatureV4 - Test validates the logic for presign signature version v4 detection.
 func TestIsRequestPresignedSignatureV4(t *testing.T) {
 	testCases := []struct {
 		inputQueryKey   string
@@ -287,7 +287,7 @@ func mustNewSignedRequest(method string, urlStr string, contentLength int64, bod
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
 	cred := globalActiveCred
 	if err := signRequestV4(req, cred.AccessKey, cred.SecretKey); err != nil {
-		t.Fatalf("Unable to inititalized new signed http request %s", err)
+		t.Fatalf("Unable to initialized new signed http request %s", err)
 	}
 	return req
 }
@@ -298,7 +298,7 @@ func mustNewSignedV2Request(method string, urlStr string, contentLength int64, b
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
 	cred := globalActiveCred
 	if err := signRequestV2(req, cred.AccessKey, cred.SecretKey); err != nil {
-		t.Fatalf("Unable to inititalized new signed http request %s", err)
+		t.Fatalf("Unable to initialized new signed http request %s", err)
 	}
 	return req
 }
@@ -309,7 +309,7 @@ func mustNewPresignedV2Request(method string, urlStr string, contentLength int64
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
 	cred := globalActiveCred
 	if err := preSignV2(req, cred.AccessKey, cred.SecretKey, time.Now().Add(10*time.Minute).Unix()); err != nil {
-		t.Fatalf("Unable to inititalized new signed http request %s", err)
+		t.Fatalf("Unable to initialized new signed http request %s", err)
 	}
 	return req
 }
@@ -320,7 +320,7 @@ func mustNewPresignedRequest(method string, urlStr string, contentLength int64, 
 	req := mustNewRequest(method, urlStr, contentLength, body, t)
 	cred := globalActiveCred
 	if err := preSignV4(req, cred.AccessKey, cred.SecretKey, time.Now().Add(10*time.Minute).Unix()); err != nil {
-		t.Fatalf("Unable to inititalized new signed http request %s", err)
+		t.Fatalf("Unable to initialized new signed http request %s", err)
 	}
 	return req
 }
@@ -375,14 +375,14 @@ func TestIsReqAuthenticated(t *testing.T) {
 
 	initConfigSubsystem(ctx, objLayer)
 
-	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
-
 	creds, err := auth.CreateCredentials("myuser", "mypassword")
 	if err != nil {
 		t.Fatalf("unable create credential, %s", err)
 	}
 
 	globalActiveCred = creds
+
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
 
 	// List of test cases for validating http request authentication.
 	testCases := []struct {
@@ -403,7 +403,7 @@ func TestIsReqAuthenticated(t *testing.T) {
 
 	// Validates all testcases.
 	for i, testCase := range testCases {
-		s3Error := isReqAuthenticated(ctx, testCase.req, globalSite.Region, serviceS3)
+		s3Error := isReqAuthenticated(ctx, testCase.req, globalSite.Region(), serviceS3)
 		if s3Error != testCase.s3Error {
 			if _, err := io.ReadAll(testCase.req.Body); toAPIErrorCode(ctx, err) != testCase.s3Error {
 				t.Fatalf("Test %d: Unexpected S3 error: want %d - got %d (got after reading request %s)", i, testCase.s3Error, s3Error, toAPIError(ctx, err).Code)
@@ -443,7 +443,7 @@ func TestCheckAdminRequestAuthType(t *testing.T) {
 		{Request: mustNewPresignedRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
 	}
 	for i, testCase := range testCases {
-		if _, s3Error := checkAdminRequestAuth(ctx, testCase.Request, iampolicy.AllAdminActions, globalSite.Region); s3Error != testCase.ErrCode {
+		if _, s3Error := checkAdminRequestAuth(ctx, testCase.Request, policy.AllAdminActions, globalSite.Region()); s3Error != testCase.ErrCode {
 			t.Errorf("Test %d: Unexpected s3error returned wanted %d, got %d", i, testCase.ErrCode, s3Error)
 		}
 	}
@@ -464,15 +464,16 @@ func TestValidateAdminSignature(t *testing.T) {
 	}
 
 	initAllSubsystems(ctx)
-	initConfigSubsystem(ctx, objLayer)
 
-	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
+	initConfigSubsystem(ctx, objLayer)
 
 	creds, err := auth.CreateCredentials("admin", "mypassword")
 	if err != nil {
 		t.Fatalf("unable create credential, %s", err)
 	}
 	globalActiveCred = creds
+
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
 
 	testCases := []struct {
 		AccessKey string
@@ -490,9 +491,9 @@ func TestValidateAdminSignature(t *testing.T) {
 	for i, testCase := range testCases {
 		req := mustNewRequest(http.MethodGet, "http://localhost:9000/", 0, nil, t)
 		if err := signRequestV4(req, testCase.AccessKey, testCase.SecretKey); err != nil {
-			t.Fatalf("Unable to inititalized new signed http request %s", err)
+			t.Fatalf("Unable to initialized new signed http request %s", err)
 		}
-		_, _, _, s3Error := validateAdminSignature(ctx, req, globalMinioDefaultRegion)
+		_, _, s3Error := validateAdminSignature(ctx, req, globalMinioDefaultRegion)
 		if s3Error != testCase.ErrCode {
 			t.Errorf("Test %d: Unexpected s3error returned wanted %d, got %d", i+1, testCase.ErrCode, s3Error)
 		}

@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -31,7 +31,9 @@ import (
 	"github.com/gomodule/redigo/redis"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/minio/internal/once"
+	"github.com/minio/minio/internal/store"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // Redis constants
@@ -39,6 +41,7 @@ const (
 	RedisFormat     = "format"
 	RedisAddress    = "address"
 	RedisPassword   = "password"
+	RedisUser       = "user"
 	RedisKey        = "key"
 	RedisQueueDir   = "queue_dir"
 	RedisQueueLimit = "queue_limit"
@@ -47,6 +50,7 @@ const (
 	EnvRedisFormat     = "MINIO_NOTIFY_REDIS_FORMAT"
 	EnvRedisAddress    = "MINIO_NOTIFY_REDIS_ADDRESS"
 	EnvRedisPassword   = "MINIO_NOTIFY_REDIS_PASSWORD"
+	EnvRedisUser       = "MINIO_NOTIFY_REDIS_USER"
 	EnvRedisKey        = "MINIO_NOTIFY_REDIS_KEY"
 	EnvRedisQueueDir   = "MINIO_NOTIFY_REDIS_QUEUE_DIR"
 	EnvRedisQueueLimit = "MINIO_NOTIFY_REDIS_QUEUE_LIMIT"
@@ -58,6 +62,7 @@ type RedisArgs struct {
 	Format     string    `json:"format"`
 	Addr       xnet.Host `json:"address"`
 	Password   string    `json:"password"`
+	User       string    `json:"user"`
 	Key        string    `json:"key"`
 	QueueDir   string    `json:"queueDir"`
 	QueueLimit uint64    `json:"queueLimit"`
@@ -117,12 +122,12 @@ func (r RedisArgs) validateFormat(c redis.Conn) error {
 
 // RedisTarget - Redis target.
 type RedisTarget struct {
-	lazyInit lazyInit
+	initOnce once.Init
 
 	id         event.TargetID
 	args       RedisArgs
 	pool       *redis.Pool
-	store      Store
+	store      store.Store[event.Event]
 	firstPing  bool
 	loggerOnce logger.LogOnce
 	quitCh     chan struct{}
@@ -131,6 +136,11 @@ type RedisTarget struct {
 // ID - returns target ID.
 func (target *RedisTarget) ID() event.TargetID {
 	return target.id
+}
+
+// Name - returns the Name of the target.
+func (target *RedisTarget) Name() string {
+	return target.ID().String()
 }
 
 // Store returns any underlying store if set.
@@ -152,8 +162,8 @@ func (target *RedisTarget) isActive() (bool, error) {
 
 	_, pingErr := conn.Do("PING")
 	if pingErr != nil {
-		if IsConnRefusedErr(pingErr) {
-			return false, errNotConnected
+		if xnet.IsConnRefusedErr(pingErr) {
+			return false, store.ErrNotConnected
 		}
 		return false, pingErr
 	}
@@ -162,12 +172,12 @@ func (target *RedisTarget) isActive() (bool, error) {
 
 // Save - saves the events to the store if questore is configured, which will be replayed when the redis connection is active.
 func (target *RedisTarget) Save(eventData event.Event) error {
-	if err := target.init(); err != nil {
+	if target.store != nil {
+		_, err := target.store.Put(eventData)
 		return err
 	}
-
-	if target.store != nil {
-		return target.store.Put(eventData)
+	if err := target.init(); err != nil {
+		return err
 	}
 	_, err := target.isActive()
 	if err != nil {
@@ -216,8 +226,8 @@ func (target *RedisTarget) send(eventData event.Event) error {
 	return nil
 }
 
-// Send - reads an event from store and sends it to redis.
-func (target *RedisTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to redis.
+func (target *RedisTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
@@ -227,23 +237,23 @@ func (target *RedisTarget) Send(eventKey string) error {
 
 	_, pingErr := conn.Do("PING")
 	if pingErr != nil {
-		if IsConnRefusedErr(pingErr) {
-			return errNotConnected
+		if xnet.IsConnRefusedErr(pingErr) {
+			return store.ErrNotConnected
 		}
 		return pingErr
 	}
 
 	if !target.firstPing {
 		if err := target.args.validateFormat(conn); err != nil {
-			if IsConnRefusedErr(err) {
-				return errNotConnected
+			if xnet.IsConnRefusedErr(err) {
+				return store.ErrNotConnected
 			}
 			return err
 		}
 		target.firstPing = true
 	}
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and would've been already been sent successfully.
@@ -254,24 +264,27 @@ func (target *RedisTarget) Send(eventKey string) error {
 	}
 
 	if err := target.send(eventData); err != nil {
-		if IsConnRefusedErr(err) {
-			return errNotConnected
+		if xnet.IsConnRefusedErr(err) {
+			return store.ErrNotConnected
 		}
 		return err
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - releases the resources used by the pool.
 func (target *RedisTarget) Close() error {
 	close(target.quitCh)
-	return target.pool.Close()
+	if target.pool != nil {
+		return target.pool.Close()
+	}
+	return nil
 }
 
 func (target *RedisTarget) init() error {
-	return target.lazyInit.Do(target.initRedis)
+	return target.initOnce.Do(target.initRedis)
 }
 
 func (target *RedisTarget) initRedis() error {
@@ -280,7 +293,7 @@ func (target *RedisTarget) initRedis() error {
 
 	_, pingErr := conn.Do("PING")
 	if pingErr != nil {
-		if !(IsConnRefusedErr(pingErr) || IsConnResetErr(pingErr)) {
+		if !(xnet.IsConnRefusedErr(pingErr) || xnet.IsConnResetErr(pingErr)) {
 			target.loggerOnce(context.Background(), pingErr, target.ID().String())
 		}
 		return pingErr
@@ -298,7 +311,7 @@ func (target *RedisTarget) initRedis() error {
 		return err
 	}
 	if !yes {
-		return errNotConnected
+		return store.ErrNotConnected
 	}
 
 	return nil
@@ -306,11 +319,11 @@ func (target *RedisTarget) initRedis() error {
 
 // NewRedisTarget - creates new Redis target.
 func NewRedisTarget(id string, args RedisArgs, loggerOnce logger.LogOnce) (*RedisTarget, error) {
-	var store Store
+	var queueStore store.Store[event.Event]
 	if args.QueueDir != "" {
 		queueDir := filepath.Join(args.QueueDir, storePrefix+"-redis-"+id)
-		store = NewQueueStore(queueDir, args.QueueLimit)
-		if err := store.Open(); err != nil {
+		queueStore = store.NewQueueStore[event.Event](queueDir, args.QueueLimit, event.StoreExtension)
+		if err := queueStore.Open(); err != nil {
 			return nil, fmt.Errorf("unable to initialize the queue store of Redis `%s`: %w", id, err)
 		}
 	}
@@ -325,9 +338,16 @@ func NewRedisTarget(id string, args RedisArgs, loggerOnce logger.LogOnce) (*Redi
 			}
 
 			if args.Password != "" {
-				if _, err = conn.Do("AUTH", args.Password); err != nil {
-					conn.Close()
-					return nil, err
+				if args.User != "" {
+					if _, err = conn.Do("AUTH", args.User, args.Password); err != nil {
+						conn.Close()
+						return nil, err
+					}
+				} else {
+					if _, err = conn.Do("AUTH", args.Password); err != nil {
+						conn.Close()
+						return nil, err
+					}
 				}
 			}
 
@@ -349,13 +369,13 @@ func NewRedisTarget(id string, args RedisArgs, loggerOnce logger.LogOnce) (*Redi
 		id:         event.TargetID{ID: id, Name: "redis"},
 		args:       args,
 		pool:       pool,
-		store:      store,
+		store:      queueStore,
 		loggerOnce: loggerOnce,
 		quitCh:     make(chan struct{}),
 	}
 
 	if target.store != nil {
-		streamEventsFromStore(target.store, target, target.quitCh, target.loggerOnce)
+		store.StreamItems(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
 	return target, nil

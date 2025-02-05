@@ -1,6 +1,6 @@
 // Copyright (c) 2015-2022 MinIO, Inc.
 //
-// # This file is part of MinIO Object Storage stack
+// This file is part of MinIO Object Storage stack
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -21,25 +21,28 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"net"
 	"net/http"
 	"syscall"
 	"time"
 
-	"github.com/minio/pkg/certs"
-	"github.com/rs/dnscache"
+	"github.com/minio/pkg/v3/certs"
 )
 
 // tlsClientSessionCacheSize is the cache size for client sessions.
 var tlsClientSessionCacheSize = 100
 
+const (
+	// WriteBufferSize 64KiB moving up from 4KiB default
+	WriteBufferSize = 64 << 10
+
+	// ReadBufferSize 64KiB moving up from 4KiB default
+	ReadBufferSize = 64 << 10
+)
+
 // ConnSettings - contains connection settings.
 type ConnSettings struct {
-	// If this is non-nil, DNSCache and DialTimeout are ignored.
-	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-
-	// Dial settings, used if DialContext is nil.
-	DNSCache    *dnscache.Resolver
+	DialContext DialContext // Custom dialContext, DialTimeout is ignored if this is already setup.
+	LookupHost  LookupHost  // Custom lookupHost, is nil on containerized deployments.
 	DialTimeout time.Duration
 
 	// TLS Settings
@@ -49,12 +52,19 @@ type ConnSettings struct {
 
 	// HTTP2
 	EnableHTTP2 bool
+
+	// TCP Options
+	TCPOptions TCPOptions
 }
 
-func (s ConnSettings) getDefaultTransport() *http.Transport {
+func (s ConnSettings) getDefaultTransport(maxIdleConnsPerHost int) *http.Transport {
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = 1024
+	}
+
 	dialContext := s.DialContext
 	if dialContext == nil {
-		dialContext = DialContextWithDNSCache(s.DNSCache, NewInternodeDialContext(s.DialTimeout))
+		dialContext = DialContextWithLookupHost(s.LookupHost, NewInternodeDialContext(s.DialTimeout, s.TCPOptions))
 	}
 
 	tlsClientConfig := tls.Config{
@@ -69,13 +79,12 @@ func (s ConnSettings) getDefaultTransport() *http.Transport {
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           dialContext,
-		MaxIdleConnsPerHost:   1024,
-		WriteBufferSize:       32 << 10, // 32KiB moving up from 4KiB default
-		ReadBufferSize:        32 << 10, // 32KiB moving up from 4KiB default
+		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+		WriteBufferSize:       WriteBufferSize,
+		ReadBufferSize:        ReadBufferSize,
 		IdleConnTimeout:       15 * time.Second,
 		ResponseHeaderTimeout: 15 * time.Minute, // Conservative timeout is the default (for MinIO internode)
 		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 10 * time.Second,
 		TLSClientConfig:       &tlsClientConfig,
 		ForceAttemptHTTP2:     s.EnableHTTP2,
 		// Go net/http automatically unzip if content-type is
@@ -109,12 +118,11 @@ func (s ConnSettings) getDefaultTransport() *http.Transport {
 }
 
 // NewInternodeHTTPTransport returns transport for internode MinIO connections.
-func (s ConnSettings) NewInternodeHTTPTransport() func() http.RoundTripper {
-	tr := s.getDefaultTransport()
+func (s ConnSettings) NewInternodeHTTPTransport(maxIdleConnsPerHost int) func() http.RoundTripper {
+	tr := s.getDefaultTransport(maxIdleConnsPerHost)
 
 	// Settings specific to internode requests.
 	tr.TLSHandshakeTimeout = 15 * time.Second
-	tr.ExpectContinueTimeout = 15 * time.Second
 
 	return func() http.RoundTripper {
 		return tr
@@ -125,7 +133,7 @@ func (s ConnSettings) NewInternodeHTTPTransport() func() http.RoundTripper {
 // only supports HTTP/1.1
 func (s ConnSettings) NewCustomHTTPProxyTransport() func() *http.Transport {
 	s.EnableHTTP2 = false
-	tr := s.getDefaultTransport()
+	tr := s.getDefaultTransport(0)
 
 	// Settings specific to proxied requests.
 	tr.ResponseHeaderTimeout = 30 * time.Minute
@@ -137,7 +145,7 @@ func (s ConnSettings) NewCustomHTTPProxyTransport() func() *http.Transport {
 
 // NewHTTPTransportWithTimeout allows setting a timeout for response headers
 func (s ConnSettings) NewHTTPTransportWithTimeout(timeout time.Duration) *http.Transport {
-	tr := s.getDefaultTransport()
+	tr := s.getDefaultTransport(0)
 
 	// Settings specific to this transport.
 	tr.ResponseHeaderTimeout = timeout
@@ -164,12 +172,12 @@ func (s ConnSettings) NewHTTPTransportWithClientCerts(ctx context.Context, clien
 
 // NewRemoteTargetHTTPTransport returns a new http configuration
 // used while communicating with the remote replication targets.
-func (s ConnSettings) NewRemoteTargetHTTPTransport() func() *http.Transport {
-	tr := s.getDefaultTransport()
+func (s ConnSettings) NewRemoteTargetHTTPTransport(insecure bool) func() *http.Transport {
+	tr := s.getDefaultTransport(0)
 
-	tr.TLSHandshakeTimeout = 5 * time.Second
-	tr.ExpectContinueTimeout = 5 * time.Second
+	tr.TLSHandshakeTimeout = 10 * time.Second
 	tr.ResponseHeaderTimeout = 0
+	tr.TLSClientConfig.InsecureSkipVerify = insecure
 
 	return func() *http.Transport {
 		return tr

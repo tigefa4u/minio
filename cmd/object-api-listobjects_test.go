@@ -155,16 +155,21 @@ func testListObjectsVersionedFolders(obj ObjectLayer, instanceType string, t1 Te
 	for i, testCase := range testCases {
 		testCase := testCase
 		t.Run(fmt.Sprintf("%s-Test%d", instanceType, i+1), func(t *testing.T) {
-			t.Log("ListObjects, bucket:", testCase.bucketName, "prefix:",
-				testCase.prefix, "marker:", testCase.marker, "delimiter:",
-				testCase.delimiter, "maxkeys:", testCase.maxKeys)
 			var err error
 			var resultL ListObjectsInfo
 			var resultV ListObjectVersionsInfo
 			if testCase.versioned {
+				t.Log("ListObjectVersions, bucket:", testCase.bucketName, "prefix:",
+					testCase.prefix, "marker:", testCase.marker, "delimiter:",
+					testCase.delimiter, "maxkeys:", testCase.maxKeys)
+
 				resultV, err = obj.ListObjectVersions(context.Background(), testCase.bucketName,
 					testCase.prefix, testCase.marker, "", testCase.delimiter, testCase.maxKeys)
 			} else {
+				t.Log("ListObjects, bucket:", testCase.bucketName, "prefix:",
+					testCase.prefix, "marker:", testCase.marker, "delimiter:",
+					testCase.delimiter, "maxkeys:", testCase.maxKeys)
+
 				resultL, err = obj.ListObjects(context.Background(), testCase.bucketName,
 					testCase.prefix, testCase.marker, testCase.delimiter, testCase.maxKeys)
 			}
@@ -393,7 +398,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 	resultCases := []ListObjectsInfo{
 		// ListObjectsResult-0.
 		// Testing for listing all objects in the bucket, (testCase 20,21,22).
-		{
+		0: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -409,7 +414,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-1.
 		// Used for asserting the truncated case, (testCase 23).
-		{
+		1: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -421,7 +426,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-2.
 		// (TestCase 24).
-		{
+		2: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -432,7 +437,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-3.
 		// (TestCase 25).
-		{
+		3: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -443,7 +448,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// ListObjectsResult-4.
 		// Again used for truncated case.
 		// (TestCase 26).
-		{
+		4: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -452,7 +457,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// ListObjectsResult-5.
 		// Used for Asserting prefixes.
 		// Used for test case with prefix "new", (testCase 27-29).
-		{
+		5: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -463,7 +468,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// ListObjectsResult-6.
 		// Used for Asserting prefixes.
 		// Used for test case with prefix = "obj", (testCase 30).
-		{
+		6: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj0"},
@@ -474,7 +479,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// ListObjectsResult-7.
 		// Used for Asserting prefixes and truncation.
 		// Used for test case with prefix = "new" and maxKeys = 1, (testCase 31).
-		{
+		7: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -483,7 +488,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// ListObjectsResult-8.
 		// Used for Asserting prefixes.
 		// Used for test case with prefix = "obj" and maxKeys = 2, (testCase 32).
-		{
+		8: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "obj0"},
@@ -493,7 +498,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// ListObjectsResult-9.
 		// Used for asserting the case with marker, but without prefix.
 		// marker is set to "newPrefix0" in the testCase, (testCase 33).
-		{
+		9: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix1"},
@@ -505,7 +510,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-10.
 		// marker is set to "newPrefix1" in the testCase, (testCase 34).
-		{
+		10: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newzen/zen/recurse/again/again/again/pics"},
@@ -516,7 +521,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-11.
 		// marker is set to "obj0" in the testCase, (testCase 35).
-		{
+		11: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -525,7 +530,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-12.
 		// Marker is set to "obj1" in the testCase, (testCase 36).
-		{
+		12: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj2"},
@@ -533,7 +538,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-13.
 		// Marker is set to "man" in the testCase, (testCase37).
-		{
+		13: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -546,7 +551,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-14.
 		// Marker is set to "Abc" in the testCase, (testCase 39).
-		{
+		14: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -562,7 +567,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-15.
 		// Marker is set to "Asia/India/India-summer-photos-1" in the testCase, (testCase 40).
-		{
+		15: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia/India/Karnataka/Bangalore/Koramangala/pics"},
@@ -576,7 +581,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-16.
 		// Marker is set to "Asia/India/Karnataka/Bangalore/Koramangala/pics" in the testCase, (testCase 41).
-		{
+		16: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -591,7 +596,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// Used for asserting the case with marker, without prefix but with truncation.
 		// Marker =  "newPrefix0" & maxKeys = 3 in the testCase, (testCase42).
 		// Output truncated to 3 values.
-		{
+		17: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix1"},
@@ -602,7 +607,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// ListObjectsResult-18.
 		// Marker = "newPrefix1" & maxkeys = 1 in the testCase, (testCase43).
 		// Output truncated to 1 value.
-		{
+		18: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "newzen/zen/recurse/again/again/again/pics"},
@@ -611,7 +616,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// ListObjectsResult-19.
 		// Marker = "obj0" & maxKeys = 1 in the testCase, (testCase44).
 		// Output truncated to 1 value.
-		{
+		19: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -619,7 +624,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-20.
 		// Marker = "obj0" & prefix = "obj" in the testCase, (testCase 45).
-		{
+		20: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -628,7 +633,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-21.
 		// Marker = "obj1" & prefix = "obj" in the testCase, (testCase 46).
-		{
+		21: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj2"},
@@ -636,7 +641,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-22.
 		// Marker = "newPrefix0" & prefix = "new" in the testCase,, (testCase 47).
-		{
+		22: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix1"},
@@ -645,7 +650,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-23.
 		// Prefix is set to "Asia/India/" in the testCase, and delimiter is not set (testCase 55).
-		{
+		23: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia/India/India-summer-photos-1"},
@@ -655,7 +660,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 
 		// ListObjectsResult-24.
 		// Prefix is set to "Asia" in the testCase, and delimiter is not set (testCase 56).
-		{
+		24: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -666,7 +671,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 
 		// ListObjectsResult-25.
 		// Prefix is set to "Asia" in the testCase, and delimiter is set (testCase 57).
-		{
+		25: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -675,7 +680,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-26.
 		// prefix = "new" and delimiter is set in the testCase.(testCase 58).
-		{
+		26: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -685,7 +690,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-27.
 		// Prefix is set to "Asia/India/" in the testCase, and delimiter is set to forward slash '/' (testCase 59).
-		{
+		27: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia/India/India-summer-photos-1"},
@@ -694,7 +699,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-28.
 		// Marker is set to "Asia/India/India-summer-photos-1" and delimiter set in the testCase, (testCase 60).
-		{
+		28: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -707,7 +712,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-29.
 		// Marker is set to "Asia/India/Karnataka/Bangalore/Koramangala/pics" in the testCase and delimiter set, (testCase 61).
-		{
+		29: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -720,12 +725,12 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		},
 		// ListObjectsResult-30.
 		// Prefix and Delimiter is set to '/', (testCase 62).
-		{
+		30: {
 			IsTruncated: false,
 			Objects:     []ObjectInfo{},
 		},
 		// ListObjectsResult-31 Empty directory, recursive listing
-		{
+		31: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -734,7 +739,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 			},
 		},
 		// ListObjectsResult-32 Empty directory, non recursive listing
-		{
+		32: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -743,7 +748,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 			Prefixes: []string{"temporary/"},
 		},
 		// ListObjectsResult-33 Listing empty directory only
-		{
+		33: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "temporary/0/"},
@@ -752,12 +757,12 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// ListObjectsResult-34:
 		//    * Listing with marker > last object should return empty
 		//    * Listing an object with a trailing slash and '/' delimiter
-		{
+		34: {
 			IsTruncated: false,
 			Objects:     []ObjectInfo{},
 		},
 		// ListObjectsResult-35 list with custom uncommon delimiter
-		{
+		35: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "file1/receipt.json"},
@@ -765,12 +770,12 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 			Prefixes: []string{"file1/guidSplunk"},
 		},
 		// ListObjectsResult-36 list with nextmarker prefix and maxKeys set to 1.
-		{
+		36: {
 			IsTruncated: true,
 			Prefixes:    []string{"dir/day_id=2017-10-10/"},
 		},
 		// ListObjectsResult-37 list with prefix match 2 levels deep
-		{
+		37: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "foo/201910/1112"},
@@ -778,7 +783,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 			},
 		},
 		// ListObjectsResult-38 list with prefix match 1 level deep
-		{
+		38: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "foo/201910/1112"},
@@ -788,14 +793,14 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 			},
 		},
 		// ListObjectsResult-39 list with prefix match 1 level deep
-		{
+		39: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "201910/foo/bar/xl.meta/1.txt"},
 			},
 		},
 		// ListObjectsResult-40
-		{
+		40: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "aaa"},
@@ -819,19 +824,18 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		shouldPass bool
 	}{
 		// Test cases with invalid bucket names ( Test number 1-4 ).
-		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: ".test"}, false},
-		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "Test"}, false},
-		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "---"}, false},
-		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "ad"}, false},
-		// Using an existing file for bucket name, but its not a directory (5).
-		{"simple-file.txt", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "simple-file.txt"}, false},
-		// Valid bucket names, but they donot exist (6-8).
-		{"volatile-bucket-1", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
-		{"volatile-bucket-2", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
-		{"volatile-bucket-3", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
-		// Testing for failure cases with both perfix and marker (11).
-		// The prefix and marker combination to be valid it should satisfy strings.HasPrefix(marker, prefix).
-		{"test-bucket-list-object", "asia", "europe-object", "", 0, ListObjectsInfo{}, fmt.Errorf("Invalid combination of marker '%s' and prefix '%s'", "europe-object", "asia"), false},
+		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: ".test"}, false},
+		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "Test"}, false},
+		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "---"}, false},
+		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "ad"}, false},
+		// Valid bucket names, but they do not exist (6-8).
+		{"volatile-bucket-1", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
+		{"volatile-bucket-2", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
+		{"volatile-bucket-3", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
+		// If marker is *after* the last possible object from the prefix it should return an empty list.
+		{"test-bucket-list-object", "Asia", "europe-object", "", 0, ListObjectsInfo{}, nil, true},
+		// If the marker is *before* the first possible object from the prefix it should return the first object.
+		{"test-bucket-list-object", "Asia", "A", "", 1, resultCases[4], nil, true},
 		// Setting a non-existing directory to be prefix (12-13).
 		{"empty-bucket", "europe/france/", "", "", 1, ListObjectsInfo{}, nil, true},
 		{"empty-bucket", "africa/tunisia/", "", "", 1, ListObjectsInfo{}, nil, true},
@@ -874,7 +878,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// Marker being set to a value which is lesser than and all object names when sorted (37).
 		// Expected to send all the objects in the bucket in this case.
 		{"test-bucket-list-object", "", "Abc", "", 10, resultCases[14], nil, true},
-		// Marker is to a hierarhical value (38-39).
+		// Marker is to a hierarchical value (38-39).
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", "", 10, resultCases[15], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", "", 10, resultCases[16], nil, true},
 		// Testing with marker and truncation, but no prefix (40-42).
@@ -905,7 +909,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		{"test-bucket-list-object", "Asia", "", SlashSeparator, 10, resultCases[25], nil, true},
 		{"test-bucket-list-object", "new", "", SlashSeparator, 10, resultCases[26], nil, true},
 		{"test-bucket-list-object", "Asia/India/", "", SlashSeparator, 10, resultCases[27], nil, true},
-		// Test with marker set as hierarhical value and with delimiter. (58-59)
+		// Test with marker set as hierarchical value and with delimiter. (58-59)
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", SlashSeparator, 10, resultCases[28], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", SlashSeparator, 10, resultCases[29], nil, true},
 		// Test with prefix and delimiter set to '/'. (60)
@@ -1563,19 +1567,16 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		shouldPass bool
 	}{
 		// Test cases with invalid bucket names ( Test number 1-4).
-		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: ".test"}, false},
-		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "Test"}, false},
-		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "---"}, false},
-		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "ad"}, false},
-		// Using an existing file for bucket name, but its not a directory (5).
-		{"simple-file.txt", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "simple-file.txt"}, false},
-		// Valid bucket names, but they donot exist (6-8).
-		{"volatile-bucket-1", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
-		{"volatile-bucket-2", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
-		{"volatile-bucket-3", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
-		// Testing for failure cases with both perfix and marker (9).
-		// The prefix and marker combination to be valid it should satisfy strings.HasPrefix(marker, prefix).
-		{"test-bucket-list-object", "asia", "europe-object", "", 0, ListObjectsInfo{}, fmt.Errorf("Invalid combination of marker '%s' and prefix '%s'", "europe-object", "asia"), false},
+		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: ".test"}, false},
+		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "Test"}, false},
+		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "---"}, false},
+		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "ad"}, false},
+		// Valid bucket names, but they do not exist (6-8).
+		{"volatile-bucket-1", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
+		{"volatile-bucket-2", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
+		{"volatile-bucket-3", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
+		// If marker is *after* the last possible object from the prefix it should return an empty list.
+		{"test-bucket-list-object", "Asia", "europe-object", "", 0, ListObjectsInfo{}, nil, true},
 		// Setting a non-existing directory to be prefix (10-11).
 		{"empty-bucket", "europe/france/", "", "", 1, ListObjectsInfo{}, nil, true},
 		{"empty-bucket", "africa/tunisia/", "", "", 1, ListObjectsInfo{}, nil, true},
@@ -1617,7 +1618,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		// Marker being set to a value which is lesser than and all object names when sorted (35).
 		// Expected to send all the objects in the bucket in this case.
 		{"test-bucket-list-object", "", "Abc", "", 10, resultCases[14], nil, true},
-		// Marker is to a hierarhical value (36-37).
+		// Marker is to a hierarchical value (36-37).
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", "", 10, resultCases[15], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", "", 10, resultCases[16], nil, true},
 		// Testing with marker and truncation, but no prefix (38-40).
@@ -1648,7 +1649,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		{"test-bucket-list-object", "Asia", "", SlashSeparator, 10, resultCases[25], nil, true},
 		{"test-bucket-list-object", "new", "", SlashSeparator, 10, resultCases[26], nil, true},
 		{"test-bucket-list-object", "Asia/India/", "", SlashSeparator, 10, resultCases[27], nil, true},
-		// Test with marker set as hierarhical value and with delimiter. (56-57)
+		// Test with marker set as hierarchical value and with delimiter. (56-57)
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", SlashSeparator, 10, resultCases[28], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", SlashSeparator, 10, resultCases[29], nil, true},
 		// Test with prefix and delimiter set to '/'. (58)
@@ -1671,6 +1672,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		{testBuckets[4], "file1/", "", "guidSplunk", 1000, resultCases[35], nil, true},
 		// Test listing at prefix with expected prefix markers
 		{testBuckets[5], "dir/", "", SlashSeparator, 1, resultCases[36], nil, true},
+		{"test-bucket-list-object", "Asia", "A", "", 1, resultCases[4], nil, true},
 	}
 
 	for i, testCase := range testCases {
@@ -1887,7 +1889,7 @@ func testListObjectsContinuation(obj ObjectLayer, instanceType string, t1 TestEr
 
 // Initialize FS backend for the benchmark.
 func initFSObjectsB(disk string, t *testing.B) (obj ObjectLayer) {
-	obj, _, err := initObjectLayer(context.Background(), mustGetPoolEndpoints(disk))
+	obj, _, err := initObjectLayer(context.Background(), mustGetPoolEndpoints(0, disk))
 	if err != nil {
 		t.Fatal(err)
 	}

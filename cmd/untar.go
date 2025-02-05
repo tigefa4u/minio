@@ -30,13 +30,13 @@ import (
 	"path"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/cosnicolaou/pbzip2"
 	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/compress/zstd"
 	gzip "github.com/klauspost/pgzip"
-	"github.com/minio/minio/internal/logger"
-	"github.com/pierrec/lz4"
+	"github.com/pierrec/lz4/v4"
 )
 
 // Max bzip2 concurrency across calls. 50% of GOMAXPROCS.
@@ -143,7 +143,8 @@ func untar(ctx context.Context, r io.Reader, putObject func(reader io.Reader, in
 	case formatS2:
 		r = s2.NewReader(bf)
 	case formatZstd:
-		dec, err := zstd.NewReader(bf)
+		// Limit to 16 MiB per stream.
+		dec, err := zstd.NewReader(bf, zstd.WithDecoderMaxWindow(16<<20))
 		if err != nil {
 			return err
 		}
@@ -202,7 +203,8 @@ func untar(ctx context.Context, r io.Reader, putObject func(reader io.Reader, in
 		}
 
 		name := header.Name
-		if name == slashSeparator {
+		switch path.Clean(name) {
+		case ".", slashSeparator:
 			continue
 		}
 
@@ -241,12 +243,12 @@ func untar(ctx context.Context, r io.Reader, putObject func(reader io.Reader, in
 					rc.Close()
 					<-asyncWriters
 					wg.Done()
-					//lint:ignore SA6002 we are fine with the tiny alloc
+					//nolint:staticcheck // SA6002 we are fine with the tiny alloc
 					poolBuf128k.Put(b)
 				}()
 				if err := putObject(&rc, fi, name); err != nil {
 					if o.ignoreErrs {
-						logger.LogIf(ctx, err)
+						s3LogIf(ctx, err)
 						return
 					}
 					asyncErrMu.Lock()
@@ -259,12 +261,18 @@ func untar(ctx context.Context, r io.Reader, putObject func(reader io.Reader, in
 			continue
 		}
 
+		// If zero or earlier modtime, set to current.
+		// Otherwise the resulting objects will be invalid.
+		if header.ModTime.UnixNano() <= 0 {
+			header.ModTime = time.Now()
+		}
+
 		// Sync upload.
 		rc := disconnectReader{r: tarReader}
 		if err := putObject(&rc, header.FileInfo(), name); err != nil {
 			rc.Close()
 			if o.ignoreErrs {
-				logger.LogIf(ctx, err)
+				s3LogIf(ctx, err)
 				continue
 			}
 			return err

@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"net/url"
 	"runtime"
@@ -29,11 +28,19 @@ import (
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
-// IPv4 addresses of local host.
-var localIP4 = mustGetLocalIP4()
+var (
+	// IPv4 addresses of localhost.
+	localIP4 = mustGetLocalIP4()
+
+	// IPv6 addresses of localhost.
+	localIP6 = mustGetLocalIP6()
+
+	// List of all local loopback addresses.
+	localLoopbacks = mustGetLocalLoopbacks()
+)
 
 // mustSplitHostPort is a wrapper to net.SplitHostPort() where error is assumed to be a fatal.
 func mustSplitHostPort(hostPort string) (host, port string) {
@@ -74,6 +81,16 @@ func mustGetLocalIPs() (ipList []net.IP) {
 	return ipList
 }
 
+func mustGetLocalLoopbacks() (ipList set.StringSet) {
+	ipList = set.NewStringSet()
+	for _, ip := range mustGetLocalIPs() {
+		if ip != nil && ip.IsLoopback() {
+			ipList.Add(ip.String())
+		}
+	}
+	return
+}
+
 // mustGetLocalIP4 returns IPv4 addresses of localhost.  It panics on error.
 func mustGetLocalIP4() (ipList set.StringSet) {
 	ipList = set.NewStringSet()
@@ -111,28 +128,9 @@ func getHostIP(host string) (ipList set.StringSet, err error) {
 	return ipList, err
 }
 
-// byLastOctetValue implements sort.Interface used in sorting a list
-// of ip address by their last octet value in descending order.
-type byLastOctetValue []net.IP
-
-func (n byLastOctetValue) Len() int      { return len(n) }
-func (n byLastOctetValue) Swap(i, j int) { n[i], n[j] = n[j], n[i] }
-func (n byLastOctetValue) Less(i, j int) bool {
-	// This case is needed when all ips in the list
-	// have same last octets, Following just ensures that
-	// 127.0.0.1 is moved to the end of the list.
-	if n[i].IsLoopback() {
-		return false
-	}
-	if n[j].IsLoopback() {
-		return true
-	}
-	return []byte(n[i].To4())[3] > []byte(n[j].To4())[3]
-}
-
-// sortIPs - sort ips based on higher octects.
+// sortIPs - sort ips based on higher octets.
 // The logic to sort by last octet is implemented to
-// prefer CIDRs with higher octects, this in-turn skips the
+// prefer CIDRs with higher octets, this in-turn skips the
 // localhost/loopback address to be not preferred as the
 // first ip on the list. Subsequently this list helps us print
 // a user friendly message with appropriate values.
@@ -152,7 +150,18 @@ func sortIPs(ipList []string) []string {
 		}
 	}
 
-	sort.Sort(byLastOctetValue(ipV4s))
+	sort.Slice(ipV4s, func(i, j int) bool {
+		// This case is needed when all ips in the list
+		// have same last octets, Following just ensures that
+		// 127.0.0.1 is moved to the end of the list.
+		if ipV4s[i].IsLoopback() {
+			return false
+		}
+		if ipV4s[j].IsLoopback() {
+			return true
+		}
+		return []byte(ipV4s[i].To4())[3] > []byte(ipV4s[j].To4())[3]
+	})
 
 	var ips []string
 	for _, ip := range ipV4s {
@@ -168,15 +177,15 @@ func getConsoleEndpoints() (consoleEndpoints []string) {
 	}
 	var ipList []string
 	if globalMinioConsoleHost == "" {
-		ipList = sortIPs(mustGetLocalIP4().ToSlice())
-		ipList = append(ipList, mustGetLocalIP6().ToSlice()...)
+		ipList = sortIPs(localIP4.ToSlice())
+		ipList = append(ipList, localIP6.ToSlice()...)
 	} else {
 		ipList = []string{globalMinioConsoleHost}
 	}
 
+	consoleEndpoints = make([]string, 0, len(ipList))
 	for _, ip := range ipList {
-		endpoint := fmt.Sprintf("%s://%s", getURLScheme(globalIsTLS), net.JoinHostPort(ip, globalMinioConsolePort))
-		consoleEndpoints = append(consoleEndpoints, endpoint)
+		consoleEndpoints = append(consoleEndpoints, getURLScheme(globalIsTLS)+"://"+net.JoinHostPort(ip, globalMinioConsolePort))
 	}
 
 	return consoleEndpoints
@@ -188,15 +197,15 @@ func getAPIEndpoints() (apiEndpoints []string) {
 	}
 	var ipList []string
 	if globalMinioHost == "" {
-		ipList = sortIPs(mustGetLocalIP4().ToSlice())
-		ipList = append(ipList, mustGetLocalIP6().ToSlice()...)
+		ipList = sortIPs(localIP4.ToSlice())
+		ipList = append(ipList, localIP6.ToSlice()...)
 	} else {
 		ipList = []string{globalMinioHost}
 	}
 
+	apiEndpoints = make([]string, 0, len(ipList))
 	for _, ip := range ipList {
-		endpoint := fmt.Sprintf("%s://%s", getURLScheme(globalIsTLS), net.JoinHostPort(ip, globalMinioPort))
-		apiEndpoints = append(apiEndpoints, endpoint)
+		apiEndpoints = append(apiEndpoints, getURLScheme(globalIsTLS)+"://"+net.JoinHostPort(ip, globalMinioPort))
 	}
 
 	return apiEndpoints
@@ -213,19 +222,6 @@ func isHostIP(ipAddress string) bool {
 		host = host[:i]
 	}
 	return net.ParseIP(host) != nil
-}
-
-// checkPortAvailability - check if given host and port is already in use.
-// Note: The check method tries to listen on given port and closes it.
-// It is possible to have a disconnected client in this tiny window of time.
-func checkPortAvailability(host, port string) (err error) {
-	l, err := net.Listen("tcp", net.JoinHostPort(host, port))
-	if err != nil {
-		return err
-	}
-	// As we are able to listen on this network, the port is not in use.
-	// Close the listener and continue check other networks.
-	return l.Close()
 }
 
 // extractHostPort - extracts host/port from many address formats

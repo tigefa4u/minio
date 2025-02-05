@@ -26,34 +26,24 @@ import (
 	"github.com/minio/minio/internal/logger"
 )
 
-// writeSTSErrorRespone writes error headers
-func writeSTSErrorResponse(ctx context.Context, w http.ResponseWriter, isErrCodeSTS bool, errCode STSErrorCode, errCtxt error) {
-	var err STSError
-	if isErrCodeSTS {
-		err = stsErrCodes.ToSTSErr(errCode)
-	}
-	if err.Code == "InternalError" || !isErrCodeSTS {
-		aerr := getAPIError(APIErrorCode(errCode))
-		if aerr.Code != "InternalError" {
-			err.Code = aerr.Code
-			err.Description = aerr.Description
-			err.HTTPStatusCode = aerr.HTTPStatusCode
-		}
-	}
+// writeSTSErrorResponse writes error headers
+func writeSTSErrorResponse(ctx context.Context, w http.ResponseWriter, errCode STSErrorCode, err error) {
+	stsErr := stsErrCodes.ToSTSErr(errCode)
+
 	// Generate error response.
 	stsErrorResponse := STSErrorResponse{}
-	stsErrorResponse.Error.Code = err.Code
+	stsErrorResponse.Error.Code = stsErr.Code
 	stsErrorResponse.RequestID = w.Header().Get(xhttp.AmzRequestID)
-	stsErrorResponse.Error.Message = err.Description
-	if errCtxt != nil {
-		stsErrorResponse.Error.Message = errCtxt.Error()
+	stsErrorResponse.Error.Message = stsErr.Description
+	if err != nil {
+		stsErrorResponse.Error.Message = err.Error()
 	}
 	switch errCode {
-	case ErrSTSInternalError, ErrSTSNotInitialized, ErrSTSUpstreamError:
-		logger.LogIf(ctx, errCtxt, logger.Minio)
+	case ErrSTSInternalError, ErrSTSUpstreamError:
+		stsLogIf(ctx, err, logger.ErrorKind)
 	}
 	encodedErrorResponse := encodeResponse(stsErrorResponse)
-	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeXML)
+	writeResponse(w, stsErr.HTTPStatusCode, encodedErrorResponse, mimeXML)
 }
 
 // STSError structure
@@ -91,7 +81,9 @@ const (
 	ErrSTSMalformedPolicyDocument
 	ErrSTSInsecureConnection
 	ErrSTSInvalidClientCertificate
+	ErrSTSTooManyIntermediateCAs
 	ErrSTSNotInitialized
+	ErrSTSIAMNotInitialized
 	ErrSTSUpstreamError
 	ErrSTSInternalError
 )
@@ -154,9 +146,19 @@ var stsErrCodes = stsErrorCodeMap{
 		Description:    "The provided client certificate is invalid. Retry with a different certificate.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrSTSTooManyIntermediateCAs: {
+		Code:           "TooManyIntermediateCAs",
+		Description:    "The provided client certificate contains too many intermediate CA certificates",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrSTSNotInitialized: {
 		Code:           "STSNotInitialized",
 		Description:    "STS API not initialized, please try again.",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSTSIAMNotInitialized: {
+		Code:           "STSIAMNotInitialized",
+		Description:    "STS IAM not initialized, please try again.",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
 	ErrSTSUpstreamError: {

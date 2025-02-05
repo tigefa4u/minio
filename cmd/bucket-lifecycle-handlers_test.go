@@ -29,7 +29,7 @@ import (
 
 // Test S3 Bucket lifecycle APIs with wrong credentials
 func TestBucketLifecycleWrongCredentials(t *testing.T) {
-	ExecObjectLayerAPITest(t, testBucketLifecycleHandlersWrongCredentials, []string{"GetBucketLifecycle", "PutBucketLifecycle", "DeleteBucketLifecycle"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testBucketLifecycleHandlersWrongCredentials, endpoints: []string{"GetBucketLifecycle", "PutBucketLifecycle", "DeleteBucketLifecycle"}})
 }
 
 // Test for authentication
@@ -145,7 +145,7 @@ func testBucketLifecycleHandlersWrongCredentials(obj ObjectLayer, instanceType, 
 
 // Test S3 Bucket lifecycle APIs
 func TestBucketLifecycle(t *testing.T) {
-	ExecObjectLayerAPITest(t, testBucketLifecycleHandlers, []string{"GetBucketLifecycle", "PutBucketLifecycle", "DeleteBucketLifecycle"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testBucketLifecycleHandlers, endpoints: []string{"GetBucketLifecycle", "PutBucketLifecycle", "DeleteBucketLifecycle"}})
 }
 
 // Simple tests of bucket lifecycle: PUT, GET, DELETE.
@@ -179,7 +179,7 @@ func testBucketLifecycleHandlers(obj ObjectLayer, instanceType, bucketName strin
 			lifecycleResponse:  []byte(``),
 			errorResponse: APIErrorResponse{
 				Resource: SlashSeparator + bucketName + SlashSeparator,
-				Code:     "InvalidRequest",
+				Code:     "InvalidArgument",
 				Message:  "Filter must have exactly one of Prefix, Tag, or And specified",
 			},
 
@@ -196,7 +196,7 @@ func testBucketLifecycleHandlers(obj ObjectLayer, instanceType, bucketName strin
 			lifecycleResponse:  []byte(``),
 			errorResponse: APIErrorResponse{
 				Resource: SlashSeparator + bucketName + SlashSeparator,
-				Code:     "InvalidRequest",
+				Code:     "InvalidArgument",
 				Message:  "Date must be provided in ISO 8601 format",
 			},
 

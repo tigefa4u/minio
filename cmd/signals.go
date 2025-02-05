@@ -23,13 +23,33 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/minio/minio/internal/logger"
 )
+
+func shutdownHealMRFWithTimeout() {
+	const shutdownTimeout = time.Minute
+
+	finished := make(chan struct{})
+	go func() {
+		globalMRFState.shutdown()
+		close(finished)
+	}()
+	select {
+	case <-time.After(shutdownTimeout):
+	case <-finished:
+	}
+}
 
 func handleSignals() {
 	// Custom exit function
 	exit := func(success bool) {
+		if globalLoggerOutput != nil {
+			globalLoggerOutput.Close()
+		}
+
 		// If global profiler is set stop before we exit.
 		globalProfilerMu.Lock()
 		defer globalProfilerMu.Unlock()
@@ -45,52 +65,59 @@ func handleSignals() {
 	}
 
 	stopProcess := func() bool {
-		var err, oerr error
+		shutdownHealMRFWithTimeout() // this can take time sometimes, it needs to be executed
+		// before stopping s3 operations
 
 		// send signal to various go-routines that they need to quit.
 		cancelGlobalContext()
 
-		if globalEventNotifier != nil {
-			globalEventNotifier.RemoveAllRemoteTargets()
-		}
-
 		if httpServer := newHTTPServerFn(); httpServer != nil {
-			err = httpServer.Shutdown()
-			if !errors.Is(err, http.ErrServerClosed) {
-				logger.LogIf(context.Background(), err)
+			if err := httpServer.Shutdown(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				shutdownLogIf(context.Background(), err)
 			}
 		}
 
 		if objAPI := newObjectLayerFn(); objAPI != nil {
-			oerr = objAPI.Shutdown(context.Background())
-			logger.LogIf(context.Background(), oerr)
+			shutdownLogIf(context.Background(), objAPI.Shutdown(context.Background()))
 		}
 
-		if srv := newConsoleServerFn(); srv != nil {
-			logger.LogIf(context.Background(), srv.Shutdown())
+		if globalBrowserEnabled {
+			if srv := newConsoleServerFn(); srv != nil {
+				shutdownLogIf(context.Background(), srv.Shutdown())
+			}
 		}
 
-		return (err == nil && oerr == nil)
+		if globalEventNotifier != nil {
+			globalEventNotifier.RemoveAllBucketTargets()
+		}
+
+		return true
 	}
 
 	for {
 		select {
 		case err := <-globalHTTPServerErrorCh:
-			logger.LogIf(context.Background(), err)
+			shutdownLogIf(context.Background(), err)
 			exit(stopProcess())
 		case osSignal := <-globalOSSignalCh:
 			logger.Info("Exiting on signal: %s", strings.ToUpper(osSignal.String()))
+			daemon.SdNotify(false, daemon.SdNotifyStopping)
 			exit(stopProcess())
 		case signal := <-globalServiceSignalCh:
 			switch signal {
 			case serviceRestart:
 				logger.Info("Restarting on service signal")
+				daemon.SdNotify(false, daemon.SdNotifyReloading)
 				stop := stopProcess()
 				rerr := restartProcess()
-				logger.LogIf(context.Background(), rerr)
+				if rerr == nil {
+					daemon.SdNotify(false, daemon.SdNotifyReady)
+				}
+				shutdownLogIf(context.Background(), rerr)
 				exit(stop && rerr == nil)
 			case serviceStop:
 				logger.Info("Stopping on service signal")
+				daemon.SdNotify(false, daemon.SdNotifyStopping)
 				exit(stopProcess())
 			}
 		}

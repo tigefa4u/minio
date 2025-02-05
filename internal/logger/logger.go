@@ -20,40 +20,44 @@ package logger
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"go/build"
+	"io"
+	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/minio/highwayhash"
-	"github.com/minio/madmin-go/v2"
-	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/color"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger/message/log"
+	"github.com/minio/pkg/v3/logger/message/log"
 )
 
 // HighwayHash key for logging in anonymous mode
 var magicHighwayHash256Key = []byte("\x4b\xe7\x34\xfa\x8e\x23\x8a\xcd\x26\x3e\x83\xe6\xbb\x96\x85\x52\x04\x0f\x93\x5d\xa3\x9f\x44\x14\x97\xe0\x9d\x13\x22\xde\x36\xa0")
 
-// LogLevel type
-type LogLevel int8
-
 // Enumerated level types
 const (
-	InfoLvl LogLevel = iota + 1
-	ErrorLvl
-	FatalLvl
-
-	Application = madmin.LogKindApplication
-	Minio       = madmin.LogKindMinio
-	All         = madmin.LogKindAll
+	// Log types errors
+	FatalKind   = madmin.LogKindFatal
+	WarningKind = madmin.LogKindWarning
+	ErrorKind   = madmin.LogKindError
+	EventKind   = madmin.LogKindEvent
+	InfoKind    = madmin.LogKindInfo
 )
 
-// MinimumLogLevel holds the minimum logging level to print - info by default
-var MinimumLogLevel = InfoLvl
+var (
+	// DisableLog avoids printing error/event/info kind of logs
+	DisableLog = false
+	// Output allows configuring custom writer, defaults to os.Stderr
+	Output io.Writer = os.Stderr
+)
 
 var trimStrings []string
 
@@ -66,18 +70,6 @@ var matchingFuncNames = [...]string{
 	// add more here ..
 }
 
-func (level LogLevel) String() string {
-	switch level {
-	case InfoLvl:
-		return "INFO"
-	case ErrorLvl:
-		return "ERROR"
-	case FatalLvl:
-		return "FATAL"
-	}
-	return ""
-}
-
 // quietFlag: Hide startup messages if enabled
 // jsonFlag: Display in JSON format, if enabled
 var (
@@ -88,11 +80,13 @@ var (
 
 // EnableQuiet - turns quiet option on.
 func EnableQuiet() {
+	color.TurnOff() // no colored outputs necessary in quiet mode.
 	quietFlag = true
 }
 
 // EnableJSON - outputs logs in json format.
 func EnableJSON() {
+	color.TurnOff() // no colored outputs necessary in JSON mode.
 	jsonFlag = true
 	quietFlag = true
 }
@@ -119,15 +113,32 @@ func RegisterError(f func(string, error, bool) string) {
 	errorFmtFunc = f
 }
 
-// Remove any duplicates and return unique entries.
-func uniqueEntries(paths []string) []string {
-	m := make(set.StringSet)
-	for _, p := range paths {
-		if !m.Contains(p) {
-			m.Add(p)
+// uniq swaps away duplicate elements in data, returning the size of the
+// unique set. data is expected to be pre-sorted, and the resulting set in
+// the range [0:size] will remain in sorted order. Uniq, following a
+// sort.Sort call, can be used to prepare arbitrary inputs for use as sets.
+func uniq(data sort.Interface) (size int) {
+	p, l := 0, data.Len()
+	if l <= 1 {
+		return l
+	}
+	for i := 1; i < l; i++ {
+		if !data.Less(p, i) {
+			continue
+		}
+		p++
+		if p < i {
+			data.Swap(p, i)
 		}
 	}
-	return m.ToSlice()
+	return p + 1
+}
+
+// Remove any duplicates and return unique entries.
+func uniqueEntries(paths []string) []string {
+	sort.Strings(paths)
+	n := uniq(sort.StringSlice(paths))
+	return paths[:n]
 }
 
 // Init sets the trimStrings to possible GOPATHs
@@ -139,17 +150,17 @@ func Init(goPath string, goRoot string) {
 	var goRootList []string
 	var defaultgoPathList []string
 	var defaultgoRootList []string
-	pathSeperator := ":"
+	pathSeparator := ":"
 	// Add all possible GOPATH paths into trimStrings
 	// Split GOPATH depending on the OS type
 	if runtime.GOOS == "windows" {
-		pathSeperator = ";"
+		pathSeparator = ";"
 	}
 
-	goPathList = strings.Split(goPath, pathSeperator)
-	goRootList = strings.Split(goRoot, pathSeperator)
-	defaultgoPathList = strings.Split(build.Default.GOPATH, pathSeperator)
-	defaultgoRootList = strings.Split(build.Default.GOROOT, pathSeperator)
+	goPathList = strings.Split(goPath, pathSeparator)
+	goRootList = strings.Split(goRoot, pathSeparator)
+	defaultgoPathList = strings.Split(build.Default.GOPATH, pathSeparator)
+	defaultgoRootList = strings.Split(build.Default.GOROOT, pathSeparator)
 
 	// Add trim string "{GOROOT}/src/" into trimStrings
 	trimStrings = []string{filepath.Join(runtime.GOROOT(), "src") + string(filepath.Separator)}
@@ -231,8 +242,8 @@ func getTrace(traceLevel int) []string {
 	return trace
 }
 
-// Return the highway hash of the passed string
-func hashString(input string) string {
+// HashString - return the highway hash of the passed string
+func HashString(input string) string {
 	hh, _ := highwayhash.New(magicHighwayHash256Key)
 	hh.Write([]byte(input))
 	return hex.EncodeToString(hh.Sum(nil))
@@ -240,55 +251,84 @@ func hashString(input string) string {
 
 // LogAlwaysIf prints a detailed error message during
 // the execution of the server.
-func LogAlwaysIf(ctx context.Context, err error, errKind ...interface{}) {
+func LogAlwaysIf(ctx context.Context, subsystem string, err error, errKind ...interface{}) {
 	if err == nil {
 		return
 	}
-
-	logIf(ctx, err, errKind...)
+	logIf(ctx, subsystem, err, errKind...)
 }
 
 // LogIf prints a detailed error message during
 // the execution of the server, if it is not an
 // ignored error.
-func LogIf(ctx context.Context, err error, errKind ...interface{}) {
+func LogIf(ctx context.Context, subsystem string, err error, errKind ...interface{}) {
 	if logIgnoreError(err) {
 		return
 	}
-	logIf(ctx, err, errKind...)
+	logIf(ctx, subsystem, err, errKind...)
 }
 
-func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entry {
-	logKind := madmin.LogKindAll
+// LogIfNot prints a detailed error message during
+// the execution of the server, if it is not an ignored error (either internal or given).
+func LogIfNot(ctx context.Context, subsystem string, err error, ignored ...error) {
+	if logIgnoreError(err) {
+		return
+	}
+	for _, ignore := range ignored {
+		if errors.Is(err, ignore) {
+			return
+		}
+	}
+	logIf(ctx, subsystem, err)
+}
+
+func errToEntry(ctx context.Context, subsystem string, err error, errKind ...interface{}) log.Entry {
+	var l string
+	if anonFlag {
+		l = reflect.TypeOf(err).String()
+	} else {
+		l = fmt.Sprintf("%v (%T)", err, err)
+	}
+	return buildLogEntry(ctx, subsystem, l, getTrace(3), errKind...)
+}
+
+func logToEntry(ctx context.Context, subsystem, message string, errKind ...interface{}) log.Entry {
+	return buildLogEntry(ctx, subsystem, message, nil, errKind...)
+}
+
+func buildLogEntry(ctx context.Context, subsystem, message string, trace []string, errKind ...interface{}) log.Entry {
+	logKind := madmin.LogKindError
 	if len(errKind) > 0 {
 		if ek, ok := errKind[0].(madmin.LogKind); ok {
 			logKind = ek
 		}
 	}
-	req := GetReqInfo(ctx)
 
+	req := GetReqInfo(ctx)
 	if req == nil {
-		req = &ReqInfo{API: "SYSTEM"}
+		req = &ReqInfo{
+			API:       "SYSTEM",
+			RequestID: fmt.Sprintf("%X", time.Now().UTC().UnixNano()),
+		}
 	}
 	req.RLock()
 	defer req.RUnlock()
 
 	API := "SYSTEM"
-	if req.API != "" {
+	switch {
+	case req.API != "":
 		API = req.API
+	case subsystem != "":
+		API += "." + subsystem
 	}
 
-	kv := req.GetTags()
-	tags := make(map[string]interface{}, len(kv))
-	for _, entry := range kv {
+	// Copy tags. We hold read lock already.
+	tags := make(map[string]interface{}, len(req.tags))
+	for _, entry := range req.tags {
 		tags[entry.Key] = entry.Val
 	}
 
-	// Get full stack trace
-	trace := getTrace(3)
-
 	// Get the cause for the Error
-	message := fmt.Sprintf("%v (%T)", err, err)
 	deploymentID := req.DeploymentID
 	if req.DeploymentID == "" {
 		deploymentID = xhttp.GlobalDeploymentID
@@ -304,8 +344,7 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 
 	entry := log.Entry{
 		DeploymentID: deploymentID,
-		Level:        ErrorLvl.String(),
-		LogKind:      logKind,
+		Level:        logKind,
 		RemoteHost:   req.RemoteHost,
 		Host:         req.Host,
 		RequestID:    req.RequestID,
@@ -320,19 +359,25 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 				Objects:   objects,
 			},
 		},
-		Trace: &log.Trace{
+	}
+
+	if trace != nil {
+		entry.Trace = &log.Trace{
 			Message:   message,
 			Source:    trace,
 			Variables: tags,
-		},
+		}
+	} else {
+		entry.Message = message
 	}
 
 	if anonFlag {
-		entry.API.Args.Bucket = hashString(entry.API.Args.Bucket)
-		entry.API.Args.Object = hashString(entry.API.Args.Object)
-		entry.RemoteHost = hashString(entry.RemoteHost)
-		entry.Trace.Message = reflect.TypeOf(err).String()
-		entry.Trace.Variables = make(map[string]interface{})
+		entry.API.Args.Bucket = HashString(entry.API.Args.Bucket)
+		entry.API.Args.Object = HashString(entry.API.Args.Object)
+		entry.RemoteHost = HashString(entry.RemoteHost)
+		if entry.Trace != nil {
+			entry.Trace.Variables = make(map[string]interface{})
+		}
 	}
 
 	return entry
@@ -340,39 +385,55 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 
 // consoleLogIf prints a detailed error message during
 // the execution of the server.
-func consoleLogIf(ctx context.Context, err error, errKind ...interface{}) {
-	if MinimumLogLevel > ErrorLvl {
+func consoleLogIf(ctx context.Context, subsystem string, err error, errKind ...interface{}) {
+	if DisableLog {
 		return
 	}
-
+	if err == nil {
+		return
+	}
 	if consoleTgt != nil {
-		entry := errToEntry(ctx, err, errKind...)
-		consoleTgt.Send(entry)
+		entry := errToEntry(ctx, subsystem, err, errKind...)
+		consoleTgt.Send(ctx, entry)
 	}
 }
 
 // logIf prints a detailed error message during
 // the execution of the server.
-func logIf(ctx context.Context, err error, errKind ...interface{}) {
-	if MinimumLogLevel > ErrorLvl {
+func logIf(ctx context.Context, subsystem string, err error, errKind ...interface{}) {
+	if DisableLog {
 		return
 	}
+	if err == nil {
+		return
+	}
+	entry := errToEntry(ctx, subsystem, err, errKind...)
+	sendLog(ctx, entry)
+}
 
+func sendLog(ctx context.Context, entry log.Entry) {
 	systemTgts := SystemTargets()
 	if len(systemTgts) == 0 {
 		return
 	}
 
-	entry := errToEntry(ctx, err, errKind...)
 	// Iterate over all logger targets to send the log entry
 	for _, t := range systemTgts {
-		if err := t.Send(entry); err != nil {
-			if consoleTgt != nil {
-				entry.Trace.Message = fmt.Sprintf("event(%#v) was not sent to Logger target (%#v): %#v", entry, t, err)
-				consoleTgt.Send(entry)
+		if err := t.Send(ctx, entry); err != nil {
+			if consoleTgt != nil { // Sending to the console never fails
+				consoleTgt.Send(ctx, errToEntry(ctx, "logging", fmt.Errorf("unable to send log event to Logger target (%s): %v", t.String(), err), entry.Level))
 			}
 		}
 	}
+}
+
+// Event sends a event log to  log targets
+func Event(ctx context.Context, subsystem, msg string, args ...interface{}) {
+	if DisableLog {
+		return
+	}
+	entry := logToEntry(ctx, subsystem, fmt.Sprintf(msg, args...), EventKind)
+	sendLog(ctx, entry)
 }
 
 // ErrCritical is the value panic'd whenever CriticalIf is called.
@@ -382,7 +443,7 @@ var ErrCritical struct{}
 // current go-routine by causing a `panic(ErrCritical)`.
 func CriticalIf(ctx context.Context, err error, errKind ...interface{}) {
 	if err != nil {
-		LogIf(ctx, err, errKind...)
+		LogIf(ctx, "", err, errKind...)
 		panic(ErrCritical)
 	}
 }

@@ -18,7 +18,6 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -26,8 +25,6 @@ import (
 	"strings"
 
 	"github.com/klauspost/reedsolomon"
-	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
 )
 
 // getDataBlockLen - get length of data blocks from encoded blocks.
@@ -45,19 +42,16 @@ func getDataBlockLen(enBlocks [][]byte, dataBlocks int) int {
 func writeDataBlocks(ctx context.Context, dst io.Writer, enBlocks [][]byte, dataBlocks int, offset int64, length int64) (int64, error) {
 	// Offset and out size cannot be negative.
 	if offset < 0 || length < 0 {
-		logger.LogIf(ctx, errUnexpected)
 		return 0, errUnexpected
 	}
 
 	// Do we have enough blocks?
 	if len(enBlocks) < dataBlocks {
-		logger.LogIf(ctx, fmt.Errorf("diskBlocks(%d)/dataBlocks(%d) - %w", len(enBlocks), dataBlocks, reedsolomon.ErrTooFewShards))
 		return 0, reedsolomon.ErrTooFewShards
 	}
 
 	// Do we have enough data?
 	if int64(getDataBlockLen(enBlocks, dataBlocks)) < length {
-		logger.LogIf(ctx, fmt.Errorf("getDataBlockLen(enBlocks, dataBlocks)(%d)/length(%d) - %w", getDataBlockLen(enBlocks, dataBlocks), length, reedsolomon.ErrShortData))
 		return 0, reedsolomon.ErrShortData
 	}
 
@@ -74,46 +68,36 @@ func writeDataBlocks(ctx context.Context, dst io.Writer, enBlocks [][]byte, data
 			// Decrement offset.
 			offset -= int64(len(block))
 			continue
-		} else {
-			// Skip until offset.
-			block = block[offset:]
-
-			// Reset the offset for next iteration to read everything
-			// from subsequent blocks.
-			offset = 0
 		}
+
+		// Skip until offset.
+		block = block[offset:]
+
+		// Reset the offset for next iteration to read everything
+		// from subsequent blocks.
+		offset = 0
 
 		// We have written all the blocks, write the last remaining block.
 		if write < int64(len(block)) {
-			n, err := xioutil.Copy(dst, bytes.NewReader(block[:write]))
+			n, err := dst.Write(block[:write])
 			if err != nil {
-				// The writer will be closed incase of range queries, which will emit ErrClosedPipe.
-				// The reader pipe might be closed at ListObjects io.EOF ignore it.
-				if err != io.ErrClosedPipe && err != io.EOF {
-					logger.LogIf(ctx, err)
-				}
 				return 0, err
 			}
-			totalWritten += n
+			totalWritten += int64(n)
 			break
 		}
 
 		// Copy the block.
-		n, err := xioutil.Copy(dst, bytes.NewReader(block))
+		n, err := dst.Write(block)
 		if err != nil {
-			// The writer will be closed incase of range queries, which will emit ErrClosedPipe.
-			// The reader pipe might be closed at ListObjects io.EOF ignore it.
-			if err != io.ErrClosedPipe && err != io.EOF {
-				logger.LogIf(ctx, err)
-			}
 			return 0, err
 		}
 
 		// Decrement output size.
-		write -= n
+		write -= int64(n)
 
 		// Increment written.
-		totalWritten += n
+		totalWritten += int64(n)
 	}
 
 	// Success.

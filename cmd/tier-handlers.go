@@ -21,13 +21,13 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 
-	"github.com/gorilla/mux"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config/storageclass"
-	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/policy"
 )
 
 var (
@@ -70,13 +70,10 @@ var (
 )
 
 func (api adminAPIHandlers) AddTierHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "AddTier")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objAPI, cred := validateAdminReq(ctx, w, r, iampolicy.SetTierAction)
-	if objAPI == nil || globalNotificationSys == nil || globalTierConfigMgr == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+	objAPI, cred := validateAdminReq(ctx, w, r, policy.SetTierAction)
+	if objAPI == nil {
 		return
 	}
 
@@ -94,6 +91,11 @@ func (api adminAPIHandlers) AddTierHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	var ignoreInUse bool
+	if forceStr := r.Form.Get("force"); forceStr != "" {
+		ignoreInUse, _ = strconv.ParseBool(forceStr)
+	}
+
 	// Disallow remote tiers with internal storage class names
 	switch cfg.Name {
 	case storageclass.STANDARD, storageclass.RRS:
@@ -107,7 +109,7 @@ func (api adminAPIHandlers) AddTierHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	err = globalTierConfigMgr.Add(ctx, cfg)
+	err = globalTierConfigMgr.Add(ctx, cfg, ignoreInUse)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -124,13 +126,10 @@ func (api adminAPIHandlers) AddTierHandler(w http.ResponseWriter, r *http.Reques
 }
 
 func (api adminAPIHandlers) ListTierHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListTier")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ListTierAction)
-	if objAPI == nil || globalNotificationSys == nil || globalTierConfigMgr == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+	objAPI, _ := validateAdminReq(ctx, w, r, policy.ListTierAction)
+	if objAPI == nil {
 		return
 	}
 
@@ -141,17 +140,15 @@ func (api adminAPIHandlers) ListTierHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	w.Header().Set(tierCfgRefreshAtHdr, globalTierConfigMgr.refreshedAt().String())
 	writeSuccessResponseJSON(w, data)
 }
 
 func (api adminAPIHandlers) EditTierHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "EditTier")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objAPI, cred := validateAdminReq(ctx, w, r, iampolicy.SetTierAction)
-	if objAPI == nil || globalNotificationSys == nil || globalTierConfigMgr == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+	objAPI, cred := validateAdminReq(ctx, w, r, policy.SetTierAction)
+	if objAPI == nil {
 		return
 	}
 	vars := mux.Vars(r)
@@ -192,24 +189,23 @@ func (api adminAPIHandlers) EditTierHandler(w http.ResponseWriter, r *http.Reque
 }
 
 func (api adminAPIHandlers) RemoveTierHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RemoveTier")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SetTierAction)
-	if objAPI == nil || globalNotificationSys == nil || globalTierConfigMgr == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+	objAPI, _ := validateAdminReq(ctx, w, r, policy.SetTierAction)
+	if objAPI == nil {
 		return
 	}
 
 	vars := mux.Vars(r)
 	tier := vars["tier"]
+	force := r.Form.Get("force") == "true"
+
 	if err := globalTierConfigMgr.Reload(ctx, objAPI); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err := globalTierConfigMgr.Remove(ctx, tier); err != nil {
+	if err := globalTierConfigMgr.Remove(ctx, tier, force); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
@@ -224,13 +220,10 @@ func (api adminAPIHandlers) RemoveTierHandler(w http.ResponseWriter, r *http.Req
 }
 
 func (api adminAPIHandlers) VerifyTierHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "VerifyTier")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ListTierAction)
-	if objAPI == nil || globalNotificationSys == nil || globalTierConfigMgr == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+	objAPI, _ := validateAdminReq(ctx, w, r, policy.ListTierAction)
+	if objAPI == nil {
 		return
 	}
 
@@ -245,13 +238,10 @@ func (api adminAPIHandlers) VerifyTierHandler(w http.ResponseWriter, r *http.Req
 }
 
 func (api adminAPIHandlers) TierStatsHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "TierStats")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ListTierAction)
-	if objAPI == nil || globalNotificationSys == nil || globalTierConfigMgr == nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+	objAPI, _ := validateAdminReq(ctx, w, r, policy.ListTierAction)
+	if objAPI == nil {
 		return
 	}
 

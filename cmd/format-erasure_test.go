@@ -21,7 +21,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"os"
 	"reflect"
 	"testing"
@@ -36,9 +35,9 @@ func TestFixFormatV3(t *testing.T) {
 	for _, erasureDir := range erasureDirs {
 		defer os.RemoveAll(erasureDir)
 	}
-	endpoints := mustGetNewEndpoints(erasureDirs...)
+	endpoints := mustGetNewEndpoints(0, 8, erasureDirs...)
 
-	storageDisks, errs := initStorageDisksWithErrors(endpoints, true)
+	storageDisks, errs := initStorageDisksWithErrors(endpoints, storageOpts{cleanUp: false, healthCheck: false})
 	for _, err := range errs {
 		if err != nil && err != errDiskNotFound {
 			t.Fatal(err)
@@ -431,62 +430,6 @@ func BenchmarkGetFormatErasureInQuorum(b *testing.B) {
 	}
 }
 
-// Tests formatErasureGetDeploymentID()
-func TestGetErasureID(t *testing.T) {
-	setCount := 2
-	setDriveCount := 8
-
-	format := newFormatErasureV3(setCount, setDriveCount)
-	format.Erasure.DistributionAlgo = formatErasureVersionV2DistributionAlgoV1
-	formats := make([]*formatErasureV3, 16)
-
-	for i := 0; i < setCount; i++ {
-		for j := 0; j < setDriveCount; j++ {
-			newFormat := format.Clone()
-			newFormat.Erasure.This = format.Erasure.Sets[i][j]
-			formats[i*setDriveCount+j] = newFormat
-		}
-	}
-
-	// Return a format from list of formats in quorum.
-	quorumFormat, err := getFormatErasureInQuorum(formats)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Check if the reference format and input formats are same.
-	var id string
-	if id, err = formatErasureGetDeploymentID(quorumFormat, formats); err != nil {
-		t.Fatal(err)
-	}
-
-	if id == "" {
-		t.Fatal("ID cannot be empty.")
-	}
-
-	formats[0] = nil
-	if id, err = formatErasureGetDeploymentID(quorumFormat, formats); err != nil {
-		t.Fatal(err)
-	}
-	if id == "" {
-		t.Fatal("ID cannot be empty.")
-	}
-
-	formats[1].Erasure.Sets[0][0] = "bad-uuid"
-	if id, err = formatErasureGetDeploymentID(quorumFormat, formats); err != nil {
-		t.Fatal(err)
-	}
-
-	if id == "" {
-		t.Fatal("ID cannot be empty.")
-	}
-
-	formats[2].ID = "bad-id"
-	if _, err = formatErasureGetDeploymentID(quorumFormat, formats); !errors.Is(err, errCorruptedFormat) {
-		t.Fatalf("Unexpect error %s", err)
-	}
-}
-
 // Initialize new format sets.
 func TestNewFormatSets(t *testing.T) {
 	setCount := 2
@@ -513,7 +456,7 @@ func TestNewFormatSets(t *testing.T) {
 	// 16th disk is unformatted.
 	errs[15] = errUnformattedDisk
 
-	newFormats := newHealFormatSets(quorumFormat, setCount, setDriveCount, formats, errs)
+	newFormats, _ := newHealFormatSets(quorumFormat, setCount, setDriveCount, formats, errs)
 	if newFormats == nil {
 		t.Fatal("Unexpected failure")
 	}
@@ -555,11 +498,12 @@ func benchmarkInitStorageDisksN(b *testing.B, nDisks int) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	endpoints := mustGetNewEndpoints(fsDirs...)
+
+	endpoints := mustGetNewEndpoints(0, 16, fsDirs...)
 	b.RunParallel(func(pb *testing.PB) {
 		endpoints := endpoints
 		for pb.Next() {
-			initStorageDisksWithErrors(endpoints, true)
+			initStorageDisksWithErrors(endpoints, storageOpts{cleanUp: false, healthCheck: false})
 		}
 	})
 }

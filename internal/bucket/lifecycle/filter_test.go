@@ -21,6 +21,8 @@ import (
 	"encoding/xml"
 	"fmt"
 	"testing"
+
+	"github.com/dustin/go-humanize"
 )
 
 // TestUnsupportedFilters checks if parsing Filter xml with
@@ -120,6 +122,221 @@ func TestUnsupportedFilters(t *testing.T) {
 			err = filter.Validate()
 			if err != tc.expectedErr {
 				t.Fatalf("%d: Expected %v but got %v", i+1, tc.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestObjectSizeFilters(t *testing.T) {
+	f1 := Filter{
+		set: true,
+		Prefix: Prefix{
+			string: "doc/",
+			set:    true,
+			Unused: struct{}{},
+		},
+		ObjectSizeGreaterThan: 100 * humanize.MiByte,
+		ObjectSizeLessThan:    100 * humanize.GiByte,
+	}
+	b, err := xml.Marshal(f1)
+	if err != nil {
+		t.Fatalf("Failed to marshal %v", f1)
+	}
+	var f2 Filter
+	err = xml.Unmarshal(b, &f2)
+	if err != nil {
+		t.Fatalf("Failed to unmarshal %s", string(b))
+	}
+	if f1.ObjectSizeLessThan != f2.ObjectSizeLessThan {
+		t.Fatalf("Expected %v but got %v", f1.ObjectSizeLessThan, f2.And.ObjectSizeLessThan)
+	}
+	if f1.ObjectSizeGreaterThan != f2.ObjectSizeGreaterThan {
+		t.Fatalf("Expected %v but got %v", f1.ObjectSizeGreaterThan, f2.And.ObjectSizeGreaterThan)
+	}
+
+	f1 = Filter{
+		set: true,
+		And: And{
+			ObjectSizeGreaterThan: 100 * humanize.MiByte,
+			ObjectSizeLessThan:    1 * humanize.GiByte,
+			Prefix:                Prefix{},
+		},
+		andSet: true,
+	}
+	b, err = xml.Marshal(f1)
+	if err != nil {
+		t.Fatalf("Failed to marshal %v", f1)
+	}
+	f2 = Filter{}
+	err = xml.Unmarshal(b, &f2)
+	if err != nil {
+		t.Fatalf("Failed to unmarshal %s", string(b))
+	}
+	if f1.And.ObjectSizeLessThan != f2.And.ObjectSizeLessThan {
+		t.Fatalf("Expected %v but got %v", f1.And.ObjectSizeLessThan, f2.And.ObjectSizeLessThan)
+	}
+	if f1.And.ObjectSizeGreaterThan != f2.And.ObjectSizeGreaterThan {
+		t.Fatalf("Expected %v but got %v", f1.And.ObjectSizeGreaterThan, f2.And.ObjectSizeGreaterThan)
+	}
+
+	fiGt := Filter{
+		ObjectSizeGreaterThan: 1 * humanize.MiByte,
+	}
+	fiLt := Filter{
+		ObjectSizeLessThan: 100 * humanize.MiByte,
+	}
+	fiLtAndGt := Filter{
+		And: And{
+			ObjectSizeGreaterThan: 1 * humanize.MiByte,
+			ObjectSizeLessThan:    100 * humanize.MiByte,
+		},
+	}
+
+	tests := []struct {
+		filter  Filter
+		objSize int64
+		want    bool
+	}{
+		{
+			filter:  fiLt,
+			objSize: 101 * humanize.MiByte,
+			want:    false,
+		},
+		{
+			filter:  fiLt,
+			objSize: 99 * humanize.MiByte,
+			want:    true,
+		},
+		{
+			filter:  fiGt,
+			objSize: 1*humanize.MiByte - 1,
+			want:    false,
+		},
+		{
+			filter:  fiGt,
+			objSize: 1*humanize.MiByte + 1,
+			want:    true,
+		},
+		{
+			filter:  fiLtAndGt,
+			objSize: 1*humanize.MiByte - 1,
+			want:    false,
+		},
+		{
+			filter:  fiLtAndGt,
+			objSize: 2 * humanize.MiByte,
+			want:    true,
+		},
+		{
+			filter:  fiLtAndGt,
+			objSize: 100*humanize.MiByte + 1,
+			want:    false,
+		},
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("Test %d", i+1), func(t *testing.T) {
+			if got := test.filter.BySize(test.objSize); got != test.want {
+				t.Fatalf("Expected %v but got %v", test.want, got)
+			}
+		})
+	}
+}
+
+func TestTestTags(t *testing.T) {
+	noTags := Filter{
+		set: true,
+		And: And{
+			Tags: []Tag{},
+		},
+		andSet: true,
+	}
+
+	oneTag := Filter{
+		set: true,
+		And: And{
+			Tags: []Tag{{Key: "FOO", Value: "1"}},
+		},
+		andSet: true,
+	}
+
+	twoTags := Filter{
+		set: true,
+		And: And{
+			Tags: []Tag{{Key: "FOO", Value: "1"}, {Key: "BAR", Value: "2"}},
+		},
+		andSet: true,
+	}
+
+	tests := []struct {
+		filter   Filter
+		userTags string
+		want     bool
+	}{
+		{
+			filter:   noTags,
+			userTags: "",
+			want:     true,
+		},
+		{
+			filter:   noTags,
+			userTags: "A=3",
+			want:     true,
+		},
+		{
+			filter:   oneTag,
+			userTags: "A=3",
+			want:     false,
+		},
+		{
+			filter:   oneTag,
+			userTags: "FOO=1",
+			want:     true,
+		},
+		{
+			filter:   oneTag,
+			userTags: "A=B&FOO=1",
+			want:     true,
+		},
+		{
+			filter:   twoTags,
+			userTags: "",
+			want:     false,
+		},
+		{
+			filter:   twoTags,
+			userTags: "FOO=1",
+			want:     false,
+		},
+		{
+			filter:   twoTags,
+			userTags: "BAR=2",
+			want:     false,
+		},
+		{
+			filter:   twoTags,
+			userTags: "FOO=2&BAR=2",
+			want:     false,
+		},
+		{
+			filter:   twoTags,
+			userTags: "F=1&B=2",
+			want:     false,
+		},
+		{
+			filter:   twoTags,
+			userTags: "FOO=1&BAR=2",
+			want:     true,
+		},
+		{
+			filter:   twoTags,
+			userTags: "BAR=2&FOO=1",
+			want:     true,
+		},
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("Test %d", i+1), func(t *testing.T) {
+			if got := test.filter.TestTags(test.userTags); got != test.want {
+				t.Errorf("Expected %v but got %v", test.want, got)
 			}
 		})
 	}

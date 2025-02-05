@@ -19,18 +19,146 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
+	"net/http/httptest"
+	"path"
 	"reflect"
+	"runtime"
 	"strconv"
 	"testing"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config/compress"
 	"github.com/minio/minio/internal/crypto"
-	"github.com/minio/pkg/trie"
+	"github.com/minio/pkg/v3/trie"
 )
+
+func pathJoinOld(elem ...string) string {
+	trailingSlash := ""
+	if len(elem) > 0 {
+		if hasSuffixByte(elem[len(elem)-1], SlashSeparatorChar) {
+			trailingSlash = SlashSeparator
+		}
+	}
+	return path.Join(elem...) + trailingSlash
+}
+
+func concatNaive(ss ...string) string {
+	rs := ss[0]
+	for i := 1; i < len(ss); i++ {
+		rs += ss[i]
+	}
+	return rs
+}
+
+func benchmark(b *testing.B, data []string) {
+	b.Run("concat naive", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			concatNaive(data...)
+		}
+	})
+	b.Run("concat fast", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			concat(data...)
+		}
+	})
+}
+
+func BenchmarkConcatImplementation(b *testing.B) {
+	data := make([]string, 2)
+	rng := rand.New(rand.NewSource(0))
+	for i := 0; i < 2; i++ {
+		var tmp [16]byte
+		rng.Read(tmp[:])
+		data[i] = hex.EncodeToString(tmp[:])
+	}
+	b.ResetTimer()
+	benchmark(b, data)
+}
+
+func BenchmarkPathJoinOld(b *testing.B) {
+	b.Run("PathJoin", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			pathJoinOld("volume", "path/path/path")
+		}
+	})
+}
+
+func BenchmarkPathJoin(b *testing.B) {
+	b.Run("PathJoin", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			pathJoin("volume", "path/path/path")
+		}
+	})
+}
+
+// Wrapper
+func TestPathTraversalExploit(t *testing.T) {
+	if runtime.GOOS != globalWindowsOSName {
+		t.Skip()
+	}
+	defer DetectTestLeak(t)()
+	ExecExtendedObjectLayerAPITest(t, testPathTraversalExploit, []string{"PutObject"})
+}
+
+// testPathTraversal exploit test, exploits path traversal on windows
+// with following object names "\\../.minio.sys/config/iam/${username}/identity.json"
+// #16852
+func testPathTraversalExploit(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
+	credentials auth.Credentials, t *testing.T,
+) {
+	if err := newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatalf("Initializing config.json failed")
+	}
+
+	objectName := `\../.minio.sys/config/hello.txt`
+
+	// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
+	rec := httptest.NewRecorder()
+	// construct HTTP request for Get Object end point.
+	req, err := newTestSignedRequestV4(http.MethodPut, getPutObjectURL("", bucketName, objectName),
+		int64(5), bytes.NewReader([]byte("hello")), credentials.AccessKey, credentials.SecretKey, map[string]string{})
+	if err != nil {
+		t.Fatalf("failed to create HTTP request for Put Object: <ERROR> %v", err)
+	}
+
+	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
+	// Call the ServeHTTP to execute the handler.
+	apiRouter.ServeHTTP(rec, req)
+
+	ctx, cancel := context.WithCancel(GlobalContext)
+	defer cancel()
+
+	// Now check if we actually wrote to backend (regardless of the response
+	// returned by the server).
+	z := obj.(*erasureServerPools)
+	xl := z.serverPools[0].sets[0]
+	erasureDisks := xl.getDisks()
+	parts, errs := readAllFileInfo(ctx, erasureDisks, "", bucketName, objectName, "", false, false)
+	for i := range parts {
+		if errs[i] == nil {
+			if parts[i].Name == objectName {
+				t.Errorf("path traversal allowed to allow writing to minioMetaBucket: %s", instanceType)
+			}
+		}
+	}
+}
 
 // Tests validate bucket name.
 func TestIsValidBucketName(t *testing.T) {
@@ -60,7 +188,7 @@ func TestIsValidBucketName(t *testing.T) {
 		{"192.168.1.1", false},
 		{"$this-is-not-valid-too", false},
 		{"contains-$-dollar", false},
-		{"contains-^-carret", false},
+		{"contains-^-caret", false},
 		{"contains-$-dollar", false},
 		{"contains-$-dollar", false},
 		{"......", false},
@@ -106,7 +234,7 @@ func TestIsValidObjectName(t *testing.T) {
 		{"117Gn8rfHL2ACARPAhaFd0AGzic9pUbIA/5OCn5A", true},
 		{"SHØRT", true},
 		{"f*le", true},
-		{"contains-^-carret", true},
+		{"contains-^-caret", true},
 		{"contains-|-pipe", true},
 		{"contains-`-tick", true},
 		{"..test", true},
@@ -481,7 +609,6 @@ func TestGetActualSize(t *testing.T) {
 			objInfo: ObjectInfo{
 				UserDefined: map[string]string{
 					"X-Minio-Internal-compression": "klauspost/compress/s2",
-					"X-Minio-Internal-actual-size": "100000001",
 					"content-type":                 "application/octet-stream",
 					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
 				},
@@ -495,6 +622,7 @@ func TestGetActualSize(t *testing.T) {
 						ActualSize: 32891137,
 					},
 				},
+				Size: 100000001,
 			},
 			result: 100000001,
 		},
@@ -507,6 +635,7 @@ func TestGetActualSize(t *testing.T) {
 					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
 				},
 				Parts: []ObjectPartInfo{},
+				Size:  841,
 			},
 			result: 841,
 		},
@@ -518,6 +647,7 @@ func TestGetActualSize(t *testing.T) {
 					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
 				},
 				Parts: []ObjectPartInfo{},
+				Size:  100,
 			},
 			result: -1,
 		},
@@ -682,5 +812,72 @@ func TestS2CompressReader(t *testing.T) {
 				t.Errorf("roundtrip failed\n\t%q\n\t%q", tt.data, decBuf.Bytes())
 			}
 		})
+	}
+}
+
+func Test_pathNeedsClean(t *testing.T) {
+	type pathTest struct {
+		path, result string
+	}
+
+	cleantests := []pathTest{
+		// Already clean
+		{"", "."},
+		{"abc", "abc"},
+		{"abc/def", "abc/def"},
+		{"a/b/c", "a/b/c"},
+		{".", "."},
+		{"..", ".."},
+		{"../..", "../.."},
+		{"../../abc", "../../abc"},
+		{"/abc", "/abc"},
+		{"/abc/def", "/abc/def"},
+		{"/", "/"},
+
+		// Remove trailing slash
+		{"abc/", "abc"},
+		{"abc/def/", "abc/def"},
+		{"a/b/c/", "a/b/c"},
+		{"./", "."},
+		{"../", ".."},
+		{"../../", "../.."},
+		{"/abc/", "/abc"},
+
+		// Remove doubled slash
+		{"abc//def//ghi", "abc/def/ghi"},
+		{"//abc", "/abc"},
+		{"///abc", "/abc"},
+		{"//abc//", "/abc"},
+		{"abc//", "abc"},
+
+		// Remove . elements
+		{"abc/./def", "abc/def"},
+		{"/./abc/def", "/abc/def"},
+		{"abc/.", "abc"},
+
+		// Remove .. elements
+		{"abc/def/ghi/../jkl", "abc/def/jkl"},
+		{"abc/def/../ghi/../jkl", "abc/jkl"},
+		{"abc/def/..", "abc"},
+		{"abc/def/../..", "."},
+		{"/abc/def/../..", "/"},
+		{"abc/def/../../..", ".."},
+		{"/abc/def/../../..", "/"},
+		{"abc/def/../../../ghi/jkl/../../../mno", "../../mno"},
+
+		// Combinations
+		{"abc/./../def", "def"},
+		{"abc//./../def", "def"},
+		{"abc/../../././../def", "../../def"},
+	}
+	for _, test := range cleantests {
+		want := test.path != test.result
+		got := pathNeedsClean([]byte(test.path))
+		if !got {
+			t.Logf("no clean: %q", test.path)
+		}
+		if want && !got {
+			t.Errorf("input: %q, want %v, got %v", test.path, want, got)
+		}
 	}
 }

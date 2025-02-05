@@ -23,25 +23,22 @@ package disk
 // Files - total inodes available
 // Ffree - free inodes available
 // FSType - file system type
+// Major - major dev id
+// Minor - minor dev id
+// Devname - device name
 type Info struct {
-	Total  uint64
-	Free   uint64
-	Used   uint64
-	Files  uint64
-	Ffree  uint64
-	FSType string
-	Major  uint32
-	Minor  uint32
+	Total      uint64
+	Free       uint64
+	Used       uint64
+	Files      uint64
+	Ffree      uint64
+	FSType     string
+	Major      uint32
+	Minor      uint32
+	Name       string
+	Rotational *bool
+	NRRequests uint64
 }
-
-// DevID is the drive major and minor ids
-type DevID struct {
-	Major uint32
-	Minor uint32
-}
-
-// AllDrivesIOStats is map between drive devices and IO stats
-type AllDrivesIOStats map[DevID]IOStats
 
 // IOStats contains stats of a single drive
 type IOStats struct {

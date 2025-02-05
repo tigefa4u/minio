@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -23,10 +23,14 @@ import (
 	"io"
 	"os"
 
-	"github.com/minio/madmin-go/v2/estream"
+	"github.com/minio/madmin-go/v3/estream"
 )
 
-func extractInspectV2(pk []byte, r io.Reader, w io.Writer) error {
+type keepFileErr struct {
+	error
+}
+
+func extractInspectV2(pk []byte, r io.Reader, w io.Writer, okMsg string) error {
 	privKey, err := bytesToPrivateKey(pk)
 	if err != nil {
 		return fmt.Errorf("decoding key returned: %w", err)
@@ -45,11 +49,14 @@ func extractInspectV2(pk []byte, r io.Reader, w io.Writer) error {
 		sr.SkipEncrypted(true)
 		return sr.DebugStream(os.Stdout)
 	}
-
+	extracted := false
 	for {
 		stream, err := sr.NextStream()
 		if err != nil {
 			if err == io.EOF {
+				if extracted {
+					return nil
+				}
 				return errors.New("no data found on stream")
 			}
 			if errors.Is(err, estream.ErrNoKey) {
@@ -61,14 +68,22 @@ func extractInspectV2(pk []byte, r io.Reader, w io.Writer) error {
 				}
 				continue
 			}
+			if extracted {
+				return keepFileErr{fmt.Errorf("next stream: %w", err)}
+			}
 			return fmt.Errorf("next stream: %w", err)
 		}
 		if stream.Name == "inspect.zip" {
+			if extracted {
+				return keepFileErr{errors.New("multiple inspect.zip streams found")}
+			}
 			_, err := io.Copy(w, stream)
 			if err != nil {
 				return fmt.Errorf("reading inspect stream: %w", err)
 			}
-			return nil
+			fmt.Println(okMsg)
+			extracted = true
+			continue
 		}
 		if err := stream.Skip(); err != nil {
 			return fmt.Errorf("stream skip: %w", err)

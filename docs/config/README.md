@@ -132,35 +132,41 @@ KEY:
 api  manage global HTTP API call specific features, such as throttling, authentication types, etc.
 
 ARGS:
-requests_max                    (number)    set the maximum number of concurrent requests (default: '0')
-requests_deadline               (duration)  set the deadline for API requests waiting to be processed (default: '10s')
+requests_max                    (number)    set the maximum number of concurrent requests (default: 'auto')
 cluster_deadline                (duration)  set the deadline for cluster readiness check (default: '10s')
 cors_allow_origin               (csv)       set comma separated list of origins allowed for CORS requests (default: '*')
 remote_transport_deadline       (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h" (default: '2h')
-list_quorum                     (string)    set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict" (default: 'strict')
+list_quorum                     (string)    set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict", "auto" (default: 'strict')
 replication_priority            (string)    set replication priority (default: 'auto')
+replication_max_workers         (number)    set the maximum number of replication workers (default: '500')
 transition_workers              (number)    set the number of transition workers (default: '100')
 stale_uploads_expiry            (duration)  set to expire stale multipart uploads older than this values (default: '24h')
 stale_uploads_cleanup_interval  (duration)  set to change intervals when stale multipart uploads are expired (default: '6h')
 delete_cleanup_interval         (duration)  set to change intervals when deleted objects are permanently deleted from ".trash" folder (default: '5m')
-disable_odirect                 (boolean)   set to disable O_DIRECT for reads under special conditions. NOTE: it is not recommended to disable O_DIRECT without prior testing. (default: 'off')
+odirect                         (boolean)   set to enable or disable O_DIRECT for writes under special conditions. NOTE: do not disable O_DIRECT without prior testing (default: 'on')
+root_access                     (boolean)   turn 'off' root credential access for all API calls including s3, admin operations (default: 'on')
+sync_events                     (boolean)   set to enable synchronous bucket notifications (default: 'off')
+object_max_versions             (number)    set max allowed number of versions per object (default: '9223372036854775807')
 ```
 
 or environment variables
 
 ```
-MINIO_API_REQUESTS_MAX                    (number)    set the maximum number of concurrent requests (default: '0')
-MINIO_API_REQUESTS_DEADLINE               (duration)  set the deadline for API requests waiting to be processed (default: '10s')
+MINIO_API_REQUESTS_MAX                    (number)    set the maximum number of concurrent requests (default: 'auto')
 MINIO_API_CLUSTER_DEADLINE                (duration)  set the deadline for cluster readiness check (default: '10s')
 MINIO_API_CORS_ALLOW_ORIGIN               (csv)       set comma separated list of origins allowed for CORS requests (default: '*')
 MINIO_API_REMOTE_TRANSPORT_DEADLINE       (duration)  set the deadline for API requests on remote transports while proxying between federated instances e.g. "2h" (default: '2h')
-MINIO_API_LIST_QUORUM                     (string)    set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict" (default: 'strict')
+MINIO_API_LIST_QUORUM                     (string)    set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict", "auto" (default: 'strict')
 MINIO_API_REPLICATION_PRIORITY            (string)    set replication priority (default: 'auto')
+MINIO_API_REPLICATION_MAX_WORKERS         (number)    set the maximum number of replication workers (default: '500')
 MINIO_API_TRANSITION_WORKERS              (number)    set the number of transition workers (default: '100')
 MINIO_API_STALE_UPLOADS_EXPIRY            (duration)  set to expire stale multipart uploads older than this values (default: '24h')
 MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL  (duration)  set to change intervals when stale multipart uploads are expired (default: '6h')
 MINIO_API_DELETE_CLEANUP_INTERVAL         (duration)  set to change intervals when deleted objects are permanently deleted from ".trash" folder (default: '5m')
-MINIO_API_DISABLE_ODIRECT                 (boolean)   set to disable O_DIRECT for reads under special conditions. NOTE: it is not recommended to disable O_DIRECT without prior testing. (default: 'off')
+MINIO_API_ODIRECT                         (boolean)   set to enable or disable O_DIRECT for writes under special conditions. NOTE: do not disable O_DIRECT without prior testing (default: 'on')
+MINIO_API_ROOT_ACCESS                     (boolean)   turn 'off' root credential access for all API calls including s3, admin operations (default: 'on')
+MINIO_API_SYNC_EVENTS                     (boolean)   set to enable synchronous bucket notifications (default: 'off')
+MINIO_API_OBJECT_MAX_VERSIONS             (number)    set max allowed number of versions per object (default: '9223372036854775807')
 ```
 
 #### Notifications
@@ -269,9 +275,12 @@ Once set the scanner settings are automatically applied without the need for ser
 
 ### Healing
 
-Healing is enabled by default. The following configuration settings allow for more staggered delay in terms of healing. The healing system by default adapts to the system speed and pauses up to '1sec' per object when the system has `max_io` number of concurrent requests. It is possible to adjust the `max_sleep` and `max_io` values thereby increasing the healing speed. The delays between each operation of the healer can be adjusted by the `mc admin config set alias/ heal max_sleep=1s` and maximum concurrent requests allowed before we start slowing things down can be configured with `mc admin config set alias/ heal max_io=30` . By default the wait delay is `1sec` beyond 10 concurrent operations. This means the healer will sleep *1 second* at max for each heal operation if there are more than *10* concurrent client requests.
+Healing is enabled by default. The following configuration settings allow for more staggered delay in terms of healing. The healing system by default adapts to the system speed and pauses up to '250ms' per object when the system has `max_io` number of concurrent requests. It is possible to adjust the `max_sleep` and `max_io` values thereby increasing the healing speed. The delays between each operation of the healer can be adjusted by the `mc admin config set alias/ heal max_sleep=1s` and maximum concurrent requests allowed before we start slowing things down can be configured with `mc admin config set alias/ heal max_io=30` . By default the wait delay is `250ms` beyond 100 concurrent operations. This means the healer will sleep *250 milliseconds* at max for each heal operation if there are more than *100* concurrent client requests.
 
 In most setups this is sufficient to heal the content after drive replacements. Setting `max_sleep` to a *lower* value and setting `max_io` to a *higher* value would make heal go faster.
+
+Each node is responsible of healing its local drives; Each drive will have multiple heal workers which is the quarter of the number of CPU cores of the node or the quarter of the configured nr_requests of the drive (https://www.kernel.org/doc/Documentation/block/queue-sysfs.txt). It is also possible to provide a custom number of workers by using this command: `mc admin config set alias/ heal drive_workers=100` .
+
 
 ```
 ~ mc admin config set alias/ heal
@@ -279,9 +288,10 @@ KEY:
 heal  manage object healing frequency and bitrot verification checks
 
 ARGS:
-bitrotscan  (on|off)    perform bitrot scan on disks when checking objects during scanner
-max_sleep   (duration)  maximum sleep duration between objects to slow down heal operation. eg. 2s
-max_io      (int)       maximum IO requests allowed between objects to slow down heal operation. eg. 3
+bitrotscan     (on|off)    perform bitrot scan on drives when checking objects during scanner
+max_sleep      (duration)  maximum sleep duration between objects to slow down heal operation. eg. 2s
+max_io         (int)       maximum IO requests allowed between objects to slow down heal operation. eg. 3
+drive_workers  (int)       the number of workers per drive to heal a new disk replacement.
 ```
 
 Example: The following settings will increase the heal operation speed by allowing healing operation to run without delay up to `100` concurrent requests, and the maximum delay between each heal operation is set to `300ms`.
@@ -326,4 +336,4 @@ minio server /data
 ## Explore Further
 
 * [MinIO Quickstart Guide](https://min.io/docs/minio/linux/index.html#quickstart-for-linux)
-* [Configure MinIO Server with TLS](https://min.io/docs/minio/linux/operations/network-encryption.htmls)
+* [Configure MinIO Server with TLS](https://min.io/docs/minio/linux/operations/network-encryption.html)

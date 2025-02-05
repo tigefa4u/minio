@@ -48,6 +48,9 @@ const (
 	// the KMS.
 	MetaDataEncryptionKey = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key"
 
+	// MetaSsecCRC is the encrypted checksum of the SSE-C encrypted object.
+	MetaSsecCRC = "X-Minio-Replication-Ssec-Crc"
+
 	// MetaContext is the KMS context provided by a client when encrypting an
 	// object with SSE-KMS. A client may not send a context in which case the
 	// MetaContext will not be present.
@@ -106,6 +109,7 @@ func RemoveInternalEntries(metadata map[string]string) {
 	delete(metadata, MetaSealedKeyKMS)
 	delete(metadata, MetaKeyID)
 	delete(metadata, MetaDataEncryptionKey)
+	delete(metadata, MetaSsecCRC)
 }
 
 // IsSourceEncrypted returns true if the source is encrypted
@@ -156,7 +160,7 @@ func IsEncrypted(metadata map[string]string) (Type, bool) {
 }
 
 // CreateMultipartMetadata adds the multipart flag entry to metadata
-// and returns modifed metadata. It allocates a new metadata map if
+// and returns modified metadata. It allocates a new metadata map if
 // metadata is nil.
 func CreateMultipartMetadata(metadata map[string]string) map[string]string {
 	if metadata == nil {

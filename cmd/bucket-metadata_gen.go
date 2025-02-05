@@ -150,6 +150,30 @@ func (z *BucketMetadata) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err, "VersioningConfigUpdatedAt")
 				return
 			}
+		case "LifecycleConfigUpdatedAt":
+			z.LifecycleConfigUpdatedAt, err = dc.ReadTime()
+			if err != nil {
+				err = msgp.WrapError(err, "LifecycleConfigUpdatedAt")
+				return
+			}
+		case "NotificationConfigUpdatedAt":
+			z.NotificationConfigUpdatedAt, err = dc.ReadTime()
+			if err != nil {
+				err = msgp.WrapError(err, "NotificationConfigUpdatedAt")
+				return
+			}
+		case "BucketTargetsConfigUpdatedAt":
+			z.BucketTargetsConfigUpdatedAt, err = dc.ReadTime()
+			if err != nil {
+				err = msgp.WrapError(err, "BucketTargetsConfigUpdatedAt")
+				return
+			}
+		case "BucketTargetsConfigMetaUpdatedAt":
+			z.BucketTargetsConfigMetaUpdatedAt, err = dc.ReadTime()
+			if err != nil {
+				err = msgp.WrapError(err, "BucketTargetsConfigMetaUpdatedAt")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -163,9 +187,9 @@ func (z *BucketMetadata) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *BucketMetadata) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 21
+	// map header, size 25
 	// write "Name"
-	err = en.Append(0xde, 0x0, 0x15, 0xa4, 0x4e, 0x61, 0x6d, 0x65)
+	err = en.Append(0xde, 0x0, 0x19, 0xa4, 0x4e, 0x61, 0x6d, 0x65)
 	if err != nil {
 		return
 	}
@@ -374,15 +398,55 @@ func (z *BucketMetadata) EncodeMsg(en *msgp.Writer) (err error) {
 		err = msgp.WrapError(err, "VersioningConfigUpdatedAt")
 		return
 	}
+	// write "LifecycleConfigUpdatedAt"
+	err = en.Append(0xb8, 0x4c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74)
+	if err != nil {
+		return
+	}
+	err = en.WriteTime(z.LifecycleConfigUpdatedAt)
+	if err != nil {
+		err = msgp.WrapError(err, "LifecycleConfigUpdatedAt")
+		return
+	}
+	// write "NotificationConfigUpdatedAt"
+	err = en.Append(0xbb, 0x4e, 0x6f, 0x74, 0x69, 0x66, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74)
+	if err != nil {
+		return
+	}
+	err = en.WriteTime(z.NotificationConfigUpdatedAt)
+	if err != nil {
+		err = msgp.WrapError(err, "NotificationConfigUpdatedAt")
+		return
+	}
+	// write "BucketTargetsConfigUpdatedAt"
+	err = en.Append(0xbc, 0x42, 0x75, 0x63, 0x6b, 0x65, 0x74, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x73, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74)
+	if err != nil {
+		return
+	}
+	err = en.WriteTime(z.BucketTargetsConfigUpdatedAt)
+	if err != nil {
+		err = msgp.WrapError(err, "BucketTargetsConfigUpdatedAt")
+		return
+	}
+	// write "BucketTargetsConfigMetaUpdatedAt"
+	err = en.Append(0xd9, 0x20, 0x42, 0x75, 0x63, 0x6b, 0x65, 0x74, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x73, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x4d, 0x65, 0x74, 0x61, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74)
+	if err != nil {
+		return
+	}
+	err = en.WriteTime(z.BucketTargetsConfigMetaUpdatedAt)
+	if err != nil {
+		err = msgp.WrapError(err, "BucketTargetsConfigMetaUpdatedAt")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *BucketMetadata) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 21
+	// map header, size 25
 	// string "Name"
-	o = append(o, 0xde, 0x0, 0x15, 0xa4, 0x4e, 0x61, 0x6d, 0x65)
+	o = append(o, 0xde, 0x0, 0x19, 0xa4, 0x4e, 0x61, 0x6d, 0x65)
 	o = msgp.AppendString(o, z.Name)
 	// string "Created"
 	o = append(o, 0xa7, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x64)
@@ -444,6 +508,18 @@ func (z *BucketMetadata) MarshalMsg(b []byte) (o []byte, err error) {
 	// string "VersioningConfigUpdatedAt"
 	o = append(o, 0xb9, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74)
 	o = msgp.AppendTime(o, z.VersioningConfigUpdatedAt)
+	// string "LifecycleConfigUpdatedAt"
+	o = append(o, 0xb8, 0x4c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74)
+	o = msgp.AppendTime(o, z.LifecycleConfigUpdatedAt)
+	// string "NotificationConfigUpdatedAt"
+	o = append(o, 0xbb, 0x4e, 0x6f, 0x74, 0x69, 0x66, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74)
+	o = msgp.AppendTime(o, z.NotificationConfigUpdatedAt)
+	// string "BucketTargetsConfigUpdatedAt"
+	o = append(o, 0xbc, 0x42, 0x75, 0x63, 0x6b, 0x65, 0x74, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x73, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74)
+	o = msgp.AppendTime(o, z.BucketTargetsConfigUpdatedAt)
+	// string "BucketTargetsConfigMetaUpdatedAt"
+	o = append(o, 0xd9, 0x20, 0x42, 0x75, 0x63, 0x6b, 0x65, 0x74, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x73, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x4d, 0x65, 0x74, 0x61, 0x55, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74)
+	o = msgp.AppendTime(o, z.BucketTargetsConfigMetaUpdatedAt)
 	return
 }
 
@@ -591,6 +667,30 @@ func (z *BucketMetadata) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "VersioningConfigUpdatedAt")
 				return
 			}
+		case "LifecycleConfigUpdatedAt":
+			z.LifecycleConfigUpdatedAt, bts, err = msgp.ReadTimeBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "LifecycleConfigUpdatedAt")
+				return
+			}
+		case "NotificationConfigUpdatedAt":
+			z.NotificationConfigUpdatedAt, bts, err = msgp.ReadTimeBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "NotificationConfigUpdatedAt")
+				return
+			}
+		case "BucketTargetsConfigUpdatedAt":
+			z.BucketTargetsConfigUpdatedAt, bts, err = msgp.ReadTimeBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "BucketTargetsConfigUpdatedAt")
+				return
+			}
+		case "BucketTargetsConfigMetaUpdatedAt":
+			z.BucketTargetsConfigMetaUpdatedAt, bts, err = msgp.ReadTimeBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "BucketTargetsConfigMetaUpdatedAt")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -605,6 +705,6 @@ func (z *BucketMetadata) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z *BucketMetadata) Msgsize() (s int) {
-	s = 3 + 5 + msgp.StringPrefixSize + len(z.Name) + 8 + msgp.TimeSize + 12 + msgp.BoolSize + 17 + msgp.BytesPrefixSize + len(z.PolicyConfigJSON) + 22 + msgp.BytesPrefixSize + len(z.NotificationConfigXML) + 19 + msgp.BytesPrefixSize + len(z.LifecycleConfigXML) + 20 + msgp.BytesPrefixSize + len(z.ObjectLockConfigXML) + 20 + msgp.BytesPrefixSize + len(z.VersioningConfigXML) + 20 + msgp.BytesPrefixSize + len(z.EncryptionConfigXML) + 17 + msgp.BytesPrefixSize + len(z.TaggingConfigXML) + 16 + msgp.BytesPrefixSize + len(z.QuotaConfigJSON) + 21 + msgp.BytesPrefixSize + len(z.ReplicationConfigXML) + 24 + msgp.BytesPrefixSize + len(z.BucketTargetsConfigJSON) + 28 + msgp.BytesPrefixSize + len(z.BucketTargetsConfigMetaJSON) + 22 + msgp.TimeSize + 26 + msgp.TimeSize + 26 + msgp.TimeSize + 23 + msgp.TimeSize + 21 + msgp.TimeSize + 27 + msgp.TimeSize + 26 + msgp.TimeSize
+	s = 3 + 5 + msgp.StringPrefixSize + len(z.Name) + 8 + msgp.TimeSize + 12 + msgp.BoolSize + 17 + msgp.BytesPrefixSize + len(z.PolicyConfigJSON) + 22 + msgp.BytesPrefixSize + len(z.NotificationConfigXML) + 19 + msgp.BytesPrefixSize + len(z.LifecycleConfigXML) + 20 + msgp.BytesPrefixSize + len(z.ObjectLockConfigXML) + 20 + msgp.BytesPrefixSize + len(z.VersioningConfigXML) + 20 + msgp.BytesPrefixSize + len(z.EncryptionConfigXML) + 17 + msgp.BytesPrefixSize + len(z.TaggingConfigXML) + 16 + msgp.BytesPrefixSize + len(z.QuotaConfigJSON) + 21 + msgp.BytesPrefixSize + len(z.ReplicationConfigXML) + 24 + msgp.BytesPrefixSize + len(z.BucketTargetsConfigJSON) + 28 + msgp.BytesPrefixSize + len(z.BucketTargetsConfigMetaJSON) + 22 + msgp.TimeSize + 26 + msgp.TimeSize + 26 + msgp.TimeSize + 23 + msgp.TimeSize + 21 + msgp.TimeSize + 27 + msgp.TimeSize + 26 + msgp.TimeSize + 25 + msgp.TimeSize + 28 + msgp.TimeSize + 29 + msgp.TimeSize + 34 + msgp.TimeSize
 	return
 }

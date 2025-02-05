@@ -61,76 +61,22 @@ var (
 		"WORM can only accept `on` and `off` values. To enable WORM, set this value to `on`",
 	)
 
-	ErrInvalidCacheDrivesValue = newErrFn(
-		"Invalid cache drive value",
-		"Please check the value in this ENV variable",
-		"MINIO_CACHE_DRIVES: Mounted drives or directories are delimited by `,`",
-	)
-
-	ErrInvalidCacheExcludesValue = newErrFn(
-		"Invalid cache excludes value",
-		"Please check the passed value",
-		"MINIO_CACHE_EXCLUDE: Cache exclusion patterns are delimited by `,`",
-	)
-
-	ErrInvalidCacheExpiryValue = newErrFn(
-		"Invalid cache expiry value",
-		"Please check the passed value",
-		"MINIO_CACHE_EXPIRY: Valid cache expiry duration must be in days",
-	)
-
-	ErrInvalidCacheQuota = newErrFn(
-		"Invalid cache quota value",
-		"Please check the passed value",
-		"MINIO_CACHE_QUOTA: Valid cache quota value must be between 0-100",
-	)
-
-	ErrInvalidCacheAfter = newErrFn(
-		"Invalid cache after value",
-		"Please check the passed value",
-		"MINIO_CACHE_AFTER: Valid cache after value must be 0 or greater",
-	)
-
-	ErrInvalidCacheWatermarkLow = newErrFn(
-		"Invalid cache low watermark value",
-		"Please check the passed value",
-		"MINIO_CACHE_WATERMARK_LOW: Valid cache low watermark value must be between 0-100",
-	)
-
-	ErrInvalidCacheWatermarkHigh = newErrFn(
-		"Invalid cache high watermark value",
-		"Please check the passed value",
-		"MINIO_CACHE_WATERMARK_HIGH: Valid cache high watermark value must be between 0-100",
-	)
-
-	ErrInvalidCacheRange = newErrFn(
-		"Invalid cache range value",
-		"Please check the passed value",
-		"MINIO_CACHE_RANGE: Valid expected value is `on` or `off`",
-	)
-
-	ErrInvalidCacheCommitValue = newErrFn(
-		"Invalid cache commit value",
-		"Please check the passed value",
-		"MINIO_CACHE_COMMIT: Valid expected value is `writeback` or `writethrough`",
-	)
-
-	ErrInvalidCacheSetting = newErrFn(
-		"Incompatible cache setting",
-		"Please check the passed value",
-		"MINIO_CACHE_AFTER cannot be used with MINIO_CACHE_COMMIT setting",
-	)
-
-	ErrInvalidCredentialsBackendEncrypted = newErrFn(
-		"Invalid credentials",
-		"Please set correct credentials in the environment for decryption",
-		`Detected encrypted config backend, correct access and secret keys should be specified via environment variables MINIO_ROOT_USER and MINIO_ROOT_PASSWORD to be able to decrypt the MinIO config, user IAM and policies`,
+	ErrInvalidConfigDecryptionKey = newErrFn(
+		"Incorrect encryption key to decrypt internal data",
+		"Please set the correct default KMS key value or the correct root credentials for older MinIO versions.",
+		`Revert MINIO_KMS_KES_KEY_NAME or MINIO_ROOT_USER/MINIO_ROOT_PASSWORD (for older MinIO versions) to be able to decrypt the internal data again.`,
 	)
 
 	ErrInvalidCredentials = newErrFn(
 		"Invalid credentials",
 		"Please provide correct credentials",
 		`Access key length should be at least 3, and secret key length at least 8 characters`,
+	)
+
+	ErrInvalidRootUserCredentials = newErrFn(
+		"Invalid credentials",
+		"Please provide correct credentials",
+		EnvRootUser+` length should be at least 3, and `+EnvRootPassword+` length at least 8 characters`,
 	)
 
 	ErrMissingEnvCredentialRootUser = newErrFn(
@@ -172,8 +118,8 @@ var (
 	ErrStorageClassValue = newErrFn(
 		"Invalid storage class value",
 		"Please check the value",
-		`MINIO_STORAGE_CLASS_STANDARD: Format "EC:<Default_Parity_Standard_Class>" (e.g. "EC:3"). This sets the number of parity disks for MinIO server in Standard mode. Objects are stored in Standard mode, if storage class is not defined in Put request
-MINIO_STORAGE_CLASS_RRS: Format "EC:<Default_Parity_Reduced_Redundancy_Class>" (e.g. "EC:3"). This sets the number of parity disks for MinIO server in Reduced Redundancy mode. Objects are stored in Reduced Redundancy mode, if Put request specifies RRS storage class
+		`MINIO_STORAGE_CLASS_STANDARD: Format "EC:<Default_Parity_Standard_Class>" (e.g. "EC:3"). This sets the number of parity drives for MinIO server in Standard mode. Objects are stored in Standard mode, if storage class is not defined in Put request
+MINIO_STORAGE_CLASS_RRS: Format "EC:<Default_Parity_Reduced_Redundancy_Class>" (e.g. "EC:3"). This sets the number of parity drives for MinIO server in Reduced Redundancy mode. Objects are stored in Reduced Redundancy mode, if Put request specifies RRS storage class
 Refer to the link https://github.com/minio/minio/tree/master/docs/erasure/storage-class for more information`,
 	)
 
@@ -225,19 +171,19 @@ Examples:
 		`Use 'sudo setcap cap_net_bind_service=+ep /path/to/minio' to provide sufficient permissions`,
 	)
 
-	ErrSSLUnexpectedError = newErrFn(
-		"Invalid TLS certificate",
-		"Please check the content of your certificate data",
-		`Only PEM (x.509) format is accepted as valid public & private certificates`,
+	ErrTLSReadError = newErrFn(
+		"Cannot read the TLS certificate",
+		"Please check if the certificate has the proper owner and read permissions",
+		"",
 	)
 
-	ErrSSLUnexpectedData = newErrFn(
+	ErrTLSUnexpectedData = newErrFn(
 		"Invalid TLS certificate",
 		"Please check your certificate",
 		"",
 	)
 
-	ErrSSLNoPassword = newErrFn(
+	ErrTLSNoPassword = newErrFn(
 		"Missing TLS password",
 		"Please set the password to environment variable `MINIO_CERT_PASSWD` so that the private key can be decrypted",
 		"",
@@ -255,7 +201,7 @@ Examples:
 		"",
 	)
 
-	ErrSSLWrongPassword = newErrFn(
+	ErrTLSWrongPassword = newErrFn(
 		"Unable to decrypt the private key using the provided password",
 		"Please set the correct password in environment variable `MINIO_CERT_PASSWD`",
 		"",
@@ -283,5 +229,20 @@ Examples:
 		"Invalid value for transition workers",
 		"",
 		"MINIO_API_TRANSITION_WORKERS: should be >= GOMAXPROCS/2",
+	)
+	ErrInvalidBatchKeyRotationWorkersWait = newErrFn(
+		"Invalid value for batch key rotation workers wait",
+		"Please input a non-negative duration",
+		"keyrotation_workers_wait should be > 0ms",
+	)
+	ErrInvalidBatchReplicationWorkersWait = newErrFn(
+		"Invalid value for batch replication workers wait",
+		"Please input a non-negative duration",
+		"replication_workers_wait should be > 0ms",
+	)
+	ErrInvalidBatchExpirationWorkersWait = newErrFn(
+		"Invalid value for batch expiration workers wait",
+		"Please input a non-negative duration",
+		"expiration_workers_wait should be > 0ms",
 	)
 )

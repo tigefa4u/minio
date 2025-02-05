@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -20,16 +20,17 @@ package cmd
 import (
 	"container/ring"
 	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/logger/message/log"
 	"github.com/minio/minio/internal/logger/target/console"
 	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/pubsub"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v3/logger/message/log"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // number of log messages to buffer
@@ -49,16 +50,16 @@ type HTTPConsoleLoggerSys struct {
 
 // NewConsoleLogger - creates new HTTPConsoleLoggerSys with all nodes subscribed to
 // the console logging pub sub system
-func NewConsoleLogger(ctx context.Context) *HTTPConsoleLoggerSys {
+func NewConsoleLogger(ctx context.Context, w io.Writer) *HTTPConsoleLoggerSys {
 	return &HTTPConsoleLoggerSys{
 		pubsub:  pubsub.New[log.Info, madmin.LogMask](8),
-		console: console.New(),
+		console: console.New(w),
 		logBuf:  ring.New(defaultLogBufferCount),
 	}
 }
 
 // IsOnline always true in case of console logger
-func (sys *HTTPConsoleLoggerSys) IsOnline() bool {
+func (sys *HTTPConsoleLoggerSys) IsOnline(_ context.Context) bool {
 	return true
 }
 
@@ -87,7 +88,7 @@ func (sys *HTTPConsoleLoggerSys) HasLogListeners() bool {
 func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan log.Info, doneCh <-chan struct{}, node string, last int, logKind madmin.LogMask, filter func(entry log.Info) bool) error {
 	// Enable console logging for remote client.
 	if !sys.HasLogListeners() {
-		logger.AddSystemTarget(sys)
+		logger.AddSystemTarget(GlobalContext, sys)
 	}
 
 	cnt := 0
@@ -128,7 +129,7 @@ func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan log.Info, doneCh <-chan st
 }
 
 // Init if HTTPConsoleLoggerSys is valid, always returns nil right now
-func (sys *HTTPConsoleLoggerSys) Init() error {
+func (sys *HTTPConsoleLoggerSys) Init(_ context.Context) error {
 	return nil
 }
 
@@ -180,7 +181,7 @@ func (sys *HTTPConsoleLoggerSys) Type() types.TargetType {
 
 // Send log message 'e' to console and publish to console
 // log pubsub system
-func (sys *HTTPConsoleLoggerSys) Send(entry interface{}) error {
+func (sys *HTTPConsoleLoggerSys) Send(ctx context.Context, entry interface{}) error {
 	var lg log.Info
 	switch e := entry.(type) {
 	case log.Entry:
@@ -196,7 +197,7 @@ func (sys *HTTPConsoleLoggerSys) Send(entry interface{}) error {
 	sys.logBuf.Value = lg
 	sys.logBuf = sys.logBuf.Next()
 	sys.Unlock()
-	err := sys.console.Send(entry, string(logger.All))
+	err := sys.console.Send(entry)
 	if err != nil {
 		atomic.AddInt64(&sys.failedMessages, 1)
 	}

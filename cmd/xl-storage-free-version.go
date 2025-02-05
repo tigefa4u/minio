@@ -30,6 +30,9 @@ const freeVersion = "free-version"
 // InitFreeVersion creates a free-version to track the tiered-content of j. If j has
 // no tiered content, it returns false.
 func (j xlMetaV2Object) InitFreeVersion(fi FileInfo) (xlMetaV2Version, bool) {
+	if fi.SkipTierFreeVersion() {
+		return xlMetaV2Version{}, false
+	}
 	if status, ok := j.MetaSys[ReservedMetadataPrefixLower+TransitionStatus]; ok && bytes.Equal(status, []byte(lifecycle.TransitionComplete)) {
 		vID, err := uuid.Parse(fi.TierFreeVersionID())
 		if err != nil {
@@ -66,8 +69,7 @@ func (j xlMetaV2DeleteMarker) FreeVersion() bool {
 
 // FreeVersion returns true if j represents a free-version, false otherwise.
 func (j xlMetaV2Version) FreeVersion() bool {
-	switch j.Type {
-	case DeleteType:
+	if j.Type == DeleteType {
 		return j.DeleteMarker.FreeVersion()
 	}
 	return false

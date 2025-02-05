@@ -23,7 +23,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/hash"
@@ -32,14 +32,32 @@ import (
 	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
+//go:generate msgp -file $GOFILE -io=false -tests=false -unexported=false
+
+//msgp:ignore ObjectOptions TransitionOptions DeleteBucketOptions
+
 // CheckPreconditionFn returns true if precondition check failed.
 type CheckPreconditionFn func(o ObjectInfo) bool
 
-// EvalMetadataFn validates input objInfo and returns an updated metadata
-type EvalMetadataFn func(o *ObjectInfo) error
+// EvalMetadataFn validates input objInfo and GetObjectInfo error and returns an updated metadata and replication decision if any
+type EvalMetadataFn func(o *ObjectInfo, gerr error) (ReplicateDecision, error)
+
+// EvalRetentionBypassFn validates input objInfo and GetObjectInfo error and returns an error if retention bypass is not allowed.
+type EvalRetentionBypassFn func(o ObjectInfo, gerr error) error
 
 // GetObjectInfoFn is the signature of GetObjectInfo function.
 type GetObjectInfoFn func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error)
+
+// WalkVersionsSortOrder represents the sort order in which versions of an
+// object should be returned by ObjectLayer.Walk method
+type WalkVersionsSortOrder uint8
+
+const (
+	// WalkVersionsSortAsc - Sort in ascending order of ModTime
+	WalkVersionsSortAsc WalkVersionsSortOrder = iota
+	// WalkVersionsSortDesc - Sort in descending order of ModTime
+	WalkVersionsSortDesc
+)
 
 // ObjectOptions represents object options for ObjectLayer object operations
 type ObjectOptions struct {
@@ -52,14 +70,19 @@ type ObjectOptions struct {
 
 	DeleteMarker            bool // Is only set in DELETE operations for delete marker replication
 	CheckDMReplicationReady bool // Is delete marker ready to be replicated - set only during HEAD
+	Tagging                 bool // Is only in GET/HEAD operations to return tagging metadata along with regular metadata and body.
 
-	UserDefined       map[string]string   // only set in case of POST/PUT operations
-	PartNumber        int                 // only useful in case of GetObject/HeadObject
-	CheckPrecondFn    CheckPreconditionFn // only set during GetObject/HeadObject/CopyObjectPart preconditional valuation
-	EvalMetadataFn    EvalMetadataFn      // only set for retention settings, meant to be used only when updating metadata in-place.
-	DeleteReplication ReplicationState    // Represents internal replication state needed for Delete replication
-	Transition        TransitionOptions
-	Expiration        ExpirationOptions
+	UserDefined         map[string]string   // only set in case of POST/PUT operations
+	ObjectAttributes    map[string]struct{} // Attribute tags defined by the users for the GetObjectAttributes request
+	MaxParts            int                 // used in GetObjectAttributes. Signals how many parts we should return
+	PartNumberMarker    int                 // used in GetObjectAttributes. Signals the part number after which results should be returned
+	PartNumber          int                 // only useful in case of GetObject/HeadObject
+	CheckPrecondFn      CheckPreconditionFn // only set during GetObject/HeadObject/CopyObjectPart preconditional valuation
+	EvalMetadataFn      EvalMetadataFn      // only set for retention settings, meant to be used only when updating metadata in-place.
+	DeleteReplication   ReplicationState    // Represents internal replication state needed for Delete replication
+	Transition          TransitionOptions
+	Expiration          ExpirationOptions
+	LifecycleAuditEvent lcAuditEvent
 
 	WantChecksum *hash.Checksum // x-amz-checksum-XXX checksum sent to PutObject/ CompleteMultipartUpload.
 
@@ -73,6 +96,7 @@ type ObjectOptions struct {
 	ReplicationSourceLegalholdTimestamp time.Time // set if MinIOSourceObjectLegalholdTimestamp received
 	ReplicationSourceRetentionTimestamp time.Time // set if MinIOSourceObjectRetentionTimestamp received
 	DeletePrefix                        bool      // set true to enforce a prefix deletion, only application for DeleteObject API,
+	DeletePrefixObject                  bool      // set true when object's erasure set is resolvable by object name (using getHashedSetIndex)
 
 	Speedtest bool // object call specifically meant for SpeedTest code, set to 'true' when invoked by SpeedtestHandler.
 
@@ -89,15 +113,39 @@ type ObjectOptions struct {
 	// participating in a rebalance operation. Typically set for 'write' operations.
 	SkipRebalancing bool
 
-	WalkFilter      func(info FileInfo) bool // return WalkFilter returns 'true/false'
-	WalkMarker      string                   // set to skip until this object
+	SrcPoolIdx int // set by PutObject/CompleteMultipart operations due to rebalance; used to prevent rebalance src, dst pools to be the same
+
+	DataMovement bool // indicates an going decommisionning or rebalacing
+
 	PrefixEnabledFn func(prefix string) bool // function which returns true if versioning is enabled on prefix
 
 	// IndexCB will return any index created but the compression.
 	// Object must have been read at this point.
 	IndexCB func() []byte
 
+	// InclFreeVersions indicates that free versions need to be included
+	// when looking up a version by fi.VersionID
 	InclFreeVersions bool
+	// SkipFreeVersion skips adding a free version when a tiered version is
+	// being 'replaced'
+	// Note: Used only when a tiered object is being expired.
+	SkipFreeVersion bool
+
+	MetadataChg           bool                  // is true if it is a metadata update operation.
+	EvalRetentionBypassFn EvalRetentionBypassFn // only set for enforcing retention bypass on DeleteObject.
+
+	FastGetObjInfo bool // Only for S3 Head/Get Object calls for now
+	NoAuditLog     bool // Only set for decom, rebalance, to avoid double audits.
+}
+
+// WalkOptions provides filtering, marker and other Walk() specific options.
+type WalkOptions struct {
+	Filter       func(info FileInfo) bool // return WalkFilter returns 'true/false'
+	Marker       string                   // set to skip until this object
+	LatestOnly   bool                     // returns only latest versions for all matching objects
+	AskDisks     string                   // dictates how many disks are being listed
+	VersionsSort WalkVersionsSortOrder    // sort order for versions of the same object; default: Ascending order in ModTime
+	Limit        int                      // maximum number of items, 0 means no limit
 }
 
 // ExpirationOptions represents object options for object expiration at objectLayer.
@@ -134,7 +182,9 @@ type DeleteBucketOptions struct {
 
 // BucketOptions provides options for ListBuckets and GetBucketInfo call.
 type BucketOptions struct {
-	Deleted bool // true only when site replication is enabled
+	Deleted    bool // true only when site replication is enabled
+	Cached     bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+	NoMetadata bool
 }
 
 // SetReplicaStatus sets replica status and timestamp for delete operations in ObjectOptions
@@ -179,14 +229,15 @@ func (o *ObjectOptions) PutReplicationState() (r ReplicationState) {
 	return
 }
 
-// LockType represents required locking for ObjectLayer operations
-type LockType int
+// SetEvalMetadataFn sets the metadata evaluation function
+func (o *ObjectOptions) SetEvalMetadataFn(f EvalMetadataFn) {
+	o.EvalMetadataFn = f
+}
 
-const (
-	noLock LockType = iota
-	readLock
-	writeLock
-)
+// SetEvalRetentionBypassFn sets the retention bypass function
+func (o *ObjectOptions) SetEvalRetentionBypassFn(f EvalRetentionBypassFn) {
+	o.EvalRetentionBypassFn = f
+}
 
 // ObjectLayer implements primitives for object API layer.
 type ObjectLayer interface {
@@ -195,10 +246,11 @@ type ObjectLayer interface {
 
 	// Storage operations.
 	Shutdown(context.Context) error
-	NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo, wantCycle uint32, scanMode madmin.HealScanMode) error
+	NSScanner(ctx context.Context, updates chan<- DataUsageInfo, wantCycle uint32, scanMode madmin.HealScanMode) error
 	BackendInfo() madmin.BackendInfo
-	StorageInfo(ctx context.Context) StorageInfo
-	LocalStorageInfo(ctx context.Context) StorageInfo
+	Legacy() bool // Only returns true for deployments which use CRCMOD as its object distribution algorithm.
+	StorageInfo(ctx context.Context, metrics bool) StorageInfo
+	LocalStorageInfo(ctx context.Context, metrics bool) StorageInfo
 
 	// Bucket operations.
 	MakeBucket(ctx context.Context, bucket string, opts MakeBucketOptions) error
@@ -209,17 +261,17 @@ type ObjectLayer interface {
 	ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (result ListObjectsV2Info, err error)
 	ListObjectVersions(ctx context.Context, bucket, prefix, marker, versionMarker, delimiter string, maxKeys int) (result ListObjectVersionsInfo, err error)
 	// Walk lists all objects including versions, delete markers.
-	Walk(ctx context.Context, bucket, prefix string, results chan<- ObjectInfo, opts ObjectOptions) error
+	Walk(ctx context.Context, bucket, prefix string, results chan<- itemOrErr[ObjectInfo], opts WalkOptions) error
 
 	// Object operations.
 
 	// GetObjectNInfo returns a GetObjectReader that satisfies the
-	// ReadCloser interface. The Close method unlocks the object
-	// after reading, so it must always be called after usage.
+	// ReadCloser interface. The Close method runs any cleanup
+	// functions, so it must always be called after reading till EOF
 	//
 	// IMPORTANTLY, when implementations return err != nil, this
 	// function MUST NOT return a non-nil ReadCloser.
-	GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (reader *GetObjectReader, err error)
+	GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (reader *GetObjectReader, err error)
 	GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error)
 	PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error)
 	CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error)
@@ -239,7 +291,8 @@ type ObjectLayer interface {
 	AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error
 	CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (objInfo ObjectInfo, err error)
 
-	SetDriveCounts() []int // list of erasure stripe size for each pool in order.
+	GetDisks(poolIdx, setIdx int) ([]StorageAPI, error) // return the disks belonging to pool and set.
+	SetDriveCounts() []int                              // list of erasure stripe size for each pool in order.
 
 	// Healing operations.
 	HealFormat(ctx context.Context, dryRun bool) (madmin.HealResultItem, error)
@@ -250,10 +303,10 @@ type ObjectLayer interface {
 
 	// Returns health of the backend
 	Health(ctx context.Context, opts HealthOptions) HealthResult
-	ReadHealth(ctx context.Context) bool
 
 	// Metadata operations
 	PutObjectMetadata(context.Context, string, string, ObjectOptions) (ObjectInfo, error)
+	DecomTieredObject(context.Context, string, string, FileInfo, ObjectOptions) error
 
 	// ObjectTagging operations
 	PutObjectTags(context.Context, string, string, string, ObjectOptions) (ObjectInfo, error)
@@ -271,7 +324,7 @@ func GetObject(ctx context.Context, api ObjectLayer, bucket, object string, star
 	}
 	Range := &HTTPRangeSpec{Start: startOffset, End: startOffset + length}
 
-	reader, err := api.GetObjectNInfo(ctx, bucket, object, Range, header, readLock, opts)
+	reader, err := api.GetObjectNInfo(ctx, bucket, object, Range, header, opts)
 	if err != nil {
 		return err
 	}

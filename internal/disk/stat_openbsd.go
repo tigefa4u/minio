@@ -27,7 +27,7 @@ import (
 )
 
 // GetInfo returns total and free bytes available in a directory, e.g. `/`.
-func GetInfo(path string) (info Info, err error) {
+func GetInfo(path string, _ bool) (info Info, err error) {
 	s := syscall.Statfs_t{}
 	err = syscall.Statfs(path, &s)
 	if err != nil {
@@ -48,7 +48,7 @@ func GetInfo(path string) (info Info, err error) {
 	return info, nil
 }
 
-// GetAllDrivesIOStats returns IO stats of all drives found in the machine
-func GetAllDrivesIOStats() (info AllDrivesIOStats, err error) {
-	return nil, errors.New("operation unsupported")
+// GetDriveStats returns IO stats of the drive by its major:minor
+func GetDriveStats(major, minor uint32) (iostats IOStats, err error) {
+	return IOStats{}, errors.New("operation unsupported")
 }

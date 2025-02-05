@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/buger/jsonparser"
+	"github.com/dustin/go-humanize"
 	jwtgo "github.com/golang-jwt/jwt/v4"
 	jsoniter "github.com/json-iterator/go"
 )
@@ -53,7 +54,7 @@ var (
 	SigningMethodHS512 *SigningMethodHMAC
 )
 
-const base64BufferSize = 8192
+const base64BufferSize = 64 * humanize.KiByte
 
 var (
 	base64BufPool sync.Pool
@@ -242,6 +243,22 @@ func (c *StandardClaims) Valid() error {
 // NewMapClaims - Initializes a new map claims
 func NewMapClaims() *MapClaims {
 	return &MapClaims{MapClaims: jwtgo.MapClaims{}}
+}
+
+// Set Adds new arbitrary claim keys and values.
+func (c *MapClaims) Set(key string, val interface{}) {
+	if c == nil {
+		return
+	}
+	c.MapClaims[key] = val
+}
+
+// Delete deletes a key named key.
+func (c *MapClaims) Delete(key string) {
+	if c == nil {
+		return
+	}
+	delete(c.MapClaims, key)
 }
 
 // Lookup returns the value and if the key is found.

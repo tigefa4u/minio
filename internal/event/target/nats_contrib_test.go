@@ -1,5 +1,5 @@
 /*
- * MinIO Object Storage (c) 2021 MinIO, Inc.
+ * MinIO Object Storage (c) 2021-2023 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ package target
 import (
 	"testing"
 
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 )
 

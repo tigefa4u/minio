@@ -32,8 +32,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/madmin-go/v2"
+	libldap "github.com/go-ldap/ldap/v3"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/arn"
 	"github.com/minio/minio/internal/auth"
@@ -42,13 +42,17 @@ import (
 	xldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
 	idplugin "github.com/minio/minio/internal/config/identity/plugin"
+	xtls "github.com/minio/minio/internal/config/identity/tls"
 	"github.com/minio/minio/internal/config/policy/opa"
 	polplugin "github.com/minio/minio/internal/config/policy/plugin"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v3/env"
+	"github.com/minio/pkg/v3/ldap"
+	"github.com/minio/pkg/v3/policy"
 	etcd "go.etcd.io/etcd/client/v3"
+	"golang.org/x/sync/singleflight"
 )
 
 // UsersSysType - defines the type of users and groups system that is
@@ -75,6 +79,10 @@ const (
 	inheritedPolicyType = "inherited-policy"
 )
 
+const (
+	maxSVCSessionPolicySize = 4096
+)
+
 // IAMSys - config system.
 type IAMSys struct {
 	// Need to keep them here to keep alignment - ref: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
@@ -87,8 +95,10 @@ type IAMSys struct {
 	sync.Mutex
 
 	iamRefreshInterval time.Duration
-	ldapConfig         xldap.Config  // only valid if usersSysType is LDAPUsers
-	openIDConfig       openid.Config // only valid if OpenID is configured
+
+	LDAPConfig   xldap.Config  // only valid if usersSysType is LDAPUsers
+	OpenIDConfig openid.Config // only valid if OpenID is configured
+	STSTLSConfig xtls.Config   // only valid if STS TLS is configured
 
 	usersSysType UsersSysType
 
@@ -163,14 +173,26 @@ func (sys *IAMSys) LoadServiceAccount(ctx context.Context, accessKey string) err
 
 // initStore initializes IAM stores
 func (sys *IAMSys) initStore(objAPI ObjectLayer, etcdClient *etcd.Client) {
-	if sys.ldapConfig.Enabled() {
+	if sys.LDAPConfig.Enabled() {
 		sys.SetUsersSysType(LDAPUsersSysType)
 	}
 
 	if etcdClient == nil {
-		sys.store = &IAMStoreSys{newIAMObjectStore(objAPI, sys.usersSysType)}
+		var (
+			group  *singleflight.Group
+			policy *singleflight.Group
+		)
+		if env.Get("_MINIO_IAM_SINGLE_FLIGHT", config.EnableOn) == config.EnableOn {
+			group = &singleflight.Group{}
+			policy = &singleflight.Group{}
+		}
+		sys.store = &IAMStoreSys{
+			IAMStorageAPI: newIAMObjectStore(objAPI, sys.usersSysType),
+			group:         group,
+			policy:        policy,
+		}
 	} else {
-		sys.store = &IAMStoreSys{newIAMEtcdStore(etcdClient, sys.usersSysType)}
+		sys.store = &IAMStoreSys{IAMStorageAPI: newIAMEtcdStore(etcdClient, sys.usersSysType)}
 	}
 }
 
@@ -185,9 +207,9 @@ func (sys *IAMSys) Initialized() bool {
 }
 
 // Load - loads all credentials, policies and policy mappings.
-func (sys *IAMSys) Load(ctx context.Context) error {
+func (sys *IAMSys) Load(ctx context.Context, firstTime bool) error {
 	loadStartTime := time.Now()
-	err := sys.store.LoadIAMCache(ctx)
+	err := sys.store.LoadIAMCache(ctx, firstTime)
 	if err != nil {
 		atomic.AddUint64(&sys.TotalRefreshFailures, 1)
 		return err
@@ -197,6 +219,20 @@ func (sys *IAMSys) Load(ctx context.Context) error {
 	atomic.StoreUint64(&sys.LastRefreshDurationMilliseconds, uint64(loadDuration.Milliseconds()))
 	atomic.StoreUint64(&sys.LastRefreshTimeUnixNano, uint64(loadStartTime.Add(loadDuration).UnixNano()))
 	atomic.AddUint64(&sys.TotalRefreshSuccesses, 1)
+
+	if !globalSiteReplicatorCred.IsValid() {
+		sa, _, err := sys.getServiceAccount(ctx, siteReplicatorSvcAcc)
+		if err == nil {
+			globalSiteReplicatorCred.Set(sa.Credentials.SecretKey)
+		}
+	}
+
+	if firstTime {
+		bootstrapTraceMsg(fmt.Sprintf("globalIAMSys.Load(): (duration: %s)", loadDuration))
+		if globalIsDistErasure {
+			logger.Info("IAM load(startup) finished. (duration: %s)", loadDuration)
+		}
+	}
 
 	select {
 	case <-sys.configLoaded:
@@ -208,42 +244,50 @@ func (sys *IAMSys) Load(ctx context.Context) error {
 
 // Init - initializes config system by reading entries from config/iam
 func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer, etcdClient *etcd.Client, iamRefreshInterval time.Duration) {
-	bootstrapTrace("IAM initialization started")
+	bootstrapTraceMsg("IAM initialization started")
 	globalServerConfigMu.RLock()
 	s := globalServerConfig
 	globalServerConfigMu.RUnlock()
 
-	var err error
-	globalOpenIDConfig, err = openid.LookupConfig(s,
-		NewHTTPTransport(), xhttp.DrainBody, globalSite.Region)
+	openidConfig, err := openid.LookupConfig(s,
+		NewHTTPTransport(), xhttp.DrainBody, globalSite.Region())
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to initialize OpenID: %w", err))
+		iamLogIf(ctx, fmt.Errorf("Unable to initialize OpenID: %w", err), logger.WarningKind)
 	}
 
 	// Initialize if LDAP is enabled
-	globalLDAPConfig, err = xldap.Lookup(s, globalRootCAs)
+	ldapConfig, err := xldap.Lookup(s, globalRootCAs)
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to parse LDAP configuration: %w", err))
+		iamLogIf(ctx, fmt.Errorf("Unable to load LDAP configuration (LDAP configuration will be disabled!): %w", err), logger.WarningKind)
+	}
+
+	stsTLSConfig, err := xtls.Lookup(s[config.IdentityTLSSubSys][config.Default])
+	if err != nil {
+		iamLogIf(ctx, fmt.Errorf("Unable to initialize X.509/TLS STS API: %w", err), logger.WarningKind)
+	}
+
+	if stsTLSConfig.InsecureSkipVerify {
+		iamLogIf(ctx, fmt.Errorf("Enabling %s is not recommended in a production environment", xtls.EnvIdentityTLSSkipVerify), logger.WarningKind)
 	}
 
 	authNPluginCfg, err := idplugin.LookupConfig(s[config.IdentityPluginSubSys][config.Default],
-		NewHTTPTransport(), xhttp.DrainBody, globalSite.Region)
+		NewHTTPTransport(), xhttp.DrainBody, globalSite.Region())
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to initialize AuthNPlugin: %w", err))
+		iamLogIf(ctx, fmt.Errorf("Unable to initialize AuthNPlugin: %w", err), logger.WarningKind)
 	}
 
-	setGlobalAuthNPlugin(idplugin.New(authNPluginCfg))
+	setGlobalAuthNPlugin(idplugin.New(GlobalContext, authNPluginCfg))
 
 	authZPluginCfg, err := polplugin.LookupConfig(s, GetDefaultConnSettings(), xhttp.DrainBody)
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to initialize AuthZPlugin: %w", err))
+		iamLogIf(ctx, fmt.Errorf("Unable to initialize AuthZPlugin: %w", err), logger.WarningKind)
 	}
 
 	if authZPluginCfg.URL == nil {
 		opaCfg, err := opa.LookupConfig(s[config.PolicyOPASubSys][config.Default],
 			NewHTTPTransport(), xhttp.DrainBody)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to initialize AuthZPlugin from legacy OPA config: %w", err))
+			iamLogIf(ctx, fmt.Errorf("Unable to initialize AuthZPlugin from legacy OPA config: %w", err))
 		} else {
 			authZPluginCfg.URL = opaCfg.URL
 			authZPluginCfg.AuthToken = opaCfg.AuthToken
@@ -255,14 +299,13 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer, etcdClient *etc
 	setGlobalAuthZPlugin(polplugin.New(authZPluginCfg))
 
 	sys.Lock()
-	defer sys.Unlock()
-
-	sys.ldapConfig = globalLDAPConfig.Clone()
-	sys.openIDConfig = globalOpenIDConfig.Clone()
+	sys.LDAPConfig = ldapConfig
+	sys.OpenIDConfig = openidConfig
+	sys.STSTLSConfig = stsTLSConfig
 	sys.iamRefreshInterval = iamRefreshInterval
-
 	// Initialize IAM store
 	sys.initStore(objAPI, etcdClient)
+	sys.Unlock()
 
 	retryCtx, cancel := context.WithCancel(ctx)
 
@@ -273,97 +316,30 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer, etcdClient *etc
 
 	// Migrate storage format if needed.
 	for {
-		if etcdClient != nil {
-			// ****  WARNING ****
-			// Migrating to encrypted backend on etcd should happen before initialization of
-			// IAM sub-system, make sure that we do not move the above codeblock elsewhere.
-			if err := migrateIAMConfigsEtcdToEncrypted(retryCtx, etcdClient); err != nil {
-				if errors.Is(err, errEtcdUnreachable) {
-					logger.Info("Connection to etcd timed out. Retrying..")
-					continue
-				}
-				logger.LogIf(ctx, fmt.Errorf("Unable to decrypt an encrypted ETCD backend for IAM users and policies: %w", err))
-				logger.LogIf(ctx, errors.New("IAM sub-system is partially initialized, some users may not be available"))
-				return
-			}
-		}
-
 		// Migrate IAM configuration, if necessary.
 		if err := saveIAMFormat(retryCtx, sys.store); err != nil {
 			if configRetriableErrors(err) {
-				logger.Info("Waiting for all MinIO IAM sub-system to be initialized.. possible cause (%v)", err)
+				retryInterval := time.Duration(r.Float64() * float64(time.Second))
+				logger.Info("Waiting for all MinIO IAM sub-system to be initialized.. possible cause (%v) (retrying in %s)", err, retryInterval)
+				time.Sleep(retryInterval)
 				continue
 			}
-			logger.LogIf(ctx, errors.New("IAM sub-system is partially initialized, unable to write the IAM format"))
+			iamLogIf(ctx, fmt.Errorf("IAM sub-system is partially initialized, unable to write the IAM format: %w", err), logger.WarningKind)
 			return
 		}
 
 		break
 	}
 
-	// Load IAM data from storage.
-	for {
-		if err := sys.Load(retryCtx); err != nil {
-			if configRetriableErrors(err) {
-				logger.Info("Waiting for all MinIO IAM sub-system to be initialized.. possible cause (%v)", err)
-				time.Sleep(time.Duration(r.Float64() * float64(5*time.Second)))
-				continue
-			}
-			if err != nil {
-				logger.LogIf(ctx, fmt.Errorf("Unable to initialize IAM sub-system, some users may not be available %w", err))
-			}
-		}
-		break
-	}
-
-	bootstrapTrace("finishing IAM loading")
-
-	refreshInterval := sys.iamRefreshInterval
-
-	// Set up polling for expired accounts and credentials purging.
-	switch {
-	case sys.openIDConfig.ProviderEnabled():
-		go func() {
-			timer := time.NewTimer(refreshInterval)
-			defer timer.Stop()
-			for {
-				select {
-				case <-timer.C:
-					sys.purgeExpiredCredentialsForExternalSSO(ctx)
-
-					timer.Reset(refreshInterval)
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	case sys.ldapConfig.Enabled():
-		go func() {
-			timer := time.NewTimer(refreshInterval)
-			defer timer.Stop()
-
-			for {
-				select {
-				case <-timer.C:
-					sys.purgeExpiredCredentialsForLDAP(ctx)
-					sys.updateGroupMembershipsForLDAP(ctx)
-
-					timer.Reset(refreshInterval)
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	// Start watching changes to storage.
-	go sys.watch(ctx)
+	cache := sys.store.lock()
+	setDefaultCannedPolicies(cache.iamPolicyDocsMap)
+	sys.store.unlock()
 
 	// Load RoleARNs
 	sys.rolesMap = make(map[arn.ARN]string)
 
 	// From OpenID
-	if riMap := globalOpenIDConfig.GetRoleInfo(); riMap != nil {
+	if riMap := sys.OpenIDConfig.GetRoleInfo(); riMap != nil {
 		sys.validateAndAddRolePolicyMappings(ctx, riMap)
 	}
 
@@ -373,7 +349,103 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer, etcdClient *etc
 		sys.validateAndAddRolePolicyMappings(ctx, riMap)
 	}
 
+	// Load IAM data from storage.
+	for {
+		if err := sys.Load(retryCtx, true); err != nil {
+			if configRetriableErrors(err) {
+				retryInterval := time.Duration(r.Float64() * float64(time.Second))
+				logger.Info("Waiting for all MinIO IAM sub-system to be initialized.. possible cause (%v) (retrying in %s)", err, retryInterval)
+				time.Sleep(retryInterval)
+				continue
+			}
+			if err != nil {
+				iamLogIf(ctx, fmt.Errorf("Unable to initialize IAM sub-system, some users may not be available: %w", err), logger.WarningKind)
+			}
+		}
+		break
+	}
+
+	refreshInterval := sys.iamRefreshInterval
+
+	go sys.periodicRoutines(ctx, refreshInterval)
+
 	sys.printIAMRoles()
+
+	bootstrapTraceMsg("finishing IAM loading")
+}
+
+const maxDurationSecondsForLog = 5
+
+func (sys *IAMSys) periodicRoutines(ctx context.Context, baseInterval time.Duration) {
+	// Watch for IAM config changes for iamStorageWatcher.
+	watcher, isWatcher := sys.store.IAMStorageAPI.(iamStorageWatcher)
+	if isWatcher {
+		go func() {
+			ch := watcher.watch(ctx, iamConfigPrefix)
+			for event := range ch {
+				if err := sys.loadWatchedEvent(ctx, event); err != nil {
+					// we simply log errors
+					iamLogIf(ctx, fmt.Errorf("Failure in loading watch event: %v", err), logger.WarningKind)
+				}
+			}
+		}()
+	}
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// Calculate the waitInterval between periodic refreshes so that each server
+	// independently picks a (uniformly distributed) random time in an interval
+	// of size = baseInterval.
+	//
+	// For example:
+	//
+	//    - if baseInterval=10s, then 5s <= waitInterval() < 15s
+	//
+	//    - if baseInterval=10m, then 5m <= waitInterval() < 15m
+	waitInterval := func() time.Duration {
+		// Calculate a random value such that 0 <= value < baseInterval
+		randAmt := time.Duration(r.Float64() * float64(baseInterval))
+		return baseInterval/2 + randAmt
+	}
+
+	timer := time.NewTimer(waitInterval())
+	defer timer.Stop()
+
+	lastPurgeHour := -1
+	for {
+		select {
+		case <-timer.C:
+			// Load all IAM items (except STS creds) periodically.
+			refreshStart := time.Now()
+			if err := sys.Load(ctx, false); err != nil {
+				iamLogIf(ctx, fmt.Errorf("Failure in periodic refresh for IAM (duration: %s): %v", time.Since(refreshStart), err), logger.WarningKind)
+			} else {
+				took := time.Since(refreshStart).Seconds()
+				if took > maxDurationSecondsForLog {
+					// Log if we took a lot of time to load.
+					logger.Info("IAM refresh took (duration: %.2fs)", took)
+				}
+			}
+
+			// Run purge routines once in each hour.
+			if refreshStart.Hour() != lastPurgeHour {
+				lastPurgeHour = refreshStart.Hour()
+				// Poll and remove accounts for those users who were removed
+				// from LDAP/OpenID.
+				if sys.LDAPConfig.Enabled() {
+					sys.purgeExpiredCredentialsForLDAP(ctx)
+					sys.updateGroupMembershipsForLDAP(ctx)
+				}
+				if sys.OpenIDConfig.ProviderEnabled() {
+					sys.purgeExpiredCredentialsForExternalSSO(ctx)
+				}
+			}
+
+			timer.Reset(waitInterval())
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (sys *IAMSys) validateAndAddRolePolicyMappings(ctx context.Context, m map[arn.ARN]string) {
@@ -386,7 +458,7 @@ func (sys *IAMSys) validateAndAddRolePolicyMappings(ctx context.Context, m map[a
 	// running server by creating the policies after start up.
 	for arn, rolePolicies := range m {
 		specifiedPoliciesSet := newMappedPolicy(rolePolicies).policySet()
-		validPolicies, _ := sys.store.FilterPolicies(rolePolicies, "")
+		validPolicies, _ := sys.store.MergePolicies(rolePolicies)
 		knownPoliciesSet := newMappedPolicy(validPolicies).policySet()
 		unknownPoliciesSet := specifiedPoliciesSet.Difference(knownPoliciesSet)
 		if len(unknownPoliciesSet) > 0 {
@@ -396,7 +468,7 @@ func (sys *IAMSys) validateAndAddRolePolicyMappings(ctx context.Context, m map[a
 				errMsg := fmt.Errorf(
 					"The policies \"%s\" mapped to role ARN %s are not defined - this role may not work as expected.",
 					unknownPoliciesSet.ToSlice(), arn.String())
-				logger.LogIf(ctx, errMsg)
+				authZLogIf(ctx, errMsg, logger.WarningKind)
 			}
 		}
 		sys.rolesMap[arn] = rolePolicies
@@ -425,45 +497,6 @@ func (sys *IAMSys) printIAMRoles() {
 // changes.
 func (sys *IAMSys) HasWatcher() bool {
 	return sys.store.HasWatcher()
-}
-
-func (sys *IAMSys) watch(ctx context.Context) {
-	watcher, ok := sys.store.IAMStorageAPI.(iamStorageWatcher)
-	if ok {
-		ch := watcher.watch(ctx, iamConfigPrefix)
-		for event := range ch {
-			if err := sys.loadWatchedEvent(ctx, event); err != nil {
-				// we simply log errors
-				logger.LogIf(ctx, fmt.Errorf("Failure in loading watch event: %v", err))
-			}
-		}
-		return
-	}
-
-	var maxRefreshDurationSecondsForLog float64 = 10
-
-	// Load all items periodically
-	timer := time.NewTimer(sys.iamRefreshInterval)
-	defer timer.Stop()
-	for {
-		select {
-		case <-timer.C:
-			refreshStart := time.Now()
-			if err := sys.Load(ctx); err != nil {
-				logger.LogIf(ctx, fmt.Errorf("Failure in periodic refresh for IAM (took %.2fs): %v", time.Since(refreshStart).Seconds(), err))
-			} else {
-				took := time.Since(refreshStart).Seconds()
-				if took > maxRefreshDurationSecondsForLog {
-					// Log if we took a lot of time to load.
-					logger.Info("IAM refresh took %.2fs", took)
-				}
-			}
-
-			timer.Reset(sys.iamRefreshInterval)
-		case <-ctx.Done():
-			return
-		}
-	}
 }
 
 func (sys *IAMSys) loadWatchedEvent(ctx context.Context, event iamWatchEvent) (err error) {
@@ -529,13 +562,23 @@ func (sys *IAMSys) GetRolePolicy(arnStr string) (arn.ARN, string, error) {
 	return roleArn, rolePolicy, nil
 }
 
-// DeletePolicy - deletes a canned policy from backend or etcd.
+// DeletePolicy - deletes a canned policy from backend. `notifyPeers` is true
+// whenever this is called via the API. It is false when called via a
+// notification from another peer. This is to avoid infinite loops.
 func (sys *IAMSys) DeletePolicy(ctx context.Context, policyName string, notifyPeers bool) error {
 	if !sys.Initialized() {
 		return errServerNotInitialized
 	}
 
-	err := sys.store.DeletePolicy(ctx, policyName)
+	for _, v := range policy.DefaultPolicies {
+		if v.Name == policyName {
+			if err := checkConfig(ctx, globalObjectAPI, getPolicyDocPath(policyName)); err != nil && err == errConfigNotFound {
+				return fmt.Errorf("inbuilt policy `%s` not allowed to be deleted", policyName)
+			}
+		}
+	}
+
+	err := sys.store.DeletePolicy(ctx, policyName, !notifyPeers)
 	if err != nil {
 		return err
 	}
@@ -545,10 +588,10 @@ func (sys *IAMSys) DeletePolicy(ctx context.Context, policyName string, notifyPe
 	}
 
 	// Notify all other MinIO peers to delete policy
-	for _, nerr := range globalNotificationSys.DeletePolicy(policyName) {
+	for _, nerr := range globalNotificationSys.DeletePolicy(ctx, policyName) {
 		if nerr.Err != nil {
 			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-			logger.LogIf(ctx, nerr.Err)
+			iamLogIf(ctx, nerr.Err)
 		}
 	}
 
@@ -580,17 +623,12 @@ func (sys *IAMSys) InfoPolicy(policyName string) (*madmin.PolicyInfo, error) {
 }
 
 // ListPolicies - lists all canned policies.
-func (sys *IAMSys) ListPolicies(ctx context.Context, bucketName string) (map[string]iampolicy.Policy, error) {
+func (sys *IAMSys) ListPolicies(ctx context.Context, bucketName string) (map[string]policy.Policy, error) {
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}
 
-	select {
-	case <-sys.configLoaded:
-		return sys.store.ListPolicies(ctx, bucketName)
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return sys.store.ListPolicies(ctx, bucketName)
 }
 
 // ListPolicyDocs - lists all canned policy docs.
@@ -599,16 +637,11 @@ func (sys *IAMSys) ListPolicyDocs(ctx context.Context, bucketName string) (map[s
 		return nil, errServerNotInitialized
 	}
 
-	select {
-	case <-sys.configLoaded:
-		return sys.store.ListPolicyDocs(ctx, bucketName)
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return sys.store.ListPolicyDocs(ctx, bucketName)
 }
 
 // SetPolicy - sets a new named policy.
-func (sys *IAMSys) SetPolicy(ctx context.Context, policyName string, p iampolicy.Policy) (time.Time, error) {
+func (sys *IAMSys) SetPolicy(ctx context.Context, policyName string, p policy.Policy) (time.Time, error) {
 	if !sys.Initialized() {
 		return time.Time{}, errServerNotInitialized
 	}
@@ -620,10 +653,10 @@ func (sys *IAMSys) SetPolicy(ctx context.Context, policyName string, p iampolicy
 
 	if !sys.HasWatcher() {
 		// Notify all other MinIO peers to reload policy
-		for _, nerr := range globalNotificationSys.LoadPolicy(policyName) {
+		for _, nerr := range globalNotificationSys.LoadPolicy(ctx, policyName) {
 			if nerr.Err != nil {
 				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				logger.LogIf(ctx, nerr.Err)
+				iamLogIf(ctx, nerr.Err)
 			}
 		}
 	}
@@ -642,10 +675,10 @@ func (sys *IAMSys) DeleteUser(ctx context.Context, accessKey string, notifyPeers
 
 	// Notify all other MinIO peers to delete user.
 	if notifyPeers && !sys.HasWatcher() {
-		for _, nerr := range globalNotificationSys.DeleteUser(accessKey) {
+		for _, nerr := range globalNotificationSys.DeleteUser(ctx, accessKey) {
 			if nerr.Err != nil {
 				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				logger.LogIf(ctx, nerr.Err)
+				iamLogIf(ctx, nerr.Err)
 			}
 		}
 	}
@@ -661,17 +694,17 @@ func (sys *IAMSys) CurrentPolicies(policyName string) string {
 		return ""
 	}
 
-	policies, _ := sys.store.FilterPolicies(policyName, "")
+	policies, _ := sys.store.MergePolicies(policyName)
 	return policies
 }
 
 func (sys *IAMSys) notifyForUser(ctx context.Context, accessKey string, isTemp bool) {
 	// Notify all other MinIO peers to reload user.
 	if !sys.HasWatcher() {
-		for _, nerr := range globalNotificationSys.LoadUser(accessKey, isTemp) {
+		for _, nerr := range globalNotificationSys.LoadUser(ctx, accessKey, isTemp) {
 			if nerr.Err != nil {
 				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				logger.LogIf(ctx, nerr.Err)
+				iamLogIf(ctx, nerr.Err)
 			}
 		}
 	}
@@ -775,11 +808,15 @@ func (sys *IAMSys) ListLDAPUsers(ctx context.Context) (map[string]madmin.UserInf
 
 	select {
 	case <-sys.configLoaded:
-		ldapUsers := make(map[string]madmin.UserInfo)
-		for user, policy := range sys.store.GetUsersWithMappedPolicies() {
+		stsMap, err := sys.store.GetAllSTSUserMappings(sys.LDAPConfig.IsLDAPUserDN)
+		if err != nil {
+			return nil, err
+		}
+		ldapUsers := make(map[string]madmin.UserInfo, len(stsMap))
+		for user, policy := range stsMap {
 			ldapUsers[user] = madmin.UserInfo{
 				PolicyName: policy,
-				Status:     madmin.AccountEnabled,
+				Status:     statusEnabled,
 			}
 		}
 		return ldapUsers, nil
@@ -788,19 +825,71 @@ func (sys *IAMSys) ListLDAPUsers(ctx context.Context) (map[string]madmin.UserInf
 	}
 }
 
+type cleanEntitiesQuery struct {
+	Users    map[string]set.StringSet
+	Groups   set.StringSet
+	Policies set.StringSet
+}
+
+// createCleanEntitiesQuery - maps users to their groups and normalizes user or group DNs if ldap.
+func (sys *IAMSys) createCleanEntitiesQuery(q madmin.PolicyEntitiesQuery, ldap bool) cleanEntitiesQuery {
+	cleanQ := cleanEntitiesQuery{
+		Users:    make(map[string]set.StringSet),
+		Groups:   set.CreateStringSet(q.Groups...),
+		Policies: set.CreateStringSet(q.Policy...),
+	}
+
+	if ldap {
+		// Validate and normalize users, then fetch and normalize their groups
+		// Also include unvalidated users for backward compatibility.
+		for _, user := range q.Users {
+			lookupRes, actualGroups, _ := sys.LDAPConfig.GetValidatedDNWithGroups(user)
+			if lookupRes != nil {
+				groupSet := set.CreateStringSet(actualGroups...)
+
+				// duplicates can be overwritten, fetched groups should be identical.
+				cleanQ.Users[lookupRes.NormDN] = groupSet
+			}
+			// Search for non-normalized DN as well for backward compatibility.
+			if _, ok := cleanQ.Users[user]; !ok {
+				cleanQ.Users[user] = nil
+			}
+		}
+
+		// Validate and normalize groups.
+		for _, group := range q.Groups {
+			lookupRes, underDN, _ := sys.LDAPConfig.GetValidatedGroupDN(nil, group)
+			if lookupRes != nil && underDN {
+				cleanQ.Groups.Add(lookupRes.NormDN)
+			}
+		}
+	} else {
+		for _, user := range q.Users {
+			info, err := sys.store.GetUserInfo(user)
+			var groupSet set.StringSet
+			if err == nil {
+				groupSet = set.CreateStringSet(info.MemberOf...)
+			}
+			cleanQ.Users[user] = groupSet
+		}
+	}
+	return cleanQ
+}
+
 // QueryLDAPPolicyEntities - queries policy associations for LDAP users/groups/policies.
 func (sys *IAMSys) QueryLDAPPolicyEntities(ctx context.Context, q madmin.PolicyEntitiesQuery) (*madmin.PolicyEntitiesResult, error) {
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}
 
-	if sys.usersSysType != LDAPUsersSysType {
+	if !sys.LDAPConfig.Enabled() {
 		return nil, errIAMActionNotAllowed
 	}
 
 	select {
 	case <-sys.configLoaded:
-		pe := sys.store.ListLDAPPolicyMappings(q, sys.ldapConfig.IsLDAPUserDN, sys.ldapConfig.IsLDAPGroupDN)
+		cleanQuery := sys.createCleanEntitiesQuery(q, true)
+		pe := sys.store.ListPolicyMappings(cleanQuery, sys.LDAPConfig.IsLDAPUserDN, sys.LDAPConfig.IsLDAPGroupDN, sys.LDAPConfig.DecodeDN)
 		pe.Timestamp = UTCNow()
 		return &pe, nil
 	case <-ctx.Done():
@@ -808,7 +897,7 @@ func (sys *IAMSys) QueryLDAPPolicyEntities(ctx context.Context, q madmin.PolicyE
 	}
 }
 
-// IsTempUser - returns if given key is a temporary user.
+// IsTempUser - returns if given key is a temporary user and parent user.
 func (sys *IAMSys) IsTempUser(name string) (bool, string, error) {
 	if !sys.Initialized() {
 		return false, "", errServerNotInitialized
@@ -850,13 +939,20 @@ func (sys *IAMSys) GetUserInfo(ctx context.Context, name string) (u madmin.UserI
 		return u, errServerNotInitialized
 	}
 
+	loadUserCalled := false
 	select {
 	case <-sys.configLoaded:
 	default:
 		sys.store.LoadUser(ctx, name)
+		loadUserCalled = true
 	}
 
-	return sys.store.GetUserInfo(name)
+	userInfo, err := sys.store.GetUserInfo(name)
+	if err == errNoSuchUser && !loadUserCalled {
+		sys.store.LoadUser(ctx, name)
+		userInfo, err = sys.store.GetUserInfo(name)
+	}
+	return userInfo, err
 }
 
 // QueryPolicyEntities - queries policy associations for builtin users/groups/policies.
@@ -867,21 +963,22 @@ func (sys *IAMSys) QueryPolicyEntities(ctx context.Context, q madmin.PolicyEntit
 
 	select {
 	case <-sys.configLoaded:
-		pe := sys.store.ListPolicyMappings(q)
+		cleanQuery := sys.createCleanEntitiesQuery(q, false)
+		var userPredicate, groupPredicate func(string) bool
+		if sys.LDAPConfig.Enabled() {
+			userPredicate = func(s string) bool {
+				return !sys.LDAPConfig.IsLDAPUserDN(s)
+			}
+			groupPredicate = func(s string) bool {
+				return !sys.LDAPConfig.IsLDAPGroupDN(s)
+			}
+		}
+		pe := sys.store.ListPolicyMappings(cleanQuery, userPredicate, groupPredicate, nil)
 		pe.Timestamp = UTCNow()
 		return &pe, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-}
-
-// GetUserPolicies - get policies attached to a user.
-func (sys *IAMSys) GetUserPolicies(name string) (p []string, err error) {
-	if !sys.Initialized() {
-		return p, errServerNotInitialized
-	}
-
-	return sys.store.GetUserPolicies(name)
 }
 
 // SetUserStatus - sets current user status, supports disabled or enabled.
@@ -906,20 +1003,22 @@ func (sys *IAMSys) SetUserStatus(ctx context.Context, accessKey string, status m
 func (sys *IAMSys) notifyForServiceAccount(ctx context.Context, accessKey string) {
 	// Notify all other Minio peers to reload the service account
 	if !sys.HasWatcher() {
-		for _, nerr := range globalNotificationSys.LoadServiceAccount(accessKey) {
+		for _, nerr := range globalNotificationSys.LoadServiceAccount(ctx, accessKey) {
 			if nerr.Err != nil {
 				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				logger.LogIf(ctx, nerr.Err)
+				iamLogIf(ctx, nerr.Err)
 			}
 		}
 	}
 }
 
 type newServiceAccountOpts struct {
-	sessionPolicy *iampolicy.Policy
-	accessKey     string
-	secretKey     string
-	comment       string
+	sessionPolicy              *policy.Policy
+	accessKey                  string
+	secretKey                  string
+	name, description          string
+	expiration                 *time.Time
+	allowSiteReplicatorAccount bool // allow creating internal service account for site-replication.
 
 	claims map[string]interface{}
 }
@@ -934,6 +1033,13 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 		return auth.Credentials{}, time.Time{}, errInvalidArgument
 	}
 
+	if len(opts.accessKey) > 0 && len(opts.secretKey) == 0 {
+		return auth.Credentials{}, time.Time{}, auth.ErrNoSecretKeyWithAccessKey
+	}
+	if len(opts.secretKey) > 0 && len(opts.accessKey) == 0 {
+		return auth.Credentials{}, time.Time{}, auth.ErrNoAccessKeyWithSecretKey
+	}
+
 	var policyBuf []byte
 	if opts.sessionPolicy != nil {
 		err := opts.sessionPolicy.Validate()
@@ -944,8 +1050,8 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 		if err != nil {
 			return auth.Credentials{}, time.Time{}, err
 		}
-		if len(policyBuf) > 16*humanize.KiByte {
-			return auth.Credentials{}, time.Time{}, fmt.Errorf("Session policy should not exceed 16 KiB characters")
+		if len(policyBuf) > maxSVCSessionPolicySize {
+			return auth.Credentials{}, time.Time{}, errSessionPolicyTooLarge
 		}
 	}
 
@@ -954,18 +1060,20 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 	if parentUser == opts.accessKey {
 		return auth.Credentials{}, time.Time{}, errIAMActionNotAllowed
 	}
-
+	if siteReplicatorSvcAcc == opts.accessKey && !opts.allowSiteReplicatorAccount {
+		return auth.Credentials{}, time.Time{}, errIAMActionNotAllowed
+	}
 	m := make(map[string]interface{})
 	m[parentClaim] = parentUser
 
 	if len(policyBuf) > 0 {
-		m[iampolicy.SessionPolicyName] = base64.StdEncoding.EncodeToString(policyBuf)
+		m[policy.SessionPolicyName] = base64.StdEncoding.EncodeToString(policyBuf)
 		m[iamPolicyClaimNameSA()] = embeddedPolicyType
 	} else {
 		m[iamPolicyClaimNameSA()] = inheritedPolicyType
 	}
 
-	// Add all the necessary claims for the service accounts.
+	// Add all the necessary claims for the service account.
 	for k, v := range opts.claims {
 		_, ok := m[k]
 		if !ok {
@@ -975,7 +1083,7 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 
 	var accessKey, secretKey string
 	var err error
-	if len(opts.accessKey) > 0 {
+	if len(opts.accessKey) > 0 || len(opts.secretKey) > 0 {
 		accessKey, secretKey = opts.accessKey, opts.secretKey
 	} else {
 		accessKey, secretKey, err = auth.GenerateCredentials()
@@ -990,7 +1098,16 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 	cred.ParentUser = parentUser
 	cred.Groups = groups
 	cred.Status = string(auth.AccountOn)
-	cred.Comment = opts.comment
+	cred.Name = opts.name
+	cred.Description = opts.description
+
+	if opts.expiration != nil {
+		expirationInUTC := opts.expiration.UTC()
+		if err := validateSvcExpirationInUTC(expirationInUTC); err != nil {
+			return auth.Credentials{}, time.Time{}, err
+		}
+		cred.Expiration = expirationInUTC
+	}
 
 	updatedAt, err := sys.store.AddServiceAccount(ctx, cred)
 	if err != nil {
@@ -1002,10 +1119,11 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 }
 
 type updateServiceAccountOpts struct {
-	sessionPolicy *iampolicy.Policy
-	secretKey     string
-	status        string
-	comment       string
+	sessionPolicy     *policy.Policy
+	secretKey         string
+	status            string
+	name, description string
+	expiration        *time.Time
 }
 
 // UpdateServiceAccount - edit a service account
@@ -1023,7 +1141,7 @@ func (sys *IAMSys) UpdateServiceAccount(ctx context.Context, accessKey string, o
 	return updatedAt, nil
 }
 
-// ListServiceAccounts - lists all services accounts associated to a specific user
+// ListServiceAccounts - lists all service accounts associated to a specific user
 func (sys *IAMSys) ListServiceAccounts(ctx context.Context, accessKey string) ([]auth.Credentials, error) {
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
@@ -1037,7 +1155,7 @@ func (sys *IAMSys) ListServiceAccounts(ctx context.Context, accessKey string) ([
 	}
 }
 
-// ListTempAccounts - lists all services accounts associated to a specific user
+// ListTempAccounts - lists all temporary service accounts associated to a specific user
 func (sys *IAMSys) ListTempAccounts(ctx context.Context, accessKey string) ([]UserIdentity, error) {
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
@@ -1051,8 +1169,22 @@ func (sys *IAMSys) ListTempAccounts(ctx context.Context, accessKey string) ([]Us
 	}
 }
 
+// ListSTSAccounts - lists all STS accounts associated to a specific user
+func (sys *IAMSys) ListSTSAccounts(ctx context.Context, accessKey string) ([]auth.Credentials, error) {
+	if !sys.Initialized() {
+		return nil, errServerNotInitialized
+	}
+
+	select {
+	case <-sys.configLoaded:
+		return sys.store.ListSTSAccounts(ctx, accessKey)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // GetServiceAccount - wrapper method to get information about a service account
-func (sys *IAMSys) GetServiceAccount(ctx context.Context, accessKey string) (auth.Credentials, *iampolicy.Policy, error) {
+func (sys *IAMSys) GetServiceAccount(ctx context.Context, accessKey string) (auth.Credentials, *policy.Policy, error) {
 	sa, embeddedPolicy, err := sys.getServiceAccount(ctx, accessKey)
 	if err != nil {
 		return auth.Credentials{}, nil, err
@@ -1063,7 +1195,7 @@ func (sys *IAMSys) GetServiceAccount(ctx context.Context, accessKey string) (aut
 	return sa.Credentials, embeddedPolicy, nil
 }
 
-func (sys *IAMSys) getServiceAccount(ctx context.Context, accessKey string) (UserIdentity, *iampolicy.Policy, error) {
+func (sys *IAMSys) getServiceAccount(ctx context.Context, accessKey string) (UserIdentity, *policy.Policy, error) {
 	sa, jwtClaims, err := sys.getAccountWithClaims(ctx, accessKey)
 	if err != nil {
 		if err == errNoSuchAccount {
@@ -1075,16 +1207,16 @@ func (sys *IAMSys) getServiceAccount(ctx context.Context, accessKey string) (Use
 		return UserIdentity{}, nil, errNoSuchServiceAccount
 	}
 
-	var embeddedPolicy *iampolicy.Policy
+	var embeddedPolicy *policy.Policy
 
 	pt, ptok := jwtClaims.Lookup(iamPolicyClaimNameSA())
-	sp, spok := jwtClaims.Lookup(iampolicy.SessionPolicyName)
+	sp, spok := jwtClaims.Lookup(policy.SessionPolicyName)
 	if ptok && spok && pt == embeddedPolicyType {
 		policyBytes, err := base64.StdEncoding.DecodeString(sp)
 		if err != nil {
 			return UserIdentity{}, nil, err
 		}
-		embeddedPolicy, err = iampolicy.ParseConfig(bytes.NewReader(policyBytes))
+		embeddedPolicy, err = policy.ParseConfig(bytes.NewReader(policyBytes))
 		if err != nil {
 			return UserIdentity{}, nil, err
 		}
@@ -1094,10 +1226,19 @@ func (sys *IAMSys) getServiceAccount(ctx context.Context, accessKey string) (Use
 }
 
 // GetTemporaryAccount - wrapper method to get information about a temporary account
-func (sys *IAMSys) GetTemporaryAccount(ctx context.Context, accessKey string) (auth.Credentials, *iampolicy.Policy, error) {
+func (sys *IAMSys) GetTemporaryAccount(ctx context.Context, accessKey string) (auth.Credentials, *policy.Policy, error) {
+	if !sys.Initialized() {
+		return auth.Credentials{}, nil, errServerNotInitialized
+	}
 	tmpAcc, embeddedPolicy, err := sys.getTempAccount(ctx, accessKey)
 	if err != nil {
-		return auth.Credentials{}, nil, err
+		if err == errNoSuchTempAccount {
+			sys.store.LoadUser(ctx, accessKey)
+			tmpAcc, embeddedPolicy, err = sys.getTempAccount(ctx, accessKey)
+		}
+		if err != nil {
+			return auth.Credentials{}, nil, err
+		}
 	}
 	// Hide secret & session keys
 	tmpAcc.Credentials.SecretKey = ""
@@ -1105,7 +1246,7 @@ func (sys *IAMSys) GetTemporaryAccount(ctx context.Context, accessKey string) (a
 	return tmpAcc.Credentials, embeddedPolicy, nil
 }
 
-func (sys *IAMSys) getTempAccount(ctx context.Context, accessKey string) (UserIdentity, *iampolicy.Policy, error) {
+func (sys *IAMSys) getTempAccount(ctx context.Context, accessKey string) (UserIdentity, *policy.Policy, error) {
 	tmpAcc, claims, err := sys.getAccountWithClaims(ctx, accessKey)
 	if err != nil {
 		if err == errNoSuchAccount {
@@ -1117,15 +1258,15 @@ func (sys *IAMSys) getTempAccount(ctx context.Context, accessKey string) (UserId
 		return UserIdentity{}, nil, errNoSuchTempAccount
 	}
 
-	var embeddedPolicy *iampolicy.Policy
+	var embeddedPolicy *policy.Policy
 
-	sp, spok := claims.Lookup(iampolicy.SessionPolicyName)
+	sp, spok := claims.Lookup(policy.SessionPolicyName)
 	if spok {
 		policyBytes, err := base64.StdEncoding.DecodeString(sp)
 		if err != nil {
 			return UserIdentity{}, nil, err
 		}
-		embeddedPolicy, err = iampolicy.ParseConfig(bytes.NewReader(policyBytes))
+		embeddedPolicy, err = policy.ParseConfig(bytes.NewReader(policyBytes))
 		if err != nil {
 			return UserIdentity{}, nil, err
 		}
@@ -1145,12 +1286,9 @@ func (sys *IAMSys) getAccountWithClaims(ctx context.Context, accessKey string) (
 		return UserIdentity{}, nil, errNoSuchAccount
 	}
 
-	jwtClaims, err := auth.ExtractClaims(acc.Credentials.SessionToken, acc.Credentials.SecretKey)
+	jwtClaims, err := extractJWTClaims(acc)
 	if err != nil {
-		jwtClaims, err = auth.ExtractClaims(acc.Credentials.SessionToken, globalActiveCred.SecretKey)
-		if err != nil {
-			return UserIdentity{}, nil, err
-		}
+		return UserIdentity{}, nil, err
 	}
 
 	return acc, jwtClaims, nil
@@ -1162,22 +1300,16 @@ func (sys *IAMSys) GetClaimsForSvcAcc(ctx context.Context, accessKey string) (ma
 		return nil, errServerNotInitialized
 	}
 
-	if sys.usersSysType != LDAPUsersSysType {
-		return nil, nil
-	}
-
 	sa, ok := sys.store.GetUser(accessKey)
 	if !ok || !sa.Credentials.IsServiceAccount() {
 		return nil, errNoSuchServiceAccount
 	}
 
-	jwtClaims, err := auth.ExtractClaims(sa.Credentials.SessionToken, sa.Credentials.SecretKey)
+	jwtClaims, err := extractJWTClaims(sa)
 	if err != nil {
-		jwtClaims, err = auth.ExtractClaims(sa.Credentials.SessionToken, globalActiveCred.SecretKey)
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
+
 	return jwtClaims.Map(), nil
 }
 
@@ -1197,10 +1329,10 @@ func (sys *IAMSys) DeleteServiceAccount(ctx context.Context, accessKey string, n
 	}
 
 	if notifyPeers && !sys.HasWatcher() {
-		for _, nerr := range globalNotificationSys.DeleteServiceAccount(accessKey) {
+		for _, nerr := range globalNotificationSys.DeleteServiceAccount(ctx, accessKey) {
 			if nerr.Err != nil {
 				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				logger.LogIf(ctx, nerr.Err)
+				iamLogIf(ctx, nerr.Err)
 			}
 		}
 	}
@@ -1215,12 +1347,12 @@ func (sys *IAMSys) CreateUser(ctx context.Context, accessKey string, ureq madmin
 		return updatedAt, errServerNotInitialized
 	}
 
-	if sys.usersSysType != MinIOUsersSysType {
-		return updatedAt, errIAMActionNotAllowed
-	}
-
 	if !auth.IsAccessKeyValid(accessKey) {
 		return updatedAt, auth.ErrInvalidAccessKeyLength
+	}
+
+	if auth.ContainsReservedChars(accessKey) {
+		return updatedAt, auth.ErrContainsReservedChars
 	}
 
 	if !auth.IsSecretKeyValid(ureq.SecretKey) {
@@ -1275,14 +1407,14 @@ func (sys *IAMSys) purgeExpiredCredentialsForExternalSSO(ctx context.Context) {
 		roleArns := puInfo.roleArns.ToSlice()
 		var roleArn string
 		if len(roleArns) == 0 {
-			logger.LogIf(GlobalContext,
+			iamLogIf(GlobalContext,
 				fmt.Errorf("parentUser: %s had no roleArns mapped!", parentUser))
 			continue
 		}
 		roleArn = roleArns[0]
-		u, err := sys.openIDConfig.LookupUser(roleArn, puInfo.subClaimValue)
+		u, err := sys.OpenIDConfig.LookupUser(roleArn, puInfo.subClaimValue)
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
+			iamLogIf(GlobalContext, err)
 			continue
 		}
 		// If user is set to "disabled", we will remove them
@@ -1301,18 +1433,23 @@ func (sys *IAMSys) purgeExpiredCredentialsForExternalSSO(ctx context.Context) {
 func (sys *IAMSys) purgeExpiredCredentialsForLDAP(ctx context.Context) {
 	parentUsers := sys.store.GetAllParentUsers()
 	var allDistNames []string
-	for parentUser := range parentUsers {
-		if !sys.ldapConfig.IsLDAPUserDN(parentUser) {
+	for parentUser, info := range parentUsers {
+		if !sys.LDAPConfig.IsLDAPUserDN(parentUser) {
 			continue
 		}
 
-		allDistNames = append(allDistNames, parentUser)
+		if info.subClaimValue != "" {
+			// we need to ask LDAP about the actual user DN not normalized DN.
+			allDistNames = append(allDistNames, info.subClaimValue)
+		} else {
+			allDistNames = append(allDistNames, parentUser)
+		}
 	}
 
-	expiredUsers, err := sys.ldapConfig.GetNonEligibleUserDistNames(allDistNames)
+	expiredUsers, err := sys.LDAPConfig.GetNonEligibleUserDistNames(allDistNames)
 	if err != nil {
 		// Log and return on error - perhaps it'll work the next time.
-		logger.LogIf(GlobalContext, err)
+		iamLogIf(GlobalContext, err)
 		return
 	}
 
@@ -1325,15 +1462,23 @@ func (sys *IAMSys) updateGroupMembershipsForLDAP(ctx context.Context) {
 	// 1. Collect all LDAP users with active creds.
 	allCreds := sys.store.GetSTSAndServiceAccounts()
 	// List of unique LDAP (parent) user DNs that have active creds
-	var parentUsers []string
-	// Map of LDAP user to list of active credential objects
+	var parentUserActualDNList []string
+	// Map of LDAP user (internal representation) to list of active credential objects
 	parentUserToCredsMap := make(map[string][]auth.Credentials)
 	// DN to ldap username mapping for each LDAP user
-	parentUserToLDAPUsernameMap := make(map[string]string)
+	actualDNToLDAPUsernameMap := make(map[string]string)
+	// External (actual) LDAP DN to internal normalized representation
+	actualDNToParentUserMap := make(map[string]string)
 	for _, cred := range allCreds {
-		if !sys.ldapConfig.IsLDAPUserDN(cred.ParentUser) {
+		// Expired credentials don't need parent user updates.
+		if cred.IsExpired() {
 			continue
 		}
+
+		if !sys.LDAPConfig.IsLDAPUserDN(cred.ParentUser) {
+			continue
+		}
+
 		// Check if this is the first time we are
 		// encountering this LDAP user.
 		if _, ok := parentUserToCredsMap[cred.ParentUser]; !ok {
@@ -1354,41 +1499,50 @@ func (sys *IAMSys) updateGroupMembershipsForLDAP(ctx context.Context) {
 					jwtClaims, err = auth.ExtractClaims(cred.SessionToken, globalActiveCred.SecretKey)
 				}
 			} else {
-				jwtClaims, err = auth.ExtractClaims(cred.SessionToken, globalActiveCred.SecretKey)
+				var secretKey string
+				secretKey, err = getTokenSigningKey()
+				if err != nil {
+					continue
+				}
+				jwtClaims, err = auth.ExtractClaims(cred.SessionToken, secretKey)
 			}
 			if err != nil {
 				// skip this cred - session token seems invalid
 				continue
 			}
 
-			ldapUsername, ok := jwtClaims.Lookup(ldapUserN)
-			if !ok {
+			ldapUsername, okUserN := jwtClaims.Lookup(ldapUserN)
+			ldapActualDN, okDN := jwtClaims.Lookup(ldapActualUser)
+			if !okUserN || !okDN {
 				// skip this cred - we dont have the
 				// username info needed
 				continue
 			}
 
 			// Collect each new cred.ParentUser into parentUsers
-			parentUsers = append(parentUsers, cred.ParentUser)
+			parentUserActualDNList = append(parentUserActualDNList, ldapActualDN)
 
 			// Update the ldapUsernameMap
-			parentUserToLDAPUsernameMap[cred.ParentUser] = ldapUsername
+			actualDNToLDAPUsernameMap[ldapActualDN] = ldapUsername
+
+			// Update the actualDNToParentUserMap
+			actualDNToParentUserMap[ldapActualDN] = cred.ParentUser
 		}
 		parentUserToCredsMap[cred.ParentUser] = append(parentUserToCredsMap[cred.ParentUser], cred)
-
 	}
 
 	// 2. Query LDAP server for groups of the LDAP users collected.
-	updatedGroups, err := sys.ldapConfig.LookupGroupMemberships(parentUsers, parentUserToLDAPUsernameMap)
+	updatedGroups, err := sys.LDAPConfig.LookupGroupMemberships(parentUserActualDNList, actualDNToLDAPUsernameMap)
 	if err != nil {
 		// Log and return on error - perhaps it'll work the next time.
-		logger.LogIf(GlobalContext, err)
+		iamLogIf(GlobalContext, err)
 		return
 	}
 
 	// 3. Update creds for those users whose groups are changed
-	for _, parentUser := range parentUsers {
-		currGroupsSet := updatedGroups[parentUser]
+	for _, parentActualDN := range parentUserActualDNList {
+		currGroupsSet := updatedGroups[parentActualDN]
+		parentUser := actualDNToParentUserMap[parentActualDN]
 		currGroups := currGroupsSet.ToSlice()
 		for _, cred := range parentUserToCredsMap[parentUser] {
 			gSet := set.CreateStringSet(cred.Groups...)
@@ -1398,51 +1552,294 @@ func (sys *IAMSys) updateGroupMembershipsForLDAP(ctx context.Context) {
 				continue
 			}
 
+			// Expired credentials don't need group membership updates.
+			if cred.IsExpired() {
+				continue
+			}
+
 			cred.Groups = currGroups
 			if err := sys.store.UpdateUserIdentity(ctx, cred); err != nil {
 				// Log and continue error - perhaps it'll work the next time.
-				logger.LogIf(GlobalContext, err)
+				iamLogIf(GlobalContext, err)
 			}
 		}
 	}
 }
 
-// GetUser - get user credentials
-func (sys *IAMSys) GetUser(ctx context.Context, accessKey string) (u UserIdentity, ok bool) {
-	if !sys.Initialized() {
-		return u, false
+// NormalizeLDAPAccessKeypairs - normalize the access key pairs (service
+// accounts) for LDAP users. This normalizes the parent user and the group names
+// whenever the parent user parses validly as a DN.
+func (sys *IAMSys) NormalizeLDAPAccessKeypairs(ctx context.Context, accessKeyMap map[string]madmin.SRSvcAccCreate,
+) (skippedAccessKeys []string, err error) {
+	conn, err := sys.LDAPConfig.LDAP.Connect()
+	if err != nil {
+		return skippedAccessKeys, err
+	}
+	defer conn.Close()
+
+	// Bind to the lookup user account
+	if err = sys.LDAPConfig.LDAP.LookupBind(conn); err != nil {
+		return skippedAccessKeys, err
 	}
 
-	fallback := false
+	var collectedErrors []error
+	updatedKeysMap := make(map[string]madmin.SRSvcAccCreate)
+	for ak, createReq := range accessKeyMap {
+		parent := createReq.Parent
+		groups := createReq.Groups
+
+		_, err := ldap.NormalizeDN(parent)
+		if err != nil {
+			// not a valid DN, ignore.
+			continue
+		}
+
+		hasDiff := false
+
+		// For the parent value, we require that the parent exists in the LDAP
+		// server and is under a configured base DN.
+		validatedParent, isUnderBaseDN, err := sys.LDAPConfig.GetValidatedUserDN(conn, parent)
+		if err != nil {
+			collectedErrors = append(collectedErrors, fmt.Errorf("could not validate parent exists in LDAP directory: %w", err))
+			continue
+		}
+		if validatedParent == nil || !isUnderBaseDN {
+			skippedAccessKeys = append(skippedAccessKeys, ak)
+			continue
+		}
+
+		if validatedParent.NormDN != parent {
+			hasDiff = true
+		}
+
+		var normalizedGroups []string
+		for _, group := range groups {
+			// For a group, we store the normalized DN even if it not under a
+			// configured base DN.
+			validatedGroup, _, err := sys.LDAPConfig.GetValidatedGroupDN(conn, group)
+			if err != nil {
+				collectedErrors = append(collectedErrors, fmt.Errorf("could not validate group exists in LDAP directory: %w", err))
+				continue
+			}
+			if validatedGroup == nil {
+				// DN group was not found in the LDAP directory for access-key
+				continue
+			}
+
+			if validatedGroup.NormDN != group {
+				hasDiff = true
+			}
+			normalizedGroups = append(normalizedGroups, validatedGroup.NormDN)
+		}
+
+		if hasDiff {
+			updatedCreateReq := createReq
+			updatedCreateReq.Parent = validatedParent.NormDN
+			updatedCreateReq.Groups = normalizedGroups
+
+			updatedKeysMap[ak] = updatedCreateReq
+		}
+	}
+
+	// if there are any errors, return a collected error.
+	if len(collectedErrors) > 0 {
+		return skippedAccessKeys, fmt.Errorf("errors validating LDAP DN: %w", errors.Join(collectedErrors...))
+	}
+
+	for k, v := range updatedKeysMap {
+		// Replace the map values with the updated ones
+		accessKeyMap[k] = v
+	}
+
+	return skippedAccessKeys, nil
+}
+
+func (sys *IAMSys) getStoredLDAPPolicyMappingKeys(ctx context.Context, isGroup bool) set.StringSet {
+	entityKeysInStorage := set.NewStringSet()
+	cache := sys.store.rlock()
+	defer sys.store.runlock()
+	cachedPolicyMap := cache.iamSTSPolicyMap
+	if isGroup {
+		cachedPolicyMap = cache.iamGroupPolicyMap
+	}
+	cachedPolicyMap.Range(func(k string, v MappedPolicy) bool {
+		entityKeysInStorage.Add(k)
+		return true
+	})
+
+	return entityKeysInStorage
+}
+
+// NormalizeLDAPMappingImport - validates the LDAP policy mappings. Keys in the
+// given map may not correspond to LDAP DNs - these keys are ignored.
+//
+// For validated mappings, it updates the key in the given map to be in
+// normalized form.
+func (sys *IAMSys) NormalizeLDAPMappingImport(ctx context.Context, isGroup bool,
+	policyMap map[string]MappedPolicy,
+) ([]string, error) {
+	conn, err := sys.LDAPConfig.LDAP.Connect()
+	if err != nil {
+		return []string{}, err
+	}
+	defer conn.Close()
+
+	// Bind to the lookup user account
+	if err = sys.LDAPConfig.LDAP.LookupBind(conn); err != nil {
+		return []string{}, err
+	}
+
+	// We map keys that correspond to LDAP DNs and validate that they exist in
+	// the LDAP server.
+	var dnValidator func(*libldap.Conn, string) (*ldap.DNSearchResult, bool, error) = sys.LDAPConfig.GetValidatedUserDN
+	if isGroup {
+		dnValidator = sys.LDAPConfig.GetValidatedGroupDN
+	}
+
+	// map of normalized DN keys to original keys.
+	normalizedDNKeysMap := make(map[string][]string)
+	var collectedErrors []error
+	var skipped []string
+	for k := range policyMap {
+		_, err := ldap.NormalizeDN(k)
+		if err != nil {
+			// not a valid DN, ignore.
+			continue
+		}
+		validatedDN, underBaseDN, err := dnValidator(conn, k)
+		if err != nil {
+			collectedErrors = append(collectedErrors, fmt.Errorf("could not validate `%s` exists in LDAP directory: %w", k, err))
+			continue
+		}
+		if validatedDN == nil || !underBaseDN {
+			skipped = append(skipped, k)
+			continue
+		}
+
+		if validatedDN.NormDN != k {
+			normalizedDNKeysMap[validatedDN.NormDN] = append(normalizedDNKeysMap[validatedDN.NormDN], k)
+		}
+	}
+
+	// if there are any errors, return a collected error.
+	if len(collectedErrors) > 0 {
+		return []string{}, fmt.Errorf("errors validating LDAP DN: %w", errors.Join(collectedErrors...))
+	}
+
+	entityKeysInStorage := sys.getStoredLDAPPolicyMappingKeys(ctx, isGroup)
+
+	for normKey, origKeys := range normalizedDNKeysMap {
+		if len(origKeys) > 1 {
+			// If there are multiple DN keys that normalize to the same value,
+			// check if the policy mappings are equal, if they are we don't need
+			// to return an error.
+			policiesDiffer := false
+			firstMappedPolicies := policyMap[origKeys[0]].policySet()
+			for i := 1; i < len(origKeys); i++ {
+				otherMappedPolicies := policyMap[origKeys[i]].policySet()
+				if !firstMappedPolicies.Equals(otherMappedPolicies) {
+					policiesDiffer = true
+					break
+				}
+			}
+
+			if policiesDiffer {
+				return []string{}, fmt.Errorf("multiple DNs map to the same LDAP DN[%s]: %v; please remove DNs that are not needed",
+					normKey, origKeys)
+			}
+
+			if len(origKeys[1:]) > 0 {
+				// Log that extra DN mappings will not be imported.
+				iamLogEvent(ctx, "import-ldap-normalize: extraneous DN mappings found for LDAP DN[%s]: %v will not be imported", origKeys[0], origKeys[1:])
+			}
+
+			// Policies mapped to the DN's are the same, so we remove the extra
+			// ones from the map.
+			for i := 1; i < len(origKeys); i++ {
+				delete(policyMap, origKeys[i])
+
+				// Remove the mapping from storage by setting the policy to "".
+				if entityKeysInStorage.Contains(origKeys[i]) {
+					// Ignore any deletion error.
+					_, delErr := sys.PolicyDBSet(ctx, origKeys[i], "", stsUser, isGroup)
+					if delErr != nil {
+						logErr := fmt.Errorf("failed to delete extraneous LDAP DN mapping for `%s`: %w", origKeys[i], delErr)
+						iamLogIf(ctx, logErr)
+					}
+				}
+			}
+		}
+
+		// Replacing origKeys[0] with normKey in the policyMap
+
+		// len(origKeys) is always > 0, so here len(origKeys) == 1
+		mappingValue := policyMap[origKeys[0]]
+		delete(policyMap, origKeys[0])
+		policyMap[normKey] = mappingValue
+		iamLogEvent(ctx, "import-ldap-normalize: normalized LDAP DN mapping from `%s` to `%s`", origKeys[0], normKey)
+
+		// Remove the mapping from storage by setting the policy to "".
+		if entityKeysInStorage.Contains(origKeys[0]) {
+			// Ignore any deletion error.
+			_, delErr := sys.PolicyDBSet(ctx, origKeys[0], "", stsUser, isGroup)
+			if delErr != nil {
+				logErr := fmt.Errorf("failed to delete extraneous LDAP DN mapping for `%s`: %w", origKeys[0], delErr)
+				iamLogIf(ctx, logErr)
+			}
+		}
+	}
+	return skipped, nil
+}
+
+// CheckKey validates the incoming accessKey
+func (sys *IAMSys) CheckKey(ctx context.Context, accessKey string) (u UserIdentity, ok bool, err error) {
+	if !sys.Initialized() {
+		return u, false, nil
+	}
+
+	if accessKey == globalActiveCred.AccessKey {
+		return newUserIdentity(globalActiveCred), true, nil
+	}
+
+	loadUserCalled := false
 	select {
 	case <-sys.configLoaded:
 	default:
-		sys.store.LoadUser(ctx, accessKey)
-		fallback = true
+		err = sys.store.LoadUser(ctx, accessKey)
+		loadUserCalled = true
 	}
 
 	u, ok = sys.store.GetUser(accessKey)
-	if !ok && !fallback {
-		// accessKey not found, also
-		// IAM store is not in fallback mode
-		// we can try to reload again from
-		// the IAM store and see if credential
-		// exists now. If it doesn't proceed to
-		// fail.
-		sys.store.LoadUser(ctx, accessKey)
+	if !ok && !loadUserCalled {
+		err = sys.store.LoadUser(ctx, accessKey)
+		loadUserCalled = true
+
 		u, ok = sys.store.GetUser(accessKey)
 	}
 
-	return u, ok && u.Credentials.IsValid()
+	if !ok && loadUserCalled && err != nil {
+		iamLogOnceIf(ctx, err, accessKey)
+
+		// return 503 to application
+		return u, false, errIAMNotInitialized
+	}
+
+	return u, ok && u.Credentials.IsValid(), nil
+}
+
+// GetUser - get user credentials
+func (sys *IAMSys) GetUser(ctx context.Context, accessKey string) (u UserIdentity, ok bool) {
+	u, ok, _ = sys.CheckKey(ctx, accessKey)
+	return u, ok
 }
 
 // Notify all other MinIO peers to load group.
 func (sys *IAMSys) notifyForGroup(ctx context.Context, group string) {
 	if !sys.HasWatcher() {
-		for _, nerr := range globalNotificationSys.LoadGroup(group) {
+		for _, nerr := range globalNotificationSys.LoadGroup(ctx, group) {
 			if nerr.Err != nil {
 				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				logger.LogIf(ctx, nerr.Err)
+				iamLogIf(ctx, nerr.Err)
 			}
 		}
 	}
@@ -1455,8 +1852,8 @@ func (sys *IAMSys) AddUsersToGroup(ctx context.Context, group string, members []
 		return updatedAt, errServerNotInitialized
 	}
 
-	if sys.usersSysType != MinIOUsersSysType {
-		return updatedAt, errIAMActionNotAllowed
+	if auth.ContainsReservedChars(group) {
+		return updatedAt, errGroupNameContainsReservedChars
 	}
 
 	updatedAt, err = sys.store.AddUsersToGroup(ctx, group, members)
@@ -1530,7 +1927,9 @@ func (sys *IAMSys) ListGroups(ctx context.Context) (r []string, err error) {
 	}
 }
 
-// PolicyDBSet - sets a policy for a user or group in the PolicyDB - the user doesn't have to exist since sometimes they are virtuals
+// PolicyDBSet - sets a policy for a user or group in the PolicyDB. This does
+// not validate if the user/group exists - that is the responsibility of the
+// caller.
 func (sys *IAMSys) PolicyDBSet(ctx context.Context, name, policy string, userType IAMUserType, isGroup bool) (updatedAt time.Time, err error) {
 	if !sys.Initialized() {
 		return updatedAt, errServerNotInitialized
@@ -1543,10 +1942,10 @@ func (sys *IAMSys) PolicyDBSet(ctx context.Context, name, policy string, userTyp
 
 	// Notify all other MinIO peers to reload policy
 	if !sys.HasWatcher() {
-		for _, nerr := range globalNotificationSys.LoadPolicyMapping(name, userType, isGroup) {
+		for _, nerr := range globalNotificationSys.LoadPolicyMapping(ctx, name, userType, isGroup) {
 			if nerr.Err != nil {
 				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				logger.LogIf(ctx, nerr.Err)
+				iamLogIf(ctx, nerr.Err)
 			}
 		}
 	}
@@ -1554,73 +1953,196 @@ func (sys *IAMSys) PolicyDBSet(ctx context.Context, name, policy string, userTyp
 	return updatedAt, nil
 }
 
-// PolicyDBUpdateLDAP - adds or removes policies from a user or a group verified
-// to be in the LDAP directory.
-func (sys *IAMSys) PolicyDBUpdateLDAP(ctx context.Context, isAttach bool,
+// PolicyDBUpdateBuiltin - adds or removes policies from a user or a group
+// verified to be an internal IDP user.
+func (sys *IAMSys) PolicyDBUpdateBuiltin(ctx context.Context, isAttach bool,
 	r madmin.PolicyAssociationReq,
-) (updatedAt time.Time, addedOrRemoved []string, err error) {
+) (updatedAt time.Time, addedOrRemoved, effectivePolicies []string, err error) {
 	if !sys.Initialized() {
-		return updatedAt, nil, errServerNotInitialized
+		err = errServerNotInitialized
+		return
 	}
 
-	var dn string
+	userOrGroup := r.User
 	var isGroup bool
-	if r.User != "" {
-		dn, err = globalLDAPConfig.DoesUsernameExist(r.User)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			return updatedAt, nil, err
-		}
-		if dn == "" {
-			return updatedAt, nil, errNoSuchUser
-		}
-		isGroup = false
-	} else {
-		if exists, err := globalLDAPConfig.DoesGroupDNExist(r.Group); err != nil {
-			logger.LogIf(ctx, err)
-			return updatedAt, nil, err
-		} else if !exists {
-			return updatedAt, nil, errNoSuchGroup
-		}
-		dn = r.Group
+	if userOrGroup == "" {
 		isGroup = true
+		userOrGroup = r.Group
 	}
 
-	userType := stsUser
-	updatedAt, addedOrRemoved, err = sys.store.PolicyDBUpdate(ctx, dn, isGroup,
-		userType, r.Policies, isAttach)
+	if isGroup {
+		_, err = sys.GetGroupDescription(userOrGroup)
+		if err != nil {
+			return
+		}
+	} else {
+		var isTemp bool
+		isTemp, _, err = sys.IsTempUser(userOrGroup)
+		if err != nil && err != errNoSuchUser {
+			return
+		}
+		if isTemp {
+			err = errIAMActionNotAllowed
+			return
+		}
+
+		// When the user is root credential you are not allowed to
+		// add policies for root user.
+		if userOrGroup == globalActiveCred.AccessKey {
+			err = errIAMActionNotAllowed
+			return
+		}
+
+		// Validate that user exists.
+		var userExists bool
+		_, userExists = sys.GetUser(ctx, userOrGroup)
+		if !userExists {
+			err = errNoSuchUser
+			return
+		}
+	}
+
+	updatedAt, addedOrRemoved, effectivePolicies, err = sys.store.PolicyDBUpdate(ctx, userOrGroup, isGroup,
+		regUser, r.Policies, isAttach)
 	if err != nil {
-		return updatedAt, nil, err
+		return
 	}
 
 	// Notify all other MinIO peers to reload policy
 	if !sys.HasWatcher() {
-		for _, nerr := range globalNotificationSys.LoadPolicyMapping(dn, userType, isGroup) {
+		for _, nerr := range globalNotificationSys.LoadPolicyMapping(ctx, userOrGroup, regUser, isGroup) {
 			if nerr.Err != nil {
 				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				logger.LogIf(ctx, nerr.Err)
+				iamLogIf(ctx, nerr.Err)
 			}
 		}
 	}
 
-	return updatedAt, addedOrRemoved, nil
+	replLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+		Type: madmin.SRIAMItemPolicyMapping,
+		PolicyMapping: &madmin.SRPolicyMapping{
+			UserOrGroup: userOrGroup,
+			UserType:    int(regUser),
+			IsGroup:     isGroup,
+			Policy:      strings.Join(effectivePolicies, ","),
+		},
+		UpdatedAt: updatedAt,
+	}))
+
+	return
+}
+
+// PolicyDBUpdateLDAP - adds or removes policies from a user or a group verified
+// to be in the LDAP directory.
+func (sys *IAMSys) PolicyDBUpdateLDAP(ctx context.Context, isAttach bool,
+	r madmin.PolicyAssociationReq,
+) (updatedAt time.Time, addedOrRemoved, effectivePolicies []string, err error) {
+	if !sys.Initialized() {
+		err = errServerNotInitialized
+		return
+	}
+
+	var dn string
+	var dnResult *ldap.DNSearchResult
+	var isGroup bool
+	if r.User != "" {
+		dnResult, err = sys.LDAPConfig.GetValidatedDNForUsername(r.User)
+		if err != nil {
+			iamLogIf(ctx, err)
+			return
+		}
+		if dnResult == nil {
+			// dn not found - still attempt to detach if provided user is a DN.
+			if !isAttach && sys.LDAPConfig.IsLDAPUserDN(r.User) {
+				dn = sys.LDAPConfig.QuickNormalizeDN(r.User)
+			} else {
+				err = errNoSuchUser
+				return
+			}
+		} else {
+			dn = dnResult.NormDN
+		}
+		isGroup = false
+	} else {
+		var underBaseDN bool
+		if dnResult, underBaseDN, err = sys.LDAPConfig.GetValidatedGroupDN(nil, r.Group); err != nil {
+			iamLogIf(ctx, err)
+			return
+		}
+		if dnResult == nil || !underBaseDN {
+			if !isAttach {
+				dn = sys.LDAPConfig.QuickNormalizeDN(r.Group)
+			} else {
+				err = errNoSuchGroup
+				return
+			}
+		} else {
+			// We use the group DN returned by the LDAP server (this may not
+			// equal the input group name, but we assume it is canonical).
+			dn = dnResult.NormDN
+		}
+		isGroup = true
+	}
+
+	// Backward compatibility in detaching non-normalized DNs.
+	if !isAttach {
+		var oldDN string
+		if isGroup {
+			oldDN = r.Group
+		} else {
+			oldDN = r.User
+		}
+		if oldDN != dn {
+			sys.store.PolicyDBUpdate(ctx, oldDN, isGroup, stsUser, r.Policies, isAttach)
+		}
+	}
+
+	userType := stsUser
+	updatedAt, addedOrRemoved, effectivePolicies, err = sys.store.PolicyDBUpdate(
+		ctx, dn, isGroup, userType, r.Policies, isAttach)
+	if err != nil {
+		return
+	}
+
+	// Notify all other MinIO peers to reload policy
+	if !sys.HasWatcher() {
+		for _, nerr := range globalNotificationSys.LoadPolicyMapping(ctx, dn, userType, isGroup) {
+			if nerr.Err != nil {
+				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+				iamLogIf(ctx, nerr.Err)
+			}
+		}
+	}
+
+	replLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+		Type: madmin.SRIAMItemPolicyMapping,
+		PolicyMapping: &madmin.SRPolicyMapping{
+			UserOrGroup: dn,
+			UserType:    int(userType),
+			IsGroup:     isGroup,
+			Policy:      strings.Join(effectivePolicies, ","),
+		},
+		UpdatedAt: updatedAt,
+	}))
+
+	return
 }
 
 // PolicyDBGet - gets policy set on a user or group. If a list of groups is
 // given, policies associated with them are included as well.
-func (sys *IAMSys) PolicyDBGet(name string, isGroup bool, groups ...string) ([]string, error) {
+func (sys *IAMSys) PolicyDBGet(name string, groups ...string) ([]string, error) {
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}
 
-	return sys.store.PolicyDBGet(name, isGroup, groups...)
+	return sys.store.PolicyDBGet(name, groups...)
 }
 
-const sessionPolicyNameExtracted = iampolicy.SessionPolicyName + "-extracted"
+const sessionPolicyNameExtracted = policy.SessionPolicyName + "-extracted"
 
 // IsAllowedServiceAccount - checks if the given service account is allowed to perform
 // actions. The permission of the parent user is checked first
-func (sys *IAMSys) IsAllowedServiceAccount(args iampolicy.Args, parentUser string) bool {
+func (sys *IAMSys) IsAllowedServiceAccount(args policy.Args, parentUser string) bool {
 	// Verify if the parent claim matches the parentUser.
 	p, ok := args.Claims[parentClaim]
 	if ok {
@@ -1655,23 +2177,22 @@ func (sys *IAMSys) IsAllowedServiceAccount(args iampolicy.Args, parentUser strin
 	case roleArn != "":
 		arn, err := arn.Parse(roleArn)
 		if err != nil {
-			logger.LogIf(GlobalContext, fmt.Errorf("error parsing role ARN %s: %v", roleArn, err))
+			iamLogIf(GlobalContext, fmt.Errorf("error parsing role ARN %s: %v", roleArn, err))
 			return false
 		}
 		svcPolicies = newMappedPolicy(sys.rolesMap[arn]).toSlice()
-
 	default:
 		// Check policy for parent user of service account.
-		svcPolicies, err = sys.PolicyDBGet(parentUser, false, args.Groups...)
+		svcPolicies, err = sys.PolicyDBGet(parentUser, args.Groups...)
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
+			iamLogIf(GlobalContext, err)
 			return false
 		}
 
 		// Finally, if there is no parent policy, check if a policy claim is
 		// present.
 		if len(svcPolicies) == 0 {
-			policySet, _ := iampolicy.GetPoliciesFromClaims(args.Claims, iamPolicyClaimNameOpenID())
+			policySet, _ := policy.GetPoliciesFromClaims(args.Claims, iamPolicyClaimNameOpenID())
 			svcPolicies = policySet.ToSlice()
 		}
 	}
@@ -1681,10 +2202,10 @@ func (sys *IAMSys) IsAllowedServiceAccount(args iampolicy.Args, parentUser strin
 		return false
 	}
 
-	var combinedPolicy iampolicy.Policy
+	var combinedPolicy policy.Policy
 	// Policies were found, evaluate all of them.
 	if !isOwnerDerived {
-		availablePoliciesStr, c := sys.store.FilterPolicies(strings.Join(svcPolicies, ","), "")
+		availablePoliciesStr, c := sys.store.MergePolicies(strings.Join(svcPolicies, ","))
 		if availablePoliciesStr == "" {
 			return false
 		}
@@ -1693,9 +2214,6 @@ func (sys *IAMSys) IsAllowedServiceAccount(args iampolicy.Args, parentUser strin
 
 	parentArgs := args
 	parentArgs.AccountName = parentUser
-	// These are dynamic values set them appropriately.
-	parentArgs.ConditionValues["username"] = []string{parentUser}
-	parentArgs.ConditionValues["userid"] = []string{parentUser}
 
 	saPolicyClaim, ok := args.Claims[iamPolicyClaimNameSA()]
 	if !ok {
@@ -1713,43 +2231,20 @@ func (sys *IAMSys) IsAllowedServiceAccount(args iampolicy.Args, parentUser strin
 		return isOwnerDerived || combinedPolicy.IsAllowed(parentArgs)
 	}
 
-	// Now check if we have a sessionPolicy.
-	spolicy, ok := args.Claims[sessionPolicyNameExtracted]
-	if !ok {
-		return false
+	// 3. If an inline session-policy is present, evaluate it.
+	hasSessionPolicy, isAllowedSP := isAllowedBySessionPolicyForServiceAccount(args)
+	if hasSessionPolicy {
+		return isAllowedSP && (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))
 	}
 
-	spolicyStr, ok := spolicy.(string)
-	if !ok {
-		// Sub policy if set, should be a string reject
-		// malformed/malicious requests.
-		return false
-	}
-
-	// Check if policy is parseable.
-	subPolicy, err := iampolicy.ParseConfig(bytes.NewReader([]byte(spolicyStr)))
-	if err != nil {
-		// Log any error in input session policy config.
-		logger.LogIf(GlobalContext, err)
-		return false
-	}
-
-	// This can only happen if policy was set but with an empty JSON.
-	if subPolicy.Version == "" && len(subPolicy.Statements) == 0 {
-		return isOwnerDerived || combinedPolicy.IsAllowed(parentArgs)
-	}
-
-	if subPolicy.Version == "" {
-		return false
-	}
-
-	return subPolicy.IsAllowed(parentArgs) && (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))
+	// Sub policy not set. Evaluate only the parent policies.
+	return (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))
 }
 
 // IsAllowedSTS is meant for STS based temporary credentials,
 // which implements claims validation and verification other than
 // applying policies.
-func (sys *IAMSys) IsAllowedSTS(args iampolicy.Args, parentUser string) bool {
+func (sys *IAMSys) IsAllowedSTS(args policy.Args, parentUser string) bool {
 	// 1. Determine mapped policies
 
 	isOwnerDerived := parentUser == globalActiveCred.AccessKey
@@ -1765,7 +2260,7 @@ func (sys *IAMSys) IsAllowedSTS(args iampolicy.Args, parentUser string) bool {
 		// If a roleARN is present, the role policy is applied.
 		arn, err := arn.Parse(roleArn)
 		if err != nil {
-			logger.LogIf(GlobalContext, fmt.Errorf("error parsing role ARN %s: %v", roleArn, err))
+			iamLogIf(GlobalContext, fmt.Errorf("error parsing role ARN %s: %v", roleArn, err))
 			return false
 		}
 		policies = newMappedPolicy(sys.rolesMap[arn]).toSlice()
@@ -1773,9 +2268,9 @@ func (sys *IAMSys) IsAllowedSTS(args iampolicy.Args, parentUser string) bool {
 	default:
 		// Otherwise, inherit parent user's policy
 		var err error
-		policies, err = sys.store.PolicyDBGet(parentUser, false, args.Groups...)
+		policies, err = sys.PolicyDBGet(parentUser, args.Groups...)
 		if err != nil {
-			logger.LogIf(GlobalContext, fmt.Errorf("error fetching policies on %s: %v", parentUser, err))
+			iamLogIf(GlobalContext, fmt.Errorf("error fetching policies on %s: %v", parentUser, err))
 			return false
 		}
 
@@ -1801,30 +2296,20 @@ func (sys *IAMSys) IsAllowedSTS(args iampolicy.Args, parentUser string) bool {
 
 	// 2. Combine the mapped policies into a single combined policy.
 
-	var combinedPolicy iampolicy.Policy
+	var combinedPolicy policy.Policy
+	// Policies were found, evaluate all of them.
 	if !isOwnerDerived {
-		var err error
-		combinedPolicy, err = sys.store.GetPolicy(strings.Join(policies, ","))
-		if errors.Is(err, errNoSuchPolicy) {
-			for _, pname := range policies {
-				_, err := sys.store.GetPolicy(pname)
-				if errors.Is(err, errNoSuchPolicy) {
-					// all policies presented in the claim should exist
-					logger.LogIf(GlobalContext, fmt.Errorf("expected policy (%s) missing from the JWT claim %s, rejecting the request", pname, iamPolicyClaimNameOpenID()))
-					return false
-				}
-			}
-			logger.LogIf(GlobalContext, fmt.Errorf("all policies were unexpectedly present!"))
+		availablePoliciesStr, c := sys.store.MergePolicies(strings.Join(policies, ","))
+		if availablePoliciesStr == "" {
+			// all policies presented in the claim should exist
+			iamLogIf(GlobalContext, fmt.Errorf("expected policy (%s) missing from the JWT claim %s, rejecting the request", policies, iamPolicyClaimNameOpenID()))
+
 			return false
 		}
-
+		combinedPolicy = c
 	}
 
 	// 3. If an inline session-policy is present, evaluate it.
-
-	// These are dynamic values set them appropriately.
-	args.ConditionValues["username"] = []string{parentUser}
-	args.ConditionValues["userid"] = []string{parentUser}
 
 	// Now check if we have a sessionPolicy.
 	hasSessionPolicy, isAllowedSP := isAllowedBySessionPolicy(args)
@@ -1837,7 +2322,7 @@ func (sys *IAMSys) IsAllowedSTS(args iampolicy.Args, parentUser string) bool {
 	return isOwnerDerived || combinedPolicy.IsAllowed(args)
 }
 
-func isAllowedBySessionPolicy(args iampolicy.Args) (hasSessionPolicy bool, isAllowed bool) {
+func isAllowedBySessionPolicyForServiceAccount(args policy.Args) (hasSessionPolicy bool, isAllowed bool) {
 	hasSessionPolicy = false
 	isAllowed = false
 
@@ -1857,10 +2342,71 @@ func isAllowedBySessionPolicy(args iampolicy.Args) (hasSessionPolicy bool, isAll
 	}
 
 	// Check if policy is parseable.
-	subPolicy, err := iampolicy.ParseConfig(bytes.NewReader([]byte(spolicyStr)))
+	subPolicy, err := policy.ParseConfig(bytes.NewReader([]byte(spolicyStr)))
 	if err != nil {
 		// Log any error in input session policy config.
-		logger.LogIf(GlobalContext, err)
+		iamLogIf(GlobalContext, err)
+		return
+	}
+
+	// SPECIAL CASE: For service accounts, any valid JSON is allowed as a
+	// policy, regardless of whether the number of statements is 0, this
+	// includes `null`, `{}` and `{"Statement": null}`. In fact, MinIO Console
+	// sends `null` when no policy is set and the intended behavior is that the
+	// service account should inherit parent policy.
+	//
+	// However, for a policy like `{"Statement":[]}`, the intention is to not
+	// provide any permissions via the session policy - i.e. the service account
+	// can do nothing (such a JSON could be generated by an external application
+	// as the policy for the service account). Inheriting the parent policy in
+	// such a case, is a security issue. Ideally, we should not allow such
+	// behavior, but for compatibility with the Console, we currently allow it.
+	//
+	// TODO:
+	//
+	// 1. fix console behavior and allow this inheritance for service accounts
+	// created before a certain (TBD) future date.
+	//
+	// 2. do not allow empty statement policies for service accounts.
+	if subPolicy.Version == "" && subPolicy.Statements == nil && subPolicy.ID == "" {
+		hasSessionPolicy = false
+		return
+	}
+
+	// As the session policy exists, even if the parent is the root account, it
+	// must be restricted by it. So, we set `.IsOwner` to false here
+	// unconditionally.
+	sessionPolicyArgs := args
+	sessionPolicyArgs.IsOwner = false
+
+	// Sub policy is set and valid.
+	return hasSessionPolicy, subPolicy.IsAllowed(sessionPolicyArgs)
+}
+
+func isAllowedBySessionPolicy(args policy.Args) (hasSessionPolicy bool, isAllowed bool) {
+	hasSessionPolicy = false
+	isAllowed = false
+
+	// Now check if we have a sessionPolicy.
+	spolicy, ok := args.Claims[sessionPolicyNameExtracted]
+	if !ok {
+		return
+	}
+
+	hasSessionPolicy = true
+
+	spolicyStr, ok := spolicy.(string)
+	if !ok {
+		// Sub policy if set, should be a string reject
+		// malformed/malicious requests.
+		return
+	}
+
+	// Check if policy is parseable.
+	subPolicy, err := policy.ParseConfig(bytes.NewReader([]byte(spolicyStr)))
+	if err != nil {
+		// Log any error in input session policy config.
+		iamLogIf(GlobalContext, err)
 		return
 	}
 
@@ -1869,23 +2415,36 @@ func isAllowedBySessionPolicy(args iampolicy.Args) (hasSessionPolicy bool, isAll
 		return
 	}
 
+	// As the session policy exists, even if the parent is the root account, it
+	// must be restricted by it. So, we set `.IsOwner` to false here
+	// unconditionally.
+	sessionPolicyArgs := args
+	sessionPolicyArgs.IsOwner = false
+
 	// Sub policy is set and valid.
-	return hasSessionPolicy, subPolicy.IsAllowed(args)
+	return hasSessionPolicy, subPolicy.IsAllowed(sessionPolicyArgs)
 }
 
 // GetCombinedPolicy returns a combined policy combining all policies
-func (sys *IAMSys) GetCombinedPolicy(policies ...string) iampolicy.Policy {
-	_, policy := sys.store.FilterPolicies(strings.Join(policies, ","), "")
+func (sys *IAMSys) GetCombinedPolicy(policies ...string) policy.Policy {
+	_, policy := sys.store.MergePolicies(strings.Join(policies, ","))
 	return policy
 }
 
+// doesPolicyAllow - checks if the given policy allows the passed action with given args. This is rarely needed.
+// Notice there is no account name involved, so this is a dangerous function.
+func (sys *IAMSys) doesPolicyAllow(policy string, args policy.Args) bool {
+	// Policies were found, evaluate all of them.
+	return sys.GetCombinedPolicy(policy).IsAllowed(args)
+}
+
 // IsAllowed - checks given policy args is allowed to continue the Rest API.
-func (sys *IAMSys) IsAllowed(args iampolicy.Args) bool {
+func (sys *IAMSys) IsAllowed(args policy.Args) bool {
 	// If opa is configured, use OPA always.
 	if authz := newGlobalAuthZPluginFn(); authz != nil {
 		ok, err := authz.IsAllowed(args)
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
+			authZLogIf(GlobalContext, err)
 		}
 		return ok
 	}
@@ -1914,7 +2473,7 @@ func (sys *IAMSys) IsAllowed(args iampolicy.Args) bool {
 	}
 
 	// Continue with the assumption of a regular user
-	policies, err := sys.PolicyDBGet(args.AccountName, false, args.Groups...)
+	policies, err := sys.PolicyDBGet(args.AccountName, args.Groups...)
 	if err != nil {
 		return false
 	}

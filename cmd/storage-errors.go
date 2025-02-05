@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -20,15 +20,19 @@ package cmd
 import (
 	"context"
 	"errors"
-
-	"github.com/minio/minio/internal/logger"
 )
+
+// errMaxVersionsExceeded return error beyond 10000 (default) versions per object
+var errMaxVersionsExceeded = StorageErr("maximum versions exceeded, please delete few versions to proceed")
 
 // errUnexpected - unexpected error, requires manual intervention.
 var errUnexpected = StorageErr("unexpected error, please report this issue at https://github.com/minio/minio/issues")
 
-// errCorruptedFormat - corrupted backend format.
-var errCorruptedFormat = StorageErr("corrupted backend format, specified drive mount has unexpected previous content")
+// errCorruptedFormat - corrupted format.
+var errCorruptedFormat = StorageErr("corrupted format")
+
+// errCorruptedBackend - corrupted backend.
+var errCorruptedBackend = StorageErr("corrupted backend")
 
 // errUnformattedDisk - unformatted disk found.
 var errUnformattedDisk = StorageErr("unformatted drive found")
@@ -47,6 +51,12 @@ var errDiskNotDir = StorageErr("drive is not directory or mountpoint")
 
 // errDiskNotFound - cannot find the underlying configured disk anymore.
 var errDiskNotFound = StorageErr("drive not found")
+
+// errDiskOngoingReq - indicates if the disk has an on-going request in progress.
+var errDiskOngoingReq = StorageErr("drive still did not complete the request")
+
+// errDriveIsRoot - cannot use the disk since its a root disk.
+var errDriveIsRoot = StorageErr("drive is part of root drive, will not be used")
 
 // errFaultyRemoteDisk - remote disk is faulty.
 var errFaultyRemoteDisk = StorageErr("remote drive is faulty")
@@ -113,6 +123,8 @@ var errDoneForNow = errors.New("done for now")
 // to proceed to next entry.
 var errSkipFile = errors.New("skip this file")
 
+var errIgnoreFileContrib = errors.New("ignore this file's contribution toward data-usage")
+
 // errXLBackend XL drive mode requires fresh deployment.
 var errXLBackend = errors.New("XL backend requires fresh drive")
 
@@ -162,7 +174,7 @@ func osErrToFileErr(err error) error {
 		return errFaultyDisk
 	}
 	if isSysErrInvalidArg(err) {
-		logger.LogIf(context.Background(), err)
+		storageLogIf(context.Background(), err)
 		// For some odd calls with O_DIRECT reads
 		// filesystems can return EINVAL, handle
 		// these as FileNotFound instead.

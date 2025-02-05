@@ -26,6 +26,9 @@ import (
 	"path"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/minio/minio/internal/cachevalue"
 )
 
 type usageTestFile struct {
@@ -61,8 +64,13 @@ func TestDataUsageUpdate(t *testing.T) {
 		}
 		return
 	}
+	xls := xlStorage{drivePath: base, diskInfoCache: cachevalue.New[DiskInfo]()}
+	xls.diskInfoCache.InitOnce(time.Second, cachevalue.Opts{}, func(ctx context.Context) (DiskInfo, error) {
+		return DiskInfo{Total: 1 << 40, Free: 1 << 40}, nil
+	})
+	weSleep := func() bool { return false }
 
-	got, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0)
+	got, err := scanDataFolder(context.Background(), nil, &xls, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0, weSleep)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +88,7 @@ func TestDataUsageUpdate(t *testing.T) {
 			size:    1322310,
 			flatten: true,
 			objs:    8,
-			oSizes:  sizeHistogram{0: 2, 1: 6},
+			oSizes:  sizeHistogram{0: 2, 1: 3, 2: 2, 4: 1},
 		},
 		{
 			path:   "/",
@@ -92,7 +100,7 @@ func TestDataUsageUpdate(t *testing.T) {
 			path:   "/dir1",
 			size:   1302010,
 			objs:   5,
-			oSizes: sizeHistogram{0: 1, 1: 4},
+			oSizes: sizeHistogram{0: 1, 1: 1, 2: 2, 4: 1},
 		},
 		{
 			path:  "/dir1/dira",
@@ -165,7 +173,6 @@ func TestDataUsageUpdate(t *testing.T) {
 			size: 200,
 		},
 	}
-
 	createUsageTestFiles(t, base, bucket, files)
 	err = os.RemoveAll(filepath.Join(base, bucket, "dir1/dira/dirasub/dcfile"))
 	if err != nil {
@@ -173,7 +180,7 @@ func TestDataUsageUpdate(t *testing.T) {
 	}
 	// Changed dir must be picked up in this many cycles.
 	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = scanDataFolder(context.Background(), 0, 0, base, got, getSize, 0)
+		got, err = scanDataFolder(context.Background(), nil, &xls, got, getSize, 0, weSleep)
 		got.Info.NextCycle++
 		if err != nil {
 			t.Fatal(err)
@@ -192,14 +199,14 @@ func TestDataUsageUpdate(t *testing.T) {
 			size:    363515,
 			flatten: true,
 			objs:    14,
-			oSizes:  sizeHistogram{0: 7, 1: 7},
+			oSizes:  sizeHistogram{0: 7, 1: 5, 2: 2},
 		},
 		{
 			path:    "/dir1",
 			size:    342210,
 			objs:    7,
 			flatten: false,
-			oSizes:  sizeHistogram{0: 2, 1: 5},
+			oSizes:  sizeHistogram{0: 2, 1: 3, 2: 2},
 		},
 		{
 			path:   "/newfolder",
@@ -280,7 +287,14 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 		}
 		return
 	}
-	got, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, getSize, 0)
+
+	weSleep := func() bool { return false }
+	xls := xlStorage{drivePath: base, diskInfoCache: cachevalue.New[DiskInfo]()}
+	xls.diskInfoCache.InitOnce(time.Second, cachevalue.Opts{}, func(ctx context.Context) (DiskInfo, error) {
+		return DiskInfo{Total: 1 << 40, Free: 1 << 40}, nil
+	})
+
+	got, err := scanDataFolder(context.Background(), nil, &xls, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, getSize, 0, weSleep)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +317,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 			path:   "flat",
 			size:   1322310 + expectSize,
 			objs:   8 + expectSize,
-			oSizes: sizeHistogram{0: 2 + expectSize, 1: 6},
+			oSizes: sizeHistogram{0: 2 + expectSize, 1: 3, 2: 2, 4: 1},
 		},
 		{
 			path:   "bucket/",
@@ -316,7 +330,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 			path:   "bucket/dir1",
 			size:   1302010,
 			objs:   5,
-			oSizes: sizeHistogram{0: 1, 1: 4},
+			oSizes: sizeHistogram{0: 1, 1: 1, 2: 2, 4: 1},
 		},
 		{
 			// Gets compacted at this level...
@@ -360,6 +374,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 			}
 			if e == nil {
 				t.Fatal("got nil result")
+				return
 			}
 			if e.Size != int64(w.size) {
 				t.Error("got size", e.Size, "want", w.size)
@@ -414,7 +429,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 	}
 	// Changed dir must be picked up in this many cycles.
 	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = scanDataFolder(context.Background(), 0, 0, base, got, getSize, 0)
+		got, err = scanDataFolder(context.Background(), nil, &xls, got, getSize, 0, weSleep)
 		got.Info.NextCycle++
 		if err != nil {
 			t.Fatal(err)
@@ -431,13 +446,13 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 			path:   "flat",
 			size:   363515 + expectSize,
 			objs:   14 + expectSize,
-			oSizes: sizeHistogram{0: 7 + expectSize, 1: 7},
+			oSizes: sizeHistogram{0: 7 + expectSize, 1: 5, 2: 2},
 		},
 		{
 			path:   "bucket/dir1",
 			size:   342210,
 			objs:   7,
-			oSizes: sizeHistogram{0: 2, 1: 5},
+			oSizes: sizeHistogram{0: 2, 1: 3, 2: 2},
 		},
 		{
 			path:   "bucket/",
@@ -562,22 +577,16 @@ func TestDataUsageCacheSerialize(t *testing.T) {
 		}
 		return
 	}
-	want, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0)
+	xls := xlStorage{drivePath: base, diskInfoCache: cachevalue.New[DiskInfo]()}
+	xls.diskInfoCache.InitOnce(time.Second, cachevalue.Opts{}, func(ctx context.Context) (DiskInfo, error) {
+		return DiskInfo{Total: 1 << 40, Free: 1 << 40}, nil
+	})
+	weSleep := func() bool { return false }
+	want, err := scanDataFolder(context.Background(), nil, &xls, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0, weSleep)
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := want.find("abucket/dir2")
-	e.ReplicationStats = &replicationAllStats{
-		Targets: map[string]replicationStats{
-			"arn": {
-				PendingSize:    1,
-				ReplicatedSize: 2,
-				FailedSize:     3,
-				FailedCount:    5,
-				PendingCount:   6,
-			},
-		},
-	}
 	want.replace("abucket/dir2", "", *e)
 	var buf bytes.Buffer
 	err = want.serializeTo(&buf)

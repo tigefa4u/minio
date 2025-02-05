@@ -21,17 +21,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/gorilla/mux"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/mux"
 )
 
 // adminErasureTestBed - encapsulates subsystems that need to be setup for
@@ -71,7 +73,7 @@ func prepareAdminErasureTestBed(ctx context.Context) (*adminErasureTestBed, erro
 	// Initialize boot time
 	globalBootTime = UTCNow()
 
-	globalEndpoints = mustGetPoolEndpoints(erasureDirs...)
+	globalEndpoints = mustGetPoolEndpoints(0, erasureDirs...)
 
 	initAllSubsystems(ctx)
 
@@ -106,7 +108,7 @@ func initTestErasureObjLayer(ctx context.Context) (ObjectLayer, []string, error)
 	if err != nil {
 		return nil, nil, err
 	}
-	endpoints := mustGetPoolEndpoints(erasureDirs...)
+	endpoints := mustGetPoolEndpoints(0, erasureDirs...)
 	globalPolicySys = NewPolicySys()
 	objLayer, err := newErasureServerPools(ctx, endpoints)
 	if err != nil {
@@ -166,6 +168,7 @@ func testServiceSignalReceiver(cmd cmdType, t *testing.T) {
 func getServiceCmdRequest(cmd cmdType, cred auth.Credentials) (*http.Request, error) {
 	queryVal := url.Values{}
 	queryVal.Set("action", string(cmd.toServiceAction()))
+	queryVal.Set("type", "2")
 	resource := adminPathPrefix + adminAPIVersionPrefix + "/service?" + queryVal.Encode()
 	req, err := newTestRequest(http.MethodPost, resource, 0, nil)
 	if err != nil {
@@ -218,11 +221,17 @@ func testServicesCmdHandler(cmd cmdType, t *testing.T) {
 	rec := httptest.NewRecorder()
 	adminTestBed.router.ServeHTTP(rec, req)
 
+	resp, _ := io.ReadAll(rec.Body)
 	if rec.Code != http.StatusOK {
-		resp, _ := io.ReadAll(rec.Body)
 		t.Errorf("Expected to receive %d status code but received %d. Body (%s)",
 			http.StatusOK, rec.Code, string(resp))
 	}
+
+	result := &serviceResult{}
+	if err := json.Unmarshal(resp, result); err != nil {
+		t.Error(err)
+	}
+	_ = result
 
 	// Wait until testServiceSignalReceiver() called in a goroutine quits.
 	wg.Wait()
@@ -339,7 +348,7 @@ func TestExtractHealInitParams(t *testing.T) {
 		}
 		return v
 	}
-	qParmsArr := []url.Values{
+	qParamsArr := []url.Values{
 		// Invalid cases
 		mkParams("", true, true),
 		mkParams("111", true, true),
@@ -364,9 +373,9 @@ func TestExtractHealInitParams(t *testing.T) {
 	body := `{"recursive": false, "dryRun": true, "remove": false, "scanMode": 0}`
 
 	// Test all combinations!
-	for pIdx, parms := range qParmsArr {
+	for pIdx, params := range qParamsArr {
 		for vIdx, vars := range varsArr {
-			_, err := extractHealInitParams(vars, parms, bytes.NewReader([]byte(body)))
+			_, err := extractHealInitParams(vars, params, bytes.NewReader([]byte(body)))
 			isErrCase := false
 			if pIdx < 4 || vIdx < 1 {
 				isErrCase = true
@@ -377,6 +386,150 @@ func TestExtractHealInitParams(t *testing.T) {
 			} else if err == ErrNone && isErrCase {
 				t.Errorf("Got no error but expected one: %v %v", pIdx, vIdx)
 			}
+		}
+	}
+}
+
+type byResourceUID struct{ madmin.LockEntries }
+
+func (b byResourceUID) Less(i, j int) bool {
+	toUniqLock := func(entry madmin.LockEntry) string {
+		return fmt.Sprintf("%s/%s", entry.Resource, entry.ID)
+	}
+	return toUniqLock(b.LockEntries[i]) < toUniqLock(b.LockEntries[j])
+}
+
+func TestTopLockEntries(t *testing.T) {
+	locksHeld := make(map[string][]lockRequesterInfo)
+	var owners []string
+	for i := 0; i < 4; i++ {
+		owners = append(owners, fmt.Sprintf("node-%d", i))
+	}
+
+	// Simulate DeleteObjects of 10 objects in a single request. i.e same lock
+	// request UID, but 10 different resource names associated with it.
+	var lris []lockRequesterInfo
+	uuid := mustGetUUID()
+	for i := 0; i < 10; i++ {
+		resource := fmt.Sprintf("bucket/delete-object-%d", i)
+		lri := lockRequesterInfo{
+			Name:   resource,
+			Writer: true,
+			UID:    uuid,
+			Owner:  owners[i%len(owners)],
+			Group:  true,
+			Quorum: 3,
+		}
+		lris = append(lris, lri)
+		locksHeld[resource] = []lockRequesterInfo{lri}
+	}
+
+	// Add a few concurrent read locks to the mix
+	for i := 0; i < 50; i++ {
+		resource := fmt.Sprintf("bucket/get-object-%d", i)
+		lri := lockRequesterInfo{
+			Name:   resource,
+			UID:    mustGetUUID(),
+			Owner:  owners[i%len(owners)],
+			Quorum: 2,
+		}
+		lris = append(lris, lri)
+		locksHeld[resource] = append(locksHeld[resource], lri)
+		// concurrent read lock, same resource different uid
+		lri.UID = mustGetUUID()
+		lris = append(lris, lri)
+		locksHeld[resource] = append(locksHeld[resource], lri)
+	}
+
+	var peerLocks []*PeerLocks
+	for _, owner := range owners {
+		peerLocks = append(peerLocks, &PeerLocks{
+			Addr:  owner,
+			Locks: locksHeld,
+		})
+	}
+	var exp madmin.LockEntries
+	for _, lri := range lris {
+		lockType := func(lri lockRequesterInfo) string {
+			if lri.Writer {
+				return "WRITE"
+			}
+			return "READ"
+		}
+		exp = append(exp, madmin.LockEntry{
+			Resource:   lri.Name,
+			Type:       lockType(lri),
+			ServerList: owners,
+			Owner:      lri.Owner,
+			ID:         lri.UID,
+			Quorum:     lri.Quorum,
+			Timestamp:  time.Unix(0, lri.Timestamp),
+		})
+	}
+
+	testCases := []struct {
+		peerLocks []*PeerLocks
+		expected  madmin.LockEntries
+	}{
+		{
+			peerLocks: peerLocks,
+			expected:  exp,
+		},
+	}
+
+	// printEntries := func(entries madmin.LockEntries) {
+	// 	for i, entry := range entries {
+	// 		fmt.Printf("%d: %s %s %s %s %v %d\n", i, entry.Resource, entry.ID, entry.Owner, entry.Type, entry.ServerList, entry.Elapsed)
+	// 	}
+	// }
+
+	check := func(exp, got madmin.LockEntries) (int, bool) {
+		if len(exp) != len(got) {
+			return 0, false
+		}
+		sort.Slice(exp, byResourceUID{exp}.Less)
+		sort.Slice(got, byResourceUID{got}.Less)
+		// printEntries(exp)
+		// printEntries(got)
+		for i, e := range exp {
+			if !e.Timestamp.Equal(got[i].Timestamp) {
+				return i, false
+			}
+			// Skip checking elapsed since it's time sensitive.
+			// if e.Elapsed != got[i].Elapsed {
+			// 	return false
+			// }
+			if e.Resource != got[i].Resource {
+				return i, false
+			}
+			if e.Type != got[i].Type {
+				return i, false
+			}
+			if e.Source != got[i].Source {
+				return i, false
+			}
+			if e.Owner != got[i].Owner {
+				return i, false
+			}
+			if e.ID != got[i].ID {
+				return i, false
+			}
+			if len(e.ServerList) != len(got[i].ServerList) {
+				return i, false
+			}
+			for j := range e.ServerList {
+				if e.ServerList[j] != got[i].ServerList[j] {
+					return i, false
+				}
+			}
+		}
+		return 0, true
+	}
+
+	for i, tc := range testCases {
+		got := topLockEntries(tc.peerLocks, false)
+		if idx, ok := check(tc.expected, got); !ok {
+			t.Fatalf("%d: mismatch at %d \n expected %#v but got %#v", i, idx, tc.expected[idx], got[idx])
 		}
 	}
 }

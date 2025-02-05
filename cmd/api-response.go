@@ -35,6 +35,7 @@ import (
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/pkg/v3/policy"
 	xxml "github.com/minio/xxml"
 )
 
@@ -84,7 +85,7 @@ type ListVersionsResponse struct {
 	VersionIDMarker string `xml:"VersionIdMarker"`
 
 	MaxKeys   int
-	Delimiter string
+	Delimiter string `xml:"Delimiter,omitempty"`
 	// A flag that indicates whether or not ListObjects returned all of the results
 	// that satisfied the search criteria.
 	IsTruncated bool
@@ -114,7 +115,7 @@ type ListObjectsResponse struct {
 	NextMarker string `xml:"NextMarker,omitempty"`
 
 	MaxKeys   int
-	Delimiter string
+	Delimiter string `xml:"Delimiter,omitempty"`
 	// A flag that indicates whether or not ListObjects returned all of the results
 	// that satisfied the search criteria.
 	IsTruncated bool
@@ -145,7 +146,7 @@ type ListObjectsV2Response struct {
 
 	KeyCount  int
 	MaxKeys   int
-	Delimiter string
+	Delimiter string `xml:"Delimiter,omitempty"`
 	// A flag that indicates whether or not ListObjects returned all of the results
 	// that satisfied the search criteria.
 	IsTruncated bool
@@ -165,10 +166,11 @@ type Part struct {
 	Size         int64
 
 	// Checksum values
-	ChecksumCRC32  string `xml:"ChecksumCRC32,omitempty"`
-	ChecksumCRC32C string `xml:"ChecksumCRC32C,omitempty"`
-	ChecksumSHA1   string `xml:"ChecksumSHA1,omitempty"`
-	ChecksumSHA256 string `xml:"ChecksumSHA256,omitempty"`
+	ChecksumCRC32     string `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C    string `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumSHA1      string `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256    string `xml:"ChecksumSHA256,omitempty"`
+	ChecksumCRC64NVME string `xml:",omitempty"`
 }
 
 // ListPartsResponse - format for list parts response.
@@ -191,6 +193,8 @@ type ListPartsResponse struct {
 	IsTruncated          bool
 
 	ChecksumAlgorithm string
+	ChecksumType      string
+
 	// List of parts.
 	Parts []Part `xml:"Part"`
 }
@@ -204,7 +208,7 @@ type ListMultipartUploadsResponse struct {
 	UploadIDMarker     string `xml:"UploadIdMarker"`
 	NextKeyMarker      string
 	NextUploadIDMarker string `xml:"NextUploadIdMarker"`
-	Delimiter          string
+	Delimiter          string `xml:"Delimiter,omitempty"`
 	Prefix             string
 	EncodingType       string `xml:"EncodingType,omitempty"`
 	MaxUploads         int
@@ -344,6 +348,13 @@ func (s *Metadata) MarshalXML(e *xxml.Encoder, start xxml.StartElement) error {
 	return e.EncodeToken(start.End())
 }
 
+// ObjectInternalInfo contains some internal information about a given
+// object, it will printed in listing calls with enabled metadata.
+type ObjectInternalInfo struct {
+	K int // Data blocks
+	M int // Parity blocks
+}
+
 // Object container for object metadata
 type Object struct {
 	Key          string
@@ -352,13 +363,16 @@ type Object struct {
 	Size         int64
 
 	// Owner of the object.
-	Owner Owner
+	Owner *Owner `xml:"Owner,omitempty"`
 
 	// The class of storage used to store the object.
 	StorageClass string
 
 	// UserMetadata user-defined metadata
 	UserMetadata *Metadata `xml:"UserMetadata,omitempty"`
+	UserTags     string    `xml:"UserTags,omitempty"`
+
+	Internal *ObjectInternalInfo `xml:"Internal,omitempty"`
 }
 
 // CopyObjectResponse container returns ETag and LastModified of the successfully copied object
@@ -402,10 +416,11 @@ type CompleteMultipartUploadResponse struct {
 	Key      string
 	ETag     string
 
-	ChecksumCRC32  string `xml:"ChecksumCRC32,omitempty"`
-	ChecksumCRC32C string `xml:"ChecksumCRC32C,omitempty"`
-	ChecksumSHA1   string `xml:"ChecksumSHA1,omitempty"`
-	ChecksumSHA256 string `xml:"ChecksumSHA256,omitempty"`
+	ChecksumCRC32     string `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C    string `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumSHA1      string `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256    string `xml:"ChecksumSHA256,omitempty"`
+	ChecksumCRC64NVME string `xml:",omitempty"`
 }
 
 // DeleteError structure.
@@ -491,19 +506,68 @@ func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 	return data
 }
 
+func cleanReservedKeys(metadata map[string]string) map[string]string {
+	m := cloneMSS(metadata)
+
+	switch kind, _ := crypto.IsEncrypted(metadata); kind {
+	case crypto.S3:
+		m[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
+	case crypto.S3KMS:
+		m[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionKMS
+		m[xhttp.AmzServerSideEncryptionKmsID] = kmsKeyIDFromMetadata(metadata)
+		if kmsCtx, ok := metadata[crypto.MetaContext]; ok {
+			m[xhttp.AmzServerSideEncryptionKmsContext] = kmsCtx
+		}
+	case crypto.SSEC:
+		m[xhttp.AmzServerSideEncryptionCustomerAlgorithm] = xhttp.AmzEncryptionAES
+
+	}
+
+	var toRemove []string
+	for k := range cleanMinioInternalMetadataKeys(m) {
+		if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
+			// Do not need to send any internal metadata
+			// values to client.
+			toRemove = append(toRemove, k)
+			continue
+		}
+
+		// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
+		if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
+			toRemove = append(toRemove, k)
+			continue
+		}
+	}
+
+	for _, k := range toRemove {
+		delete(m, k)
+		delete(m, strings.ToLower(k))
+	}
+
+	return m
+}
+
 // generates an ListBucketVersions response for the said bucket with other enumerated options.
-func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delimiter, encodingType string, maxKeys int, resp ListObjectVersionsInfo) ListVersionsResponse {
+func generateListVersionsResponse(ctx context.Context, bucket, prefix, marker, versionIDMarker, delimiter, encodingType string, maxKeys int, resp ListObjectVersionsInfo, metadata metaCheckFn) ListVersionsResponse {
 	versions := make([]ObjectVersion, 0, len(resp.Objects))
 
-	owner := Owner{
+	owner := &Owner{
 		ID:          globalMinioDefaultOwnerID,
 		DisplayName: "minio",
 	}
 	data := ListVersionsResponse{}
+	var lastObjMetaName string
+	var tagErr, metaErr APIErrorCode = -1, -1
 
 	for _, object := range resp.Objects {
 		if object.Name == "" {
 			continue
+		}
+		// Cache checks for the same object
+		if metadata != nil && lastObjMetaName != object.Name {
+			tagErr = metadata(object.Name, policy.GetObjectTaggingAction)
+			metaErr = metadata(object.Name, policy.GetObjectAction)
+			lastObjMetaName = object.Name
 		}
 		content := ObjectVersion{}
 		content.Key = s3EncodeName(object.Name, encodingType)
@@ -513,9 +577,30 @@ func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delim
 		}
 		content.Size = object.Size
 		if object.StorageClass != "" {
-			content.StorageClass = object.StorageClass
+			content.StorageClass = filterStorageClass(ctx, object.StorageClass)
 		} else {
 			content.StorageClass = globalMinioDefaultStorageClass
+		}
+		if tagErr == ErrNone {
+			content.UserTags = object.UserTags
+		}
+		if metaErr == ErrNone {
+			content.UserMetadata = &Metadata{}
+			switch kind, _ := crypto.IsEncrypted(object.UserDefined); kind {
+			case crypto.S3:
+				content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)
+			case crypto.S3KMS:
+				content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
+			case crypto.SSEC:
+				content.UserMetadata.Set(xhttp.AmzServerSideEncryptionCustomerAlgorithm, xhttp.AmzEncryptionAES)
+			}
+			for k, v := range cleanReservedKeys(object.UserDefined) {
+				content.UserMetadata.Set(k, v)
+			}
+			content.Internal = &ObjectInternalInfo{
+				K: object.DataBlocks,
+				M: object.ParityBlocks,
+			}
 		}
 		content.Owner = owner
 		content.VersionID = object.VersionID
@@ -551,9 +636,9 @@ func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delim
 }
 
 // generates an ListObjectsV1 response for the said bucket with other enumerated options.
-func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingType string, maxKeys int, resp ListObjectsInfo) ListObjectsResponse {
+func generateListObjectsV1Response(ctx context.Context, bucket, prefix, marker, delimiter, encodingType string, maxKeys int, resp ListObjectsInfo) ListObjectsResponse {
 	contents := make([]Object, 0, len(resp.Objects))
-	owner := Owner{
+	owner := &Owner{
 		ID:          globalMinioDefaultOwnerID,
 		DisplayName: "minio",
 	}
@@ -571,7 +656,7 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingTy
 		}
 		content.Size = object.Size
 		if object.StorageClass != "" {
-			content.StorageClass = object.StorageClass
+			content.StorageClass = filterStorageClass(ctx, object.StorageClass)
 		} else {
 			content.StorageClass = globalMinioDefaultStorageClass
 		}
@@ -600,12 +685,16 @@ func generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingTy
 }
 
 // generates an ListObjectsV2 response for the said bucket with other enumerated options.
-func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter, delimiter, encodingType string, fetchOwner, isTruncated bool, maxKeys int, objects []ObjectInfo, prefixes []string, metadata bool) ListObjectsV2Response {
+func generateListObjectsV2Response(ctx context.Context, bucket, prefix, token, nextToken, startAfter, delimiter, encodingType string, fetchOwner, isTruncated bool, maxKeys int, objects []ObjectInfo, prefixes []string, metadata metaCheckFn) ListObjectsV2Response {
 	contents := make([]Object, 0, len(objects))
-	owner := Owner{
-		ID:          globalMinioDefaultOwnerID,
-		DisplayName: "minio",
+	var owner *Owner
+	if fetchOwner {
+		owner = &Owner{
+			ID:          globalMinioDefaultOwnerID,
+			DisplayName: "minio",
+		}
 	}
+
 	data := ListObjectsV2Response{}
 
 	for _, object := range objects {
@@ -620,32 +709,32 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 		}
 		content.Size = object.Size
 		if object.StorageClass != "" {
-			content.StorageClass = object.StorageClass
+			content.StorageClass = filterStorageClass(ctx, object.StorageClass)
 		} else {
 			content.StorageClass = globalMinioDefaultStorageClass
 		}
 		content.Owner = owner
-		if metadata {
-			content.UserMetadata = &Metadata{}
-			switch kind, _ := crypto.IsEncrypted(object.UserDefined); kind {
-			case crypto.S3:
-				content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)
-			case crypto.S3KMS:
-				content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
-			case crypto.SSEC:
-				content.UserMetadata.Set(xhttp.AmzServerSideEncryptionCustomerAlgorithm, xhttp.AmzEncryptionAES)
+		if metadata != nil {
+			if metadata(object.Name, policy.GetObjectTaggingAction) == ErrNone {
+				content.UserTags = object.UserTags
 			}
-			for k, v := range cleanMinioInternalMetadataKeys(object.UserDefined) {
-				if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
-					// Do not need to send any internal metadata
-					// values to client.
-					continue
+			if metadata(object.Name, policy.GetObjectAction) == ErrNone {
+				content.UserMetadata = &Metadata{}
+				switch kind, _ := crypto.IsEncrypted(object.UserDefined); kind {
+				case crypto.S3:
+					content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)
+				case crypto.S3KMS:
+					content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
+				case crypto.SSEC:
+					content.UserMetadata.Set(xhttp.AmzServerSideEncryptionCustomerAlgorithm, xhttp.AmzEncryptionAES)
 				}
-				// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
-				if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
-					continue
+				for k, v := range cleanReservedKeys(object.UserDefined) {
+					content.UserMetadata.Set(k, v)
 				}
-				content.UserMetadata.Set(k, v)
+				content.Internal = &ObjectInternalInfo{
+					K: object.DataBlocks,
+					M: object.ParityBlocks,
+				}
 			}
 		}
 		contents = append(contents, content)
@@ -673,6 +762,8 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 	return data
 }
 
+type metaCheckFn = func(name string, action policy.Action) (s3Err APIErrorCode)
+
 // generates CopyObjectResponse from etag and lastModified time.
 func generateCopyObjectResponse(etag string, lastModified time.Time) CopyObjectResponse {
 	return CopyObjectResponse{
@@ -699,18 +790,19 @@ func generateInitiateMultipartUploadResponse(bucket, key, uploadID string) Initi
 }
 
 // generates CompleteMultipartUploadResponse for given bucket, key, location and ETag.
-func generateCompleteMultpartUploadResponse(bucket, key, location string, oi ObjectInfo) CompleteMultipartUploadResponse {
-	cs := oi.decryptChecksums()
+func generateCompleteMultipartUploadResponse(bucket, key, location string, oi ObjectInfo, h http.Header) CompleteMultipartUploadResponse {
+	cs := oi.decryptChecksums(0, h)
 	c := CompleteMultipartUploadResponse{
 		Location: location,
 		Bucket:   bucket,
 		Key:      key,
 		// AWS S3 quotes the ETag in XML, make sure we are compatible here.
-		ETag:           "\"" + oi.ETag + "\"",
-		ChecksumSHA1:   cs[hash.ChecksumSHA1.String()],
-		ChecksumSHA256: cs[hash.ChecksumSHA256.String()],
-		ChecksumCRC32:  cs[hash.ChecksumCRC32.String()],
-		ChecksumCRC32C: cs[hash.ChecksumCRC32C.String()],
+		ETag:              "\"" + oi.ETag + "\"",
+		ChecksumSHA1:      cs[hash.ChecksumSHA1.String()],
+		ChecksumSHA256:    cs[hash.ChecksumSHA256.String()],
+		ChecksumCRC32:     cs[hash.ChecksumCRC32.String()],
+		ChecksumCRC32C:    cs[hash.ChecksumCRC32C.String()],
+		ChecksumCRC64NVME: cs[hash.ChecksumCRC64NVME.String()],
 	}
 	return c
 }
@@ -738,6 +830,7 @@ func generateListPartsResponse(partsInfo ListPartsInfo, encodingType string) Lis
 	listPartsResponse.IsTruncated = partsInfo.IsTruncated
 	listPartsResponse.NextPartNumberMarker = partsInfo.NextPartNumberMarker
 	listPartsResponse.ChecksumAlgorithm = partsInfo.ChecksumAlgorithm
+	listPartsResponse.ChecksumType = partsInfo.ChecksumType
 
 	listPartsResponse.Parts = make([]Part, len(partsInfo.Parts))
 	for index, part := range partsInfo.Parts {
@@ -750,6 +843,7 @@ func generateListPartsResponse(partsInfo ListPartsInfo, encodingType string) Lis
 		newPart.ChecksumCRC32C = part.ChecksumCRC32C
 		newPart.ChecksumSHA1 = part.ChecksumSHA1
 		newPart.ChecksumSHA256 = part.ChecksumSHA256
+		newPart.ChecksumCRC64NVME = part.ChecksumCRC64NVME
 		listPartsResponse.Parts[index] = newPart
 	}
 	return listPartsResponse
@@ -801,7 +895,7 @@ func writeResponse(w http.ResponseWriter, statusCode int, response []byte, mType
 	}
 	// Similar check to http.checkWriteHeaderCode
 	if statusCode < 100 || statusCode > 999 {
-		logger.Error(fmt.Sprintf("invalid WriteHeader code %v", statusCode))
+		bugLogIf(context.Background(), fmt.Errorf("invalid WriteHeader code %v", statusCode))
 		statusCode = http.StatusInternalServerError
 	}
 	setCommonHeaders(w)
@@ -854,33 +948,38 @@ func writeSuccessResponseHeadersOnly(w http.ResponseWriter) {
 	writeResponse(w, http.StatusOK, nil, mimeNone)
 }
 
-// writeErrorRespone writes error headers
+// writeErrorResponse writes error headers
 func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL) {
-	switch err.Code {
-	case "SlowDown", "XMinioServerNotInitialized", "XMinioReadQuorum", "XMinioWriteQuorum":
-		// Set retry-after header to indicate user-agents to retry request after 120secs.
+	switch err.HTTPStatusCode {
+	case http.StatusServiceUnavailable, http.StatusTooManyRequests:
+		// Set retry-after header to indicate user-agents to retry request after 60 seconds.
 		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
-		w.Header().Set(xhttp.RetryAfter, "120")
+		w.Header().Set(xhttp.RetryAfter, "60")
+	}
+
+	switch err.Code {
 	case "InvalidRegion":
-		err.Description = fmt.Sprintf("Region does not match; expecting '%s'.", globalSite.Region)
+		err.Description = fmt.Sprintf("Region does not match; expecting '%s'.", globalSite.Region())
 	case "AuthorizationHeaderMalformed":
-		err.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalSite.Region)
+		err.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalSite.Region())
 	}
 
 	// Similar check to http.checkWriteHeaderCode
 	if err.HTTPStatusCode < 100 || err.HTTPStatusCode > 999 {
-		logger.Error(fmt.Sprintf("invalid WriteHeader code %v from %v", err.HTTPStatusCode, err.Code))
+		bugLogIf(ctx, fmt.Errorf("invalid WriteHeader code %v from %v", err.HTTPStatusCode, err.Code))
 		err.HTTPStatusCode = http.StatusInternalServerError
 	}
 
 	// Generate error response.
 	errorResponse := getAPIErrorResponse(ctx, err, reqURL.Path,
-		w.Header().Get(xhttp.AmzRequestID), globalDeploymentID)
+		w.Header().Get(xhttp.AmzRequestID), w.Header().Get(xhttp.AmzRequestHostID))
 	encodedErrorResponse := encodeResponse(errorResponse)
 	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeXML)
 }
 
 func writeErrorResponseHeadersOnly(w http.ResponseWriter, err APIError) {
+	w.Header().Set(xMinIOErrCodeHeader, err.Code)
+	w.Header().Set(xMinIOErrDescHeader, "\""+err.Description+"\"")
 	writeResponse(w, err.HTTPStatusCode, nil, mimeNone)
 }
 
@@ -893,7 +992,7 @@ func writeErrorResponseString(ctx context.Context, w http.ResponseWriter, err AP
 // useful for admin APIs.
 func writeErrorResponseJSON(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL) {
 	// Generate error response.
-	errorResponse := getAPIErrorResponse(ctx, err, reqURL.Path, w.Header().Get(xhttp.AmzRequestID), globalDeploymentID)
+	errorResponse := getAPIErrorResponse(ctx, err, reqURL.Path, w.Header().Get(xhttp.AmzRequestID), w.Header().Get(xhttp.AmzRequestHostID))
 	encodedErrorResponse := encodeResponseJSON(errorResponse)
 	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeJSON)
 }
@@ -912,7 +1011,7 @@ func writeCustomErrorResponseJSON(ctx context.Context, w http.ResponseWriter, er
 		BucketName: reqInfo.BucketName,
 		Key:        reqInfo.ObjectName,
 		RequestID:  w.Header().Get(xhttp.AmzRequestID),
-		HostID:     globalDeploymentID,
+		HostID:     globalDeploymentID(),
 	}
 	encodedErrorResponse := encodeResponseJSON(errorResponse)
 	writeResponse(w, err.HTTPStatusCode, encodedErrorResponse, mimeJSON)

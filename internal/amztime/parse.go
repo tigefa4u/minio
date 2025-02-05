@@ -50,7 +50,7 @@ func Parse(amzDateStr string) (time.Time, error) {
 }
 
 var httpTimeFormats = []string{
-	// Do not chagne this order, http time format dates
+	// Do not change this order, http time format dates
 	// are usually in http.TimeFormat however there are
 	// situations where for example aws-sdk-java doesn't
 	// send the correct format.
@@ -69,4 +69,14 @@ func ParseHeader(timeStr string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, ErrMalformedDate
+}
+
+// ParseReplicationTS parse http.TimeFormat first
+// will try time.RFC3339Nano when parse http.TimeFormat failed
+func ParseReplicationTS(str string) (time.Time, error) {
+	tm, err := time.Parse(http.TimeFormat, str)
+	if tm.IsZero() || err != nil {
+		tm, err = time.Parse(time.RFC3339Nano, str)
+	}
+	return tm, err
 }

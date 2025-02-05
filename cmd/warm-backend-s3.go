@@ -19,23 +19,16 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
-	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-)
-
-// getRemoteTierTargetInstanceTransport contains a singleton roundtripper.
-var (
-	getRemoteTierTargetInstanceTransport     http.RoundTripper
-	getRemoteTierTargetInstanceTransportOnce sync.Once
 )
 
 type warmBackendS3 struct {
@@ -63,9 +56,17 @@ func (s3 *warmBackendS3) getDest(object string) string {
 	return destObj
 }
 
-func (s3 *warmBackendS3) Put(ctx context.Context, object string, r io.Reader, length int64) (remoteVersionID, error) {
-	res, err := s3.client.PutObject(ctx, s3.Bucket, s3.getDest(object), r, length, minio.PutObjectOptions{StorageClass: s3.StorageClass})
+func (s3 *warmBackendS3) PutWithMeta(ctx context.Context, object string, r io.Reader, length int64, meta map[string]string) (remoteVersionID, error) {
+	res, err := s3.client.PutObject(ctx, s3.Bucket, s3.getDest(object), r, length, minio.PutObjectOptions{
+		SendContentMd5: true,
+		StorageClass:   s3.StorageClass,
+		UserMetadata:   meta,
+	})
 	return remoteVersionID(res.VersionID), s3.ToObjectError(err, object)
+}
+
+func (s3 *warmBackendS3) Put(ctx context.Context, object string, r io.Reader, length int64) (remoteVersionID, error) {
+	return s3.PutWithMeta(ctx, object, r, length, map[string]string{})
 }
 
 func (s3 *warmBackendS3) Get(ctx context.Context, object string, rv remoteVersionID, opts WarmBackendGetOpts) (io.ReadCloser, error) {
@@ -105,33 +106,71 @@ func (s3 *warmBackendS3) InUse(ctx context.Context) (bool, error) {
 	return len(result.CommonPrefixes) > 0 || len(result.Contents) > 0, nil
 }
 
-func newWarmBackendS3(conf madmin.TierS3) (*warmBackendS3, error) {
+func newWarmBackendS3(conf madmin.TierS3, tier string) (*warmBackendS3, error) {
 	u, err := url.Parse(conf.Endpoint)
 	if err != nil {
 		return nil, err
 	}
-	var creds *credentials.Credentials
-	if conf.AWSRole {
-		creds = credentials.NewChainCredentials(defaultAWSCredProvider)
-	} else {
-		creds = credentials.NewStaticV4(conf.AccessKey, conf.SecretKey, "")
+
+	// Validation code
+	switch {
+	case conf.AWSRoleWebIdentityTokenFile == "" && conf.AWSRoleARN != "" || conf.AWSRoleWebIdentityTokenFile != "" && conf.AWSRoleARN == "":
+		return nil, errors.New("both the token file and the role ARN are required")
+	case conf.AccessKey == "" && conf.SecretKey != "" || conf.AccessKey != "" && conf.SecretKey == "":
+		return nil, errors.New("both the access and secret keys are required")
+	case conf.AWSRole && (conf.AWSRoleWebIdentityTokenFile != "" || conf.AWSRoleARN != "" || conf.AccessKey != "" || conf.SecretKey != ""):
+		return nil, errors.New("AWS Role cannot be activated with static credentials or the web identity token file")
+	case conf.Bucket == "":
+		return nil, errors.New("no bucket name was provided")
 	}
-	getRemoteTierTargetInstanceTransportOnce.Do(func() {
-		getRemoteTierTargetInstanceTransport = NewHTTPTransportWithTimeout(10 * time.Minute)
-	})
+
+	// Credentials initialization
+	var creds *credentials.Credentials
+	switch {
+	case conf.AWSRole:
+		creds = credentials.New(&credentials.IAM{
+			Client: &http.Client{
+				Transport: NewHTTPTransport(),
+			},
+		})
+	case conf.AWSRoleWebIdentityTokenFile != "" && conf.AWSRoleARN != "":
+		sessionName := conf.AWSRoleSessionName
+		if sessionName == "" {
+			// RoleSessionName has a limited set of characters (https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html)
+			sessionName = "minio-tier-" + mustGetUUID()
+		}
+		s3WebIdentityIAM := credentials.IAM{
+			Client: &http.Client{
+				Transport: NewHTTPTransport(),
+			},
+			EKSIdentity: struct {
+				TokenFile       string
+				RoleARN         string
+				RoleSessionName string
+			}{
+				conf.AWSRoleWebIdentityTokenFile,
+				conf.AWSRoleARN,
+				sessionName,
+			},
+		}
+		creds = credentials.New(&s3WebIdentityIAM)
+	case conf.AccessKey != "" && conf.SecretKey != "":
+		creds = credentials.NewStaticV4(conf.AccessKey, conf.SecretKey, "")
+	default:
+		return nil, errors.New("insufficient parameters for S3 backend authentication")
+	}
 	opts := &minio.Options{
 		Creds:     creds,
 		Secure:    u.Scheme == "https",
-		Transport: getRemoteTierTargetInstanceTransport,
+		Transport: globalRemoteTargetTransport,
 	}
 	client, err := minio.New(u.Host, opts)
 	if err != nil {
 		return nil, err
 	}
-	core, err := minio.NewCore(u.Host, opts)
-	if err != nil {
-		return nil, err
-	}
+	client.SetAppInfo(fmt.Sprintf("s3-tier-%s", tier), ReleaseTag)
+
+	core := &minio.Core{Client: client}
 	return &warmBackendS3{
 		client:       client,
 		core:         core,

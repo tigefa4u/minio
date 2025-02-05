@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,28 +18,28 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
-	"github.com/gorilla/mux"
-	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/env"
+	"github.com/minio/pkg/v3/policy"
 )
 
 var (
-	errRebalanceDecommissionAlreadyRunning = errors.New("Rebalance cannot be started, decommission is aleady in progress")
+	errRebalanceDecommissionAlreadyRunning = errors.New("Rebalance cannot be started, decommission is already in progress")
 	errDecommissionRebalanceAlreadyRunning = errors.New("Decommission cannot be started, rebalance is already in progress")
 )
 
 func (a adminAPIHandlers) StartDecommission(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "StartDecommission")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DecommissionAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.DecommissionAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -68,16 +68,28 @@ func (a adminAPIHandlers) StartDecommission(w http.ResponseWriter, r *http.Reque
 
 	vars := mux.Vars(r)
 	v := vars["pool"]
+	byID := vars["by-id"] == "true"
 
 	pools := strings.Split(v, ",")
 	poolIndices := make([]int, 0, len(pools))
 
 	for _, pool := range pools {
-		idx := globalEndpoints.GetPoolIdx(pool)
-		if idx == -1 {
-			// We didn't find any matching pools, invalid input
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errInvalidArgument), r.URL)
-			return
+		var idx int
+		if byID {
+			var err error
+			idx, err = strconv.Atoi(pool)
+			if err != nil {
+				// We didn't find any matching pools, invalid input
+				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errInvalidArgument), r.URL)
+				return
+			}
+		} else {
+			idx = globalEndpoints.GetPoolIdx(pool)
+			if idx == -1 {
+				// We didn't find any matching pools, invalid input
+				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errInvalidArgument), r.URL)
+				return
+			}
 		}
 		var pool *erasureSets
 		for pidx := range z.serverPools {
@@ -95,29 +107,18 @@ func (a adminAPIHandlers) StartDecommission(w http.ResponseWriter, r *http.Reque
 		poolIndices = append(poolIndices, idx)
 	}
 
-	if len(poolIndices) > 0 && globalEndpoints[poolIndices[0]].Endpoints[0].IsLocal {
-		ep := globalEndpoints[poolIndices[0]].Endpoints[0]
-		for nodeIdx, proxyEp := range globalProxyEndpoints {
-			if proxyEp.Endpoint.Host == ep.Host {
-				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
-					return
-				}
-			}
+	if len(poolIndices) == 0 || !proxyDecommissionRequest(ctx, globalEndpoints[poolIndices[0]].Endpoints[0], w, r) {
+		if err := z.Decommission(r.Context(), poolIndices...); err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
 		}
-	}
-
-	if err := z.Decommission(r.Context(), poolIndices...); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
 	}
 }
 
 func (a adminAPIHandlers) CancelDecommission(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "CancelDecommission")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.DecommissionAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.DecommissionAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -136,36 +137,35 @@ func (a adminAPIHandlers) CancelDecommission(w http.ResponseWriter, r *http.Requ
 
 	vars := mux.Vars(r)
 	v := vars["pool"]
+	byID := vars["by-id"] == "true"
+	idx := -1
 
-	idx := globalEndpoints.GetPoolIdx(v)
+	if byID {
+		if i, err := strconv.Atoi(v); err == nil && i >= 0 && i < len(globalEndpoints) {
+			idx = i
+		}
+	} else {
+		idx = globalEndpoints.GetPoolIdx(v)
+	}
+
 	if idx == -1 {
 		// We didn't find any matching pools, invalid input
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errInvalidArgument), r.URL)
 		return
 	}
 
-	if ep := globalEndpoints[idx].Endpoints[0]; !ep.IsLocal {
-		for nodeIdx, proxyEp := range globalProxyEndpoints {
-			if proxyEp.Endpoint.Host == ep.Host {
-				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
-					return
-				}
-			}
+	if !proxyDecommissionRequest(ctx, globalEndpoints[idx].Endpoints[0], w, r) {
+		if err := pools.DecommissionCancel(ctx, idx); err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
 		}
-	}
-
-	if err := pools.DecommissionCancel(ctx, idx); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
 	}
 }
 
 func (a adminAPIHandlers) StatusPool(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "StatusPool")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ServerInfoAdminAction, iampolicy.DecommissionAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ServerInfoAdminAction, policy.DecommissionAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -184,8 +184,17 @@ func (a adminAPIHandlers) StatusPool(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 	v := vars["pool"]
+	byID := vars["by-id"] == "true"
+	idx := -1
 
-	idx := globalEndpoints.GetPoolIdx(v)
+	if byID {
+		if i, err := strconv.Atoi(v); err == nil && i >= 0 && i < len(globalEndpoints) {
+			idx = i
+		}
+	} else {
+		idx = globalEndpoints.GetPoolIdx(v)
+	}
+
 	if idx == -1 {
 		apiErr := toAdminAPIErr(ctx, errInvalidArgument)
 		apiErr.Description = fmt.Sprintf("specified pool '%s' not found, please specify a valid pool", v)
@@ -200,15 +209,13 @@ func (a adminAPIHandlers) StatusPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logger.LogIf(r.Context(), json.NewEncoder(w).Encode(&status))
+	adminLogIf(r.Context(), json.NewEncoder(w).Encode(&status))
 }
 
 func (a adminAPIHandlers) ListPools(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListPools")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ServerInfoAdminAction, iampolicy.DecommissionAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ServerInfoAdminAction, policy.DecommissionAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -235,14 +242,13 @@ func (a adminAPIHandlers) ListPools(w http.ResponseWriter, r *http.Request) {
 		poolsStatus[idx] = status
 	}
 
-	logger.LogIf(r.Context(), json.NewEncoder(w).Encode(poolsStatus))
+	adminLogIf(r.Context(), json.NewEncoder(w).Encode(poolsStatus))
 }
 
 func (a adminAPIHandlers) RebalanceStart(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RebalanceStart")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.RebalanceAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.RebalanceAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -253,7 +259,7 @@ func (a adminAPIHandlers) RebalanceStart(w http.ResponseWriter, r *http.Request)
 	if ep := globalEndpoints[0].Endpoints[0]; !ep.IsLocal {
 		for nodeIdx, proxyEp := range globalProxyEndpoints {
 			if proxyEp.Endpoint.Host == ep.Host {
-				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
+				if proxied, success := proxyRequestByNodeIndex(ctx, w, r, nodeIdx, false); proxied && success {
 					return
 				}
 			}
@@ -311,10 +317,9 @@ func (a adminAPIHandlers) RebalanceStart(w http.ResponseWriter, r *http.Request)
 }
 
 func (a adminAPIHandlers) RebalanceStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RebalanceStatus")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.RebalanceAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.RebalanceAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -325,7 +330,7 @@ func (a adminAPIHandlers) RebalanceStatus(w http.ResponseWriter, r *http.Request
 	if ep := globalEndpoints[0].Endpoints[0]; !ep.IsLocal {
 		for nodeIdx, proxyEp := range globalProxyEndpoints {
 			if proxyEp.Endpoint.Host == ep.Host {
-				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
+				if proxied, success := proxyRequestByNodeIndex(ctx, w, r, nodeIdx, false); proxied && success {
 					return
 				}
 			}
@@ -344,18 +349,17 @@ func (a adminAPIHandlers) RebalanceStatus(w http.ResponseWriter, r *http.Request
 			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminRebalanceNotStarted), r.URL)
 			return
 		}
-		logger.LogIf(ctx, fmt.Errorf("failed to fetch rebalance status: %w", err))
+		adminLogIf(ctx, fmt.Errorf("failed to fetch rebalance status: %w", err))
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
-	logger.LogIf(r.Context(), json.NewEncoder(w).Encode(rs))
+	adminLogIf(r.Context(), json.NewEncoder(w).Encode(rs))
 }
 
 func (a adminAPIHandlers) RebalanceStop(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RebalanceStop")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.RebalanceAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.RebalanceAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -369,5 +373,21 @@ func (a adminAPIHandlers) RebalanceStop(w http.ResponseWriter, r *http.Request) 
 	// Cancel any ongoing rebalance operation
 	globalNotificationSys.StopRebalance(r.Context())
 	writeSuccessResponseHeadersOnly(w)
-	logger.LogIf(ctx, pools.saveRebalanceStats(GlobalContext, 0, rebalSaveStoppedAt))
+	adminLogIf(ctx, pools.saveRebalanceStats(GlobalContext, 0, rebalSaveStoppedAt))
+	globalNotificationSys.LoadRebalanceMeta(ctx, false)
+}
+
+func proxyDecommissionRequest(ctx context.Context, defaultEndPoint Endpoint, w http.ResponseWriter, r *http.Request) (proxy bool) {
+	host := env.Get("_MINIO_DECOM_ENDPOINT_HOST", defaultEndPoint.Host)
+	if host == "" {
+		return
+	}
+	for nodeIdx, proxyEp := range globalProxyEndpoints {
+		if proxyEp.Endpoint.Host == host && !proxyEp.IsLocal {
+			if proxied, success := proxyRequestByNodeIndex(ctx, w, r, nodeIdx, false); proxied && success {
+				return true
+			}
+		}
+	}
+	return
 }

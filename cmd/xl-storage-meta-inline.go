@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/minio/minio/internal/logger"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -379,24 +378,24 @@ func (x *xlMetaInlineData) remove(keys ...string) bool {
 // xlMetaV2TrimData will trim any data from the metadata without unmarshalling it.
 // If any error occurs the unmodified data is returned.
 func xlMetaV2TrimData(buf []byte) []byte {
-	metaBuf, min, maj, err := checkXL2V1(buf)
+	metaBuf, maj, minor, err := checkXL2V1(buf)
 	if err != nil {
 		return buf
 	}
-	if maj == 1 && min < 1 {
+	if maj == 1 && minor < 1 {
 		// First version to carry data.
 		return buf
 	}
 	// Skip header
 	_, metaBuf, err = msgp.ReadBytesZC(metaBuf)
 	if err != nil {
-		logger.LogIf(GlobalContext, err)
+		storageLogIf(GlobalContext, err)
 		return buf
 	}
 	// Skip CRC
-	if maj > 1 || min >= 2 {
+	if maj > 1 || minor >= 2 {
 		_, metaBuf, err = msgp.ReadUint32Bytes(metaBuf)
-		logger.LogIf(GlobalContext, err)
+		storageLogIf(GlobalContext, err)
 	}
 	//   =  input - current pos
 	ends := len(buf) - len(metaBuf)

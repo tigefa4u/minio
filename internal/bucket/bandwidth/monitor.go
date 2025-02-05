@@ -17,36 +17,41 @@
 
 package bandwidth
 
+//go:generate msgp -file=$GOFILE -unexported
+
 import (
 	"context"
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
 	"golang.org/x/time/rate"
 )
 
-type throttle struct {
+//msgp:ignore bucketThrottle Monitor
+
+type bucketThrottle struct {
 	*rate.Limiter
 	NodeBandwidthPerSec int64
 }
 
 // Monitor holds the state of the global bucket monitor
 type Monitor struct {
-	tlock                 sync.RWMutex // mutex for bucketThrottle
-	bucketThrottle        map[string]*throttle
-	mlock                 sync.RWMutex                  // mutex for activeBuckets map
-	activeBuckets         map[string]*bucketMeasurement // Buckets with objects in flight
-	bucketMovingAvgTicker *time.Ticker                  // Ticker for calculating moving averages
-	ctx                   context.Context               // Context for generate
+	tlock sync.RWMutex // mutex for bucket throttling
+	mlock sync.RWMutex // mutex for bucket measurement
+
+	bucketsThrottle    map[BucketOptions]*bucketThrottle
+	bucketsMeasurement map[BucketOptions]*bucketMeasurement // Buckets with objects in flight
+
+	bucketMovingAvgTicker *time.Ticker    // Ticker for calculating moving averages
+	ctx                   context.Context // Context for generate
 	NodeCount             uint64
 }
 
 // NewMonitor returns a monitor with defaults.
 func NewMonitor(ctx context.Context, numNodes uint64) *Monitor {
 	m := &Monitor{
-		activeBuckets:         make(map[string]*bucketMeasurement),
-		bucketThrottle:        make(map[string]*throttle),
+		bucketsMeasurement:    make(map[BucketOptions]*bucketMeasurement),
+		bucketsThrottle:       make(map[BucketOptions]*bucketThrottle),
 		bucketMovingAvgTicker: time.NewTicker(2 * time.Second),
 		ctx:                   ctx,
 		NodeCount:             numNodes,
@@ -55,12 +60,16 @@ func NewMonitor(ctx context.Context, numNodes uint64) *Monitor {
 	return m
 }
 
-func (m *Monitor) updateMeasurement(bucket string, bytes uint64) {
+func (m *Monitor) updateMeasurement(opts BucketOptions, bytes uint64) {
 	m.mlock.Lock()
 	defer m.mlock.Unlock()
-	if m, ok := m.activeBuckets[bucket]; ok {
-		m.incrementBytes(bytes)
+
+	tm, ok := m.bucketsMeasurement[opts]
+	if !ok {
+		tm = &bucketMeasurement{}
 	}
+	tm.incrementBytes(bytes)
+	m.bucketsMeasurement[opts] = tm
 }
 
 // SelectionFunction for buckets
@@ -74,8 +83,8 @@ func SelectBuckets(buckets ...string) SelectionFunction {
 		}
 	}
 	return func(bucket string) bool {
-		for _, b := range buckets {
-			if b == "" || b == bucket {
+		for _, bkt := range buckets {
+			if bkt == bucket {
 				return true
 			}
 		}
@@ -83,27 +92,38 @@ func SelectBuckets(buckets ...string) SelectionFunction {
 	}
 }
 
+// Details for the measured bandwidth
+type Details struct {
+	LimitInBytesPerSecond            int64   `json:"limitInBits"`
+	CurrentBandwidthInBytesPerSecond float64 `json:"currentBandwidth"`
+}
+
+// BucketBandwidthReport captures the details for all buckets.
+type BucketBandwidthReport struct {
+	BucketStats map[BucketOptions]Details `json:"bucketStats,omitempty"`
+}
+
 // GetReport gets the report for all bucket bandwidth details.
-func (m *Monitor) GetReport(selectBucket SelectionFunction) *madmin.BucketBandwidthReport {
+func (m *Monitor) GetReport(selectBucket SelectionFunction) *BucketBandwidthReport {
 	m.mlock.RLock()
 	defer m.mlock.RUnlock()
 	return m.getReport(selectBucket)
 }
 
-func (m *Monitor) getReport(selectBucket SelectionFunction) *madmin.BucketBandwidthReport {
-	report := &madmin.BucketBandwidthReport{
-		BucketStats: make(map[string]madmin.BandwidthDetails),
+func (m *Monitor) getReport(selectBucket SelectionFunction) *BucketBandwidthReport {
+	report := &BucketBandwidthReport{
+		BucketStats: make(map[BucketOptions]Details),
 	}
-	for bucket, bucketMeasurement := range m.activeBuckets {
-		if !selectBucket(bucket) {
+	for bucketOpts, bucketMeasurement := range m.bucketsMeasurement {
+		if !selectBucket(bucketOpts.Name) {
 			continue
 		}
 		m.tlock.RLock()
-		bucketThrottle, ok := m.bucketThrottle[bucket]
-		if ok {
-			report.BucketStats[bucket] = madmin.BandwidthDetails{
-				LimitInBytesPerSecond:            bucketThrottle.NodeBandwidthPerSec * int64(m.NodeCount),
-				CurrentBandwidthInBytesPerSecond: bucketMeasurement.getExpMovingAvgBytesPerSecond(),
+		if tgtThrottle, ok := m.bucketsThrottle[bucketOpts]; ok {
+			currBw := bucketMeasurement.getExpMovingAvgBytesPerSecond()
+			report.BucketStats[bucketOpts] = Details{
+				LimitInBytesPerSecond:            tgtThrottle.NodeBandwidthPerSec * int64(m.NodeCount),
+				CurrentBandwidthInBytesPerSecond: currBw,
 			}
 		}
 		m.tlock.RUnlock()
@@ -126,65 +146,75 @@ func (m *Monitor) trackEWMA() {
 func (m *Monitor) updateMovingAvg() {
 	m.mlock.Lock()
 	defer m.mlock.Unlock()
-	for _, bucketMeasurement := range m.activeBuckets {
+	for _, bucketMeasurement := range m.bucketsMeasurement {
 		bucketMeasurement.updateExponentialMovingAverage(time.Now())
 	}
 }
 
-func (m *Monitor) getBucketMeasurement(bucket string, initTime time.Time) *bucketMeasurement {
-	bucketTracker, ok := m.activeBuckets[bucket]
-	if !ok {
-		bucketTracker = newBucketMeasurement(initTime)
-		m.activeBuckets[bucket] = bucketTracker
-	}
-	return bucketTracker
-}
-
-// track returns the measurement object for bucket
-func (m *Monitor) track(bucket string) {
+func (m *Monitor) init(opts BucketOptions) {
 	m.mlock.Lock()
 	defer m.mlock.Unlock()
-	m.getBucketMeasurement(bucket, time.Now())
+
+	_, ok := m.bucketsMeasurement[opts]
+	if !ok {
+		m.bucketsMeasurement[opts] = newBucketMeasurement(time.Now())
+	}
 }
 
 // DeleteBucket deletes monitoring the 'bucket'
 func (m *Monitor) DeleteBucket(bucket string) {
 	m.tlock.Lock()
-	delete(m.bucketThrottle, bucket)
+	for opts := range m.bucketsThrottle {
+		if opts.Name == bucket {
+			delete(m.bucketsThrottle, opts)
+		}
+	}
+	m.tlock.Unlock()
+
+	m.mlock.Lock()
+	for opts := range m.bucketsMeasurement {
+		if opts.Name == bucket {
+			delete(m.bucketsMeasurement, opts)
+		}
+	}
+	m.mlock.Unlock()
+}
+
+// DeleteBucketThrottle deletes monitoring for a bucket's target
+func (m *Monitor) DeleteBucketThrottle(bucket, arn string) {
+	m.tlock.Lock()
+	delete(m.bucketsThrottle, BucketOptions{Name: bucket, ReplicationARN: arn})
 	m.tlock.Unlock()
 	m.mlock.Lock()
-	delete(m.activeBuckets, bucket)
+	delete(m.bucketsMeasurement, BucketOptions{Name: bucket, ReplicationARN: arn})
 	m.mlock.Unlock()
 }
 
 // throttle returns currently configured throttle for this bucket
-func (m *Monitor) throttle(bucket string) *throttle {
+func (m *Monitor) throttle(opts BucketOptions) *bucketThrottle {
 	m.tlock.RLock()
 	defer m.tlock.RUnlock()
-	return m.bucketThrottle[bucket]
+	return m.bucketsThrottle[opts]
 }
 
 // SetBandwidthLimit sets the bandwidth limit for a bucket
-func (m *Monitor) SetBandwidthLimit(bucket string, limit int64) {
+func (m *Monitor) SetBandwidthLimit(bucket, arn string, limit int64) {
 	m.tlock.Lock()
 	defer m.tlock.Unlock()
-	bw := limit / int64(m.NodeCount)
-	t, ok := m.bucketThrottle[bucket]
+	limitBytes := limit / int64(m.NodeCount)
+	throttle, ok := m.bucketsThrottle[BucketOptions{Name: bucket, ReplicationARN: arn}]
 	if !ok {
-		t = &throttle{
-			NodeBandwidthPerSec: bw,
-		}
+		throttle = &bucketThrottle{}
 	}
-	t.NodeBandwidthPerSec = bw
-	newlimit := rate.Every(time.Second / time.Duration(t.NodeBandwidthPerSec))
-	t.Limiter = rate.NewLimiter(newlimit, int(t.NodeBandwidthPerSec))
-	m.bucketThrottle[bucket] = t
+	throttle.NodeBandwidthPerSec = limitBytes
+	throttle.Limiter = rate.NewLimiter(rate.Limit(float64(limitBytes)), int(limitBytes))
+	m.bucketsThrottle[BucketOptions{Name: bucket, ReplicationARN: arn}] = throttle
 }
 
 // IsThrottled returns true if a bucket has bandwidth throttling enabled.
-func (m *Monitor) IsThrottled(bucket string) bool {
+func (m *Monitor) IsThrottled(bucket, arn string) bool {
 	m.tlock.RLock()
 	defer m.tlock.RUnlock()
-	_, ok := m.bucketThrottle[bucket]
+	_, ok := m.bucketsThrottle[BucketOptions{Name: bucket, ReplicationARN: arn}]
 	return ok
 }

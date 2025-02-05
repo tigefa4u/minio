@@ -20,14 +20,47 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"slices"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 )
 
+func commonETags(etags []string) (etag string, maxima int) {
+	etagOccurrenceMap := make(map[string]int, len(etags))
+
+	// Ignore the uuid sentinel and count the rest.
+	for _, etag := range etags {
+		if etag == "" {
+			continue
+		}
+		etagOccurrenceMap[etag]++
+	}
+
+	maxima = 0 // Counter for remembering max occurrence of elements.
+	latest := ""
+
+	// Find the common cardinality from previously collected
+	// occurrences of elements.
+	for etag, count := range etagOccurrenceMap {
+		if count < maxima {
+			continue
+		}
+
+		// We are at or above maxima
+		if count > maxima {
+			maxima = count
+			latest = etag
+		}
+	}
+
+	// Return the collected common max time, with maxima
+	return latest, maxima
+}
+
 // commonTime returns a maximally occurring time from a list of time.
-func commonTimeAndOccurence(times []time.Time, group time.Duration) (maxTime time.Time, maxima int) {
-	timeOccurenceMap := make(map[int64]int, len(times))
+func commonTimeAndOccurrence(times []time.Time, group time.Duration) (maxTime time.Time, maxima int) {
+	timeOccurrenceMap := make(map[int64]int, len(times))
 	groupNano := group.Nanoseconds()
 	// Ignore the uuid sentinel and count the rest.
 	for _, t := range times {
@@ -36,7 +69,7 @@ func commonTimeAndOccurence(times []time.Time, group time.Duration) (maxTime tim
 		}
 		nano := t.UnixNano()
 		if group > 0 {
-			for k := range timeOccurenceMap {
+			for k := range timeOccurrenceMap {
 				if k == nano {
 					// We add to ourself later
 					continue
@@ -47,12 +80,12 @@ func commonTimeAndOccurence(times []time.Time, group time.Duration) (maxTime tim
 				}
 				// We are within the limit
 				if diff < groupNano {
-					timeOccurenceMap[k]++
+					timeOccurrenceMap[k]++
 				}
 			}
 		}
 		// Add ourself...
-		timeOccurenceMap[nano]++
+		timeOccurrenceMap[nano]++
 	}
 
 	maxima = 0 // Counter for remembering max occurrence of elements.
@@ -60,7 +93,7 @@ func commonTimeAndOccurence(times []time.Time, group time.Duration) (maxTime tim
 
 	// Find the common cardinality from previously collected
 	// occurrences of elements.
-	for nano, count := range timeOccurenceMap {
+	for nano, count := range timeOccurrenceMap {
 		if count < maxima {
 			continue
 		}
@@ -76,10 +109,21 @@ func commonTimeAndOccurence(times []time.Time, group time.Duration) (maxTime tim
 	return time.Unix(0, latest).UTC(), maxima
 }
 
-// commonTime returns a maximally occurring time from a list of time.
-func commonTime(modTimes []time.Time) (modTime time.Time) {
-	modTime, _ = commonTimeAndOccurence(modTimes, 0)
-	return modTime
+// commonTime returns a maximally occurring time from a list of time if it
+// occurs >= quorum, else return timeSentinel
+func commonTime(modTimes []time.Time, quorum int) time.Time {
+	if modTime, count := commonTimeAndOccurrence(modTimes, 0); count >= quorum {
+		return modTime
+	}
+
+	return timeSentinel
+}
+
+func commonETag(etags []string, quorum int) string {
+	if etag, count := commonETags(etags); count >= quorum {
+		return etag
+	}
+	return ""
 }
 
 // Beginning of unix time is treated as sentinel value here.
@@ -96,6 +140,33 @@ func bootModtimes(diskCount int) []time.Time {
 		modTimes[i] = timeSentinel
 	}
 	return modTimes
+}
+
+func listObjectETags(partsMetadata []FileInfo, errs []error, quorum int) (etags []string) {
+	etags = make([]string, len(partsMetadata))
+	vidMap := map[string]int{}
+	for index, metadata := range partsMetadata {
+		if errs[index] != nil {
+			continue
+		}
+		vid := metadata.VersionID
+		if metadata.VersionID == "" {
+			vid = nullVersionID
+		}
+		vidMap[vid]++
+		etags[index] = metadata.Metadata["etag"]
+	}
+
+	for _, count := range vidMap {
+		// do we have enough common versions
+		// that have enough quorum to satisfy
+		// the etag.
+		if count >= quorum {
+			return etags
+		}
+	}
+
+	return make([]string, len(partsMetadata))
 }
 
 // Extracts list of times from FileInfo slice and returns, skips
@@ -121,19 +192,6 @@ func filterOnlineDisksInplace(fi FileInfo, partsMetadata []FileInfo, onlineDisks
 	}
 }
 
-// Extracts list of disk mtimes from FileInfo slice and returns, skips
-// slice elements that have errors.
-func listObjectDiskMtimes(partsMetadata []FileInfo) (diskMTimes []time.Time) {
-	diskMTimes = bootModtimes(len(partsMetadata))
-	for index, metadata := range partsMetadata {
-		if metadata.IsValid() {
-			// Once the file is found, save the disk mtime saved on disk.
-			diskMTimes[index] = metadata.DiskMTime
-		}
-	}
-	return diskMTimes
-}
-
 // Notes:
 // There are 5 possible states a disk could be in,
 // 1. __online__             - has the latest copy of xl.meta - returned by listOnlineDisks
@@ -157,15 +215,32 @@ func listObjectDiskMtimes(partsMetadata []FileInfo) (diskMTimes []time.Time) {
 // listOnlineDisks - returns
 // - a slice of disks where disk having 'older' xl.meta (or nothing)
 // are set to nil.
-// - latest (in time) of the maximally occurring modTime(s).
-func listOnlineDisks(disks []StorageAPI, partsMetadata []FileInfo, errs []error) (onlineDisks []StorageAPI, modTime time.Time) {
+// - latest (in time) of the maximally occurring modTime(s), which has at least quorum occurrences.
+func listOnlineDisks(disks []StorageAPI, partsMetadata []FileInfo, errs []error, quorum int) (onlineDisks []StorageAPI, modTime time.Time, etag string) {
 	onlineDisks = make([]StorageAPI, len(disks))
 
 	// List all the file commit ids from parts metadata.
 	modTimes := listObjectModtimes(partsMetadata, errs)
 
 	// Reduce list of UUIDs to a single common value.
-	modTime = commonTime(modTimes)
+	modTime = commonTime(modTimes, quorum)
+
+	if modTime.IsZero() || modTime.Equal(timeSentinel) {
+		etags := listObjectETags(partsMetadata, errs, quorum)
+
+		etag = commonETag(etags, quorum)
+
+		if etag != "" { // allow this fallback only if a non-empty etag is found.
+			for index, e := range etags {
+				if partsMetadata[index].IsValid() && e == etag {
+					onlineDisks[index] = disks[index]
+				} else {
+					onlineDisks[index] = nil
+				}
+			}
+			return onlineDisks, modTime, etag
+		}
+	}
 
 	// Create a new online disks slice, which have common uuid.
 	for index, t := range modTimes {
@@ -176,29 +251,57 @@ func listOnlineDisks(disks []StorageAPI, partsMetadata []FileInfo, errs []error)
 		}
 	}
 
-	return onlineDisks, modTime
+	return onlineDisks, modTime, ""
 }
 
-// disksWithAllParts - This function needs to be called with
-// []StorageAPI returned by listOnlineDisks. Returns,
-//
-// - disks which have all parts specified in the latest xl.meta.
-//
-//   - slice of errors about the state of data files on disk - can have
-//     a not-found error or a hash-mismatch error.
-func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []FileInfo,
-	errs []error, latestMeta FileInfo, bucket, object string,
-	scanMode madmin.HealScanMode) ([]StorageAPI, []error, time.Time,
-) {
-	var diskMTime time.Time
-	var shardFix bool
-	if !latestMeta.DataShardFixed() {
-		diskMTime = pickValidDiskTimeWithQuorum(partsMetadata,
-			latestMeta.Erasure.DataBlocks)
+// Convert verify or check parts returned error to integer representation
+func convPartErrToInt(err error) int {
+	err = unwrapAll(err)
+	switch err {
+	case nil:
+		return checkPartSuccess
+	case errFileNotFound, errFileVersionNotFound:
+		return checkPartFileNotFound
+	case errFileCorrupt:
+		return checkPartFileCorrupt
+	case errVolumeNotFound:
+		return checkPartVolumeNotFound
+	case errDiskNotFound:
+		return checkPartDiskNotFound
+	default:
+		return checkPartUnknown
+	}
+}
+
+func partNeedsHealing(partErrs []int) bool {
+	return slices.IndexFunc(partErrs, func(i int) bool { return i != checkPartSuccess && i != checkPartUnknown }) > -1
+}
+
+func countPartNotSuccess(partErrs []int) (c int) {
+	for _, pe := range partErrs {
+		if pe != checkPartSuccess {
+			c++
+		}
+	}
+	return
+}
+
+// checkObjectWithAllParts sets partsMetadata and onlineDisks when xl.meta is inexistant/corrupted or outdated
+// it also checks if the status of each part (corrupted, missing, ok) in each drive
+func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []FileInfo,
+	errs []error, latestMeta FileInfo, filterByETag bool, bucket, object string,
+	scanMode madmin.HealScanMode,
+) (dataErrsByDisk map[int][]int, dataErrsByPart map[int][]int) {
+	dataErrsByDisk = make(map[int][]int, len(onlineDisks))
+	for i := range onlineDisks {
+		dataErrsByDisk[i] = make([]int, len(latestMeta.Parts))
 	}
 
-	availableDisks := make([]StorageAPI, len(onlineDisks))
-	dataErrs := make([]error, len(onlineDisks))
+	dataErrsByPart = make(map[int][]int, len(latestMeta.Parts))
+	for i := range latestMeta.Parts {
+		dataErrsByPart[i] = make([]int, len(onlineDisks))
+	}
+
 	inconsistent := 0
 	for i, meta := range partsMetadata {
 		if !meta.IsValid() {
@@ -227,27 +330,38 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 		erasureDistributionReliable = false
 	}
 
-	for i, onlineDisk := range onlineDisks {
+	metaErrs := make([]error, len(errs))
+
+	for i := range onlineDisks {
 		if errs[i] != nil {
-			dataErrs[i] = errs[i]
+			metaErrs[i] = errs[i]
 			continue
 		}
-		if onlineDisk == OfflineDisk {
-			dataErrs[i] = errDiskNotFound
+		if onlineDisks[i] == OfflineDisk {
+			metaErrs[i] = errDiskNotFound
 			continue
 		}
 
 		meta := partsMetadata[i]
-		if !meta.ModTime.Equal(latestMeta.ModTime) || meta.DataDir != latestMeta.DataDir {
-			dataErrs[i] = errFileCorrupt
+		corrupted := false
+		if filterByETag {
+			corrupted = meta.Metadata["etag"] != latestMeta.Metadata["etag"]
+		} else {
+			corrupted = !meta.ModTime.Equal(latestMeta.ModTime) || meta.DataDir != latestMeta.DataDir
+		}
+
+		if corrupted {
+			metaErrs[i] = errFileCorrupt
 			partsMetadata[i] = FileInfo{}
+			onlineDisks[i] = nil
 			continue
 		}
 
 		if erasureDistributionReliable {
 			if !meta.IsValid() {
 				partsMetadata[i] = FileInfo{}
-				dataErrs[i] = errFileCorrupt
+				metaErrs[i] = errFileCorrupt
+				onlineDisks[i] = nil
 				continue
 			}
 
@@ -257,82 +371,75 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
 					// attempt a fix if possible, assuming other entries
 					// might have the right erasure distribution.
 					partsMetadata[i] = FileInfo{}
-					dataErrs[i] = errFileCorrupt
-					continue
-				}
-
-				// Since erasure.Distribution is trustable we can fix the mismatching erasure.Index
-				if meta.Erasure.Distribution[i] != meta.Erasure.Index {
-					partsMetadata[i] = FileInfo{}
-					dataErrs[i] = errFileCorrupt
+					metaErrs[i] = errFileCorrupt
+					onlineDisks[i] = nil
 					continue
 				}
 			}
 		}
+	}
 
-		if !diskMTime.Equal(timeSentinel) && !diskMTime.IsZero() {
-			if !partsMetadata[i].AcceptableDelta(diskMTime, shardDiskTimeDelta) {
-				// not with in acceptable delta, skip.
-				// If disk mTime mismatches it is considered outdated
-				// https://github.com/minio/minio/pull/13803
-				//
-				// This check only is active if we could find maximally
-				// occurring disk mtimes that are somewhat same across
-				// the quorum. Allowing to skip those shards which we
-				// might think are wrong.
-				shardFix = true
-				partsMetadata[i] = FileInfo{}
-				dataErrs[i] = errFileCorrupt
-				continue
+	// Copy meta errors to part errors
+	for i, err := range metaErrs {
+		if err != nil {
+			partErr := convPartErrToInt(err)
+			for p := range latestMeta.Parts {
+				dataErrsByPart[p][i] = partErr
 			}
+		}
+	}
+
+	for i, onlineDisk := range onlineDisks {
+		if metaErrs[i] != nil {
+			continue
+		}
+
+		meta := partsMetadata[i]
+		if meta.Deleted || meta.IsRemote() {
+			continue
 		}
 
 		// Always check data, if we got it.
 		if (len(meta.Data) > 0 || meta.Size == 0) && len(meta.Parts) > 0 {
 			checksumInfo := meta.Erasure.GetChecksumInfo(meta.Parts[0].Number)
-			dataErrs[i] = bitrotVerify(bytes.NewReader(meta.Data),
+			verifyErr := bitrotVerify(bytes.NewReader(meta.Data),
 				int64(len(meta.Data)),
 				meta.Erasure.ShardFileSize(meta.Size),
 				checksumInfo.Algorithm,
 				checksumInfo.Hash, meta.Erasure.ShardSize())
-			if dataErrs[i] == nil {
-				// All parts verified, mark it as all data available.
-				availableDisks[i] = onlineDisk
-			} else {
-				// upon errors just make that disk's fileinfo invalid
-				partsMetadata[i] = FileInfo{}
-			}
+			dataErrsByPart[0][i] = convPartErrToInt(verifyErr)
 			continue
 		}
 
-		meta.DataDir = latestMeta.DataDir
+		var (
+			verifyErr  error
+			verifyResp *CheckPartsResp
+		)
+
 		switch scanMode {
 		case madmin.HealDeepScan:
 			// disk has a valid xl.meta but may not have all the
 			// parts. This is considered an outdated disk, since
 			// it needs healing too.
-			if !meta.Deleted && !meta.IsRemote() {
-				dataErrs[i] = onlineDisk.VerifyFile(ctx, bucket, object, meta)
-			}
-		case madmin.HealNormalScan:
-			if !meta.Deleted && !meta.IsRemote() {
-				dataErrs[i] = onlineDisk.CheckParts(ctx, bucket, object, meta)
-			}
+			verifyResp, verifyErr = onlineDisk.VerifyFile(ctx, bucket, object, meta)
+		default:
+			verifyResp, verifyErr = onlineDisk.CheckParts(ctx, bucket, object, meta)
 		}
 
-		if dataErrs[i] == nil {
-			// All parts verified, mark it as all data available.
-			availableDisks[i] = onlineDisk
-		} else {
-			// upon errors just make that disk's fileinfo invalid
-			partsMetadata[i] = FileInfo{}
+		for p := range latestMeta.Parts {
+			if verifyErr != nil {
+				dataErrsByPart[p][i] = convPartErrToInt(verifyErr)
+			} else {
+				dataErrsByPart[p][i] = verifyResp.Results[p]
+			}
 		}
 	}
 
-	if shardFix {
-		// Only when shard is fixed return an appropriate disk mtime value.
-		return availableDisks, dataErrs, diskMTime
-	} // else return timeSentinel for disk mtime
-
-	return availableDisks, dataErrs, timeSentinel
+	// Build dataErrs by disk from dataErrs by part
+	for part, disks := range dataErrsByPart {
+		for disk := range disks {
+			dataErrsByDisk[disk][part] = dataErrsByPart[part][disk]
+		}
+	}
+	return
 }

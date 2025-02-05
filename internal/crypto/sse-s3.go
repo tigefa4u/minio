@@ -71,15 +71,19 @@ func (sses3) IsEncrypted(metadata map[string]string) bool {
 // UnsealObjectKey extracts and decrypts the sealed object key
 // from the metadata using KMS and returns the decrypted object
 // key.
-func (s3 sses3) UnsealObjectKey(KMS kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
-	if KMS == nil {
+func (s3 sses3) UnsealObjectKey(k *kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	if k == nil {
 		return key, Errorf("KMS not configured")
 	}
 	keyID, kmsKey, sealedKey, err := s3.ParseMetadata(metadata)
 	if err != nil {
 		return key, err
 	}
-	unsealKey, err := KMS.DecryptKey(keyID, kmsKey, kms.Context{bucket: path.Join(bucket, object)})
+	unsealKey, err := k.Decrypt(context.TODO(), &kms.DecryptRequest{
+		Name:           keyID,
+		Ciphertext:     kmsKey,
+		AssociatedData: kms.Context{bucket: path.Join(bucket, object)},
+	})
 	if err != nil {
 		return key, err
 	}
@@ -92,54 +96,17 @@ func (s3 sses3) UnsealObjectKey(KMS kms.KMS, metadata map[string]string, bucket,
 // keys.
 //
 // The metadata, buckets and objects slices must have the same length.
-func (s3 sses3) UnsealObjectKeys(ctx context.Context, KMS kms.KMS, metadata []map[string]string, buckets, objects []string) ([]ObjectKey, error) {
-	if KMS == nil {
+func (s3 sses3) UnsealObjectKeys(ctx context.Context, k *kms.KMS, metadata []map[string]string, buckets, objects []string) ([]ObjectKey, error) {
+	if k == nil {
 		return nil, Errorf("KMS not configured")
 	}
 
 	if len(metadata) != len(buckets) || len(metadata) != len(objects) {
 		return nil, Errorf("invalid metadata/object count: %d != %d != %d", len(metadata), len(buckets), len(objects))
 	}
-
-	keyIDs := make([]string, 0, len(metadata))
-	kmsKeys := make([][]byte, 0, len(metadata))
-	sealedKeys := make([]SealedKey, 0, len(metadata))
-
-	sameKeyID := true
+	keys := make([]ObjectKey, 0, len(metadata))
 	for i := range metadata {
-		keyID, kmsKey, sealedKey, err := s3.ParseMetadata(metadata[i])
-		if err != nil {
-			return nil, err
-		}
-		keyIDs = append(keyIDs, keyID)
-		kmsKeys = append(kmsKeys, kmsKey)
-		sealedKeys = append(sealedKeys, sealedKey)
-
-		if i > 0 && keyID != keyIDs[i-1] {
-			sameKeyID = false
-		}
-	}
-	if sameKeyID {
-		contexts := make([]kms.Context, 0, len(keyIDs))
-		for i := range buckets {
-			contexts = append(contexts, kms.Context{buckets[i]: path.Join(buckets[i], objects[i])})
-		}
-		unsealKeys, err := KMS.DecryptAll(ctx, keyIDs[0], kmsKeys, contexts)
-		if err != nil {
-			return nil, err
-		}
-		keys := make([]ObjectKey, len(unsealKeys))
-		for i := range keys {
-			if err := keys[i].Unseal(unsealKeys[i], sealedKeys[i], s3.String(), buckets[i], objects[i]); err != nil {
-				return nil, err
-			}
-		}
-		return keys, nil
-	}
-
-	keys := make([]ObjectKey, 0, len(keyIDs))
-	for i := range keyIDs {
-		key, err := s3.UnsealObjectKey(KMS, metadata[i], buckets[i], objects[i])
+		key, err := s3.UnsealObjectKey(k, metadata[i], buckets[i], objects[i])
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +124,7 @@ func (sses3) CreateMetadata(metadata map[string]string, keyID string, kmsKey []b
 		logger.CriticalIf(context.Background(), Errorf("The seal algorithm '%s' is invalid for SSE-S3", sealedKey.Algorithm))
 	}
 
-	// There are two possibilites:
+	// There are two possibilities:
 	// - We use a KMS -> There must be non-empty key ID and a KMS data key.
 	// - We use a K/V -> There must be no key ID and no KMS data key.
 	// Otherwise, the caller has passed an invalid argument combination.
@@ -203,7 +170,7 @@ func (sses3) ParseMetadata(metadata map[string]string) (keyID string, kmsKey []b
 		return keyID, kmsKey, sealedKey, Errorf("The object metadata is missing the internal sealed key for SSE-S3")
 	}
 
-	// There are two possibilites:
+	// There are two possibilities:
 	// - We use a KMS -> There must be a key ID and a KMS data key.
 	// - We use a K/V -> There must be no key ID and no KMS data key.
 	// Otherwise, the metadata is corrupted.

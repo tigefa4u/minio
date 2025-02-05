@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -24,7 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,9 +34,12 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/event"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/certs"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/minio/internal/once"
+	"github.com/minio/minio/internal/store"
+	"github.com/minio/pkg/v3/certs"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // Webhook constants
@@ -90,21 +93,28 @@ func (w WebhookArgs) Validate() error {
 
 // WebhookTarget - Webhook target.
 type WebhookTarget struct {
-	lazyInit lazyInit
+	initOnce once.Init
 
 	id         event.TargetID
 	args       WebhookArgs
 	transport  *http.Transport
 	httpClient *http.Client
-	store      Store
+	store      store.Store[event.Event]
 	loggerOnce logger.LogOnce
 	cancel     context.CancelFunc
 	cancelCh   <-chan struct{}
+
+	addr string // full address ip/dns with a port number, e.g.  x.x.x.x:8080
 }
 
 // ID - returns target ID.
 func (target *WebhookTarget) ID() event.TargetID {
 	return target.id
+}
+
+// Name - returns the Name of the target.
+func (target *WebhookTarget) Name() string {
+	return target.ID().String()
 }
 
 // IsActive - Return true if target is up and active
@@ -121,51 +131,31 @@ func (target *WebhookTarget) Store() event.TargetStore {
 }
 
 func (target *WebhookTarget) isActive() (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, target.args.Endpoint.String(), nil)
+	conn, err := net.DialTimeout("tcp", target.addr, 5*time.Second)
 	if err != nil {
 		if xnet.IsNetworkOrHostDown(err, false) {
-			return false, errNotConnected
+			return false, store.ErrNotConnected
 		}
 		return false, err
 	}
-	tokens := strings.Fields(target.args.AuthToken)
-	switch len(tokens) {
-	case 2:
-		req.Header.Set("Authorization", target.args.AuthToken)
-	case 1:
-		req.Header.Set("Authorization", "Bearer "+target.args.AuthToken)
-	}
-
-	resp, err := target.httpClient.Do(req)
-	if err != nil {
-		if xnet.IsNetworkOrHostDown(err, true) {
-			return false, errNotConnected
-		}
-		return false, err
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	// No network failure i.e response from the target means its up
+	defer conn.Close()
 	return true, nil
 }
 
 // Save - saves the events to the store if queuestore is configured,
 // which will be replayed when the webhook connection is active.
 func (target *WebhookTarget) Save(eventData event.Event) error {
-	if err := target.init(); err != nil {
+	if target.store != nil {
+		_, err := target.store.Put(eventData)
 		return err
 	}
-
-	if target.store != nil {
-		return target.store.Put(eventData)
+	if err := target.init(); err != nil {
+		return err
 	}
 	err := target.send(eventData)
 	if err != nil {
 		if xnet.IsNetworkOrHostDown(err, false) {
-			return errNotConnected
+			return store.ErrNotConnected
 		}
 	}
 	return err
@@ -207,23 +197,24 @@ func (target *WebhookTarget) send(eventData event.Event) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	xhttp.DrainBody(resp.Body)
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("sending event failed with %v", resp.Status)
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		// accepted HTTP status codes.
+		return nil
+	} else if resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%s returned '%s', please check if your auth token is correctly set", target.args.Endpoint, resp.Status)
 	}
-
-	return nil
+	return fmt.Errorf("%s returned '%s', please check your endpoint configuration", target.args.Endpoint, resp.Status)
 }
 
-// Send - reads an event from store and sends it to webhook.
-func (target *WebhookTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to webhook.
+func (target *WebhookTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and would've been already been sent successfully.
@@ -235,13 +226,13 @@ func (target *WebhookTarget) Send(eventKey string) error {
 
 	if err := target.send(eventData); err != nil {
 		if xnet.IsNetworkOrHostDown(err, false) {
-			return errNotConnected
+			return store.ErrNotConnected
 		}
 		return err
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - does nothing and available for interface compatibility.
@@ -251,7 +242,7 @@ func (target *WebhookTarget) Close() error {
 }
 
 func (target *WebhookTarget) init() error {
-	return target.lazyInit.Do(target.initWebhook)
+	return target.initOnce.Do(target.initWebhook)
 }
 
 // Only called from init()
@@ -274,7 +265,7 @@ func (target *WebhookTarget) initWebhook() error {
 		return err
 	}
 	if !yes {
-		return errNotConnected
+		return store.ErrNotConnected
 	}
 
 	return nil
@@ -284,11 +275,11 @@ func (target *WebhookTarget) initWebhook() error {
 func NewWebhookTarget(ctx context.Context, id string, args WebhookArgs, loggerOnce logger.LogOnce, transport *http.Transport) (*WebhookTarget, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	var store Store
+	var queueStore store.Store[event.Event]
 	if args.QueueDir != "" {
 		queueDir := filepath.Join(args.QueueDir, storePrefix+"-webhook-"+id)
-		store = NewQueueStore(queueDir, args.QueueLimit)
-		if err := store.Open(); err != nil {
+		queueStore = store.NewQueueStore[event.Event](queueDir, args.QueueLimit, event.StoreExtension)
+		if err := queueStore.Open(); err != nil {
 			cancel()
 			return nil, fmt.Errorf("unable to initialize the queue store of Webhook `%s`: %w", id, err)
 		}
@@ -299,13 +290,26 @@ func NewWebhookTarget(ctx context.Context, id string, args WebhookArgs, loggerOn
 		args:       args,
 		loggerOnce: loggerOnce,
 		transport:  transport,
-		store:      store,
+		store:      queueStore,
 		cancel:     cancel,
 		cancelCh:   ctx.Done(),
 	}
 
+	// Calculate the webhook addr with the port number format
+	target.addr = args.Endpoint.Host
+	if _, _, err := net.SplitHostPort(args.Endpoint.Host); err != nil && strings.Contains(err.Error(), "missing port in address") {
+		switch strings.ToLower(args.Endpoint.Scheme) {
+		case "http":
+			target.addr += ":80"
+		case "https":
+			target.addr += ":443"
+		default:
+			return nil, errors.New("unsupported scheme")
+		}
+	}
+
 	if target.store != nil {
-		streamEventsFromStore(target.store, target, target.cancelCh, target.loggerOnce)
+		store.StreamItems(target.store, target, target.cancelCh, target.loggerOnce)
 	}
 
 	return target, nil

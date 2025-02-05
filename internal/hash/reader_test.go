@@ -19,15 +19,19 @@ package hash
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"testing"
+
+	"github.com/minio/minio/internal/ioutil"
 )
 
 // Tests functions like Size(), MD5*(), SHA256*()
 func TestHashReaderHelperMethods(t *testing.T) {
-	r, err := NewReader(bytes.NewReader([]byte("abcd")), 4, "e2fc714c4727ee9395f324cd2e7f331f", "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589", 4)
+	r, err := NewReader(context.Background(), bytes.NewReader([]byte("abcd")), 4, "e2fc714c4727ee9395f324cd2e7f331f", "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589", 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,14 +39,15 @@ func TestHashReaderHelperMethods(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.MD5HexString() != "e2fc714c4727ee9395f324cd2e7f331f" {
-		t.Errorf("Expected md5hex \"e2fc714c4727ee9395f324cd2e7f331f\", got %s", r.MD5HexString())
+	md5sum := r.MD5Current()
+	if hex.EncodeToString(md5sum) != "e2fc714c4727ee9395f324cd2e7f331f" {
+		t.Errorf("Expected md5hex \"e2fc714c4727ee9395f324cd2e7f331f\", got %s", hex.EncodeToString(md5sum))
 	}
 	if r.SHA256HexString() != "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589" {
 		t.Errorf("Expected sha256hex \"88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589\", got %s", r.SHA256HexString())
 	}
-	if r.MD5Base64String() != "4vxxTEcn7pOV8yTNLn8zHw==" {
-		t.Errorf("Expected md5base64 \"4vxxTEcn7pOV8yTNLn8zHw==\", got \"%s\"", r.MD5Base64String())
+	if base64.StdEncoding.EncodeToString(md5sum) != "4vxxTEcn7pOV8yTNLn8zHw==" {
+		t.Errorf("Expected md5base64 \"4vxxTEcn7pOV8yTNLn8zHw==\", got \"%s\"", base64.StdEncoding.EncodeToString(md5sum))
 	}
 	if r.Size() != 4 {
 		t.Errorf("Expected size 4, got %d", r.Size())
@@ -53,9 +58,6 @@ func TestHashReaderHelperMethods(t *testing.T) {
 	expectedMD5, err := hex.DecodeString("e2fc714c4727ee9395f324cd2e7f331f")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if !bytes.Equal(r.MD5(), expectedMD5) {
-		t.Errorf("Expected md5hex \"e2fc714c4727ee9395f324cd2e7f331f\", got %s", r.MD5HexString())
 	}
 	if !bytes.Equal(r.MD5Current(), expectedMD5) {
 		t.Errorf("Expected md5hex \"e2fc714c4727ee9395f324cd2e7f331f\", got %s", hex.EncodeToString(r.MD5Current()))
@@ -79,7 +81,7 @@ func TestHashReaderVerification(t *testing.T) {
 		md5hex, sha256hex string
 		err               error
 	}{
-		{
+		0: {
 			desc:       "Success, no checksum verification provided.",
 			src:        bytes.NewReader([]byte("abcd")),
 			size:       4,
@@ -124,7 +126,7 @@ func TestHashReaderVerification(t *testing.T) {
 				CalculatedSHA256: "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
 			},
 		},
-		{
+		5: {
 			desc:       "Correct sha256, nested",
 			src:        mustReader(t, bytes.NewReader([]byte("abcd")), 4, "", "", 4),
 			size:       4,
@@ -137,13 +139,15 @@ func TestHashReaderVerification(t *testing.T) {
 			size:       4,
 			actualSize: -1,
 			sha256hex:  "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
+			err:        ioutil.ErrOverread,
 		},
-		{
+		7: {
 			desc:       "Correct sha256, nested, truncated, swapped",
 			src:        mustReader(t, bytes.NewReader([]byte("abcd-more-stuff-to-be ignored")), 4, "", "", -1),
 			size:       4,
 			actualSize: -1,
 			sha256hex:  "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
+			err:        ioutil.ErrOverread,
 		},
 		{
 			desc:       "Incorrect MD5, nested",
@@ -162,6 +166,7 @@ func TestHashReaderVerification(t *testing.T) {
 			size:       4,
 			actualSize: 4,
 			sha256hex:  "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
+			err:        ioutil.ErrOverread,
 		},
 		{
 			desc:       "Correct MD5, nested",
@@ -177,6 +182,7 @@ func TestHashReaderVerification(t *testing.T) {
 			actualSize: 4,
 			sha256hex:  "",
 			md5hex:     "e2fc714c4727ee9395f324cd2e7f331f",
+			err:        ioutil.ErrOverread,
 		},
 		{
 			desc:       "Correct MD5, nested, truncated",
@@ -184,16 +190,21 @@ func TestHashReaderVerification(t *testing.T) {
 			size:       4,
 			actualSize: 4,
 			md5hex:     "e2fc714c4727ee9395f324cd2e7f331f",
+			err:        ioutil.ErrOverread,
 		},
 	}
 	for i, testCase := range testCases {
 		t.Run(fmt.Sprintf("case-%d", i+1), func(t *testing.T) {
-			r, err := NewReader(testCase.src, testCase.size, testCase.md5hex, testCase.sha256hex, testCase.actualSize)
+			r, err := NewReader(context.Background(), testCase.src, testCase.size, testCase.md5hex, testCase.sha256hex, testCase.actualSize)
 			if err != nil {
 				t.Fatalf("Test %q: Initializing reader failed %s", testCase.desc, err)
 			}
 			_, err = io.Copy(io.Discard, r)
 			if err != nil {
+				if testCase.err == nil {
+					t.Errorf("Test %q; got unexpected error: %v", testCase.desc, err)
+					return
+				}
 				if err.Error() != testCase.err.Error() {
 					t.Errorf("Test %q: Expected error %s, got error %s", testCase.desc, testCase.err, err)
 				}
@@ -203,7 +214,7 @@ func TestHashReaderVerification(t *testing.T) {
 }
 
 func mustReader(t *testing.T, src io.Reader, size int64, md5Hex, sha256Hex string, actualSize int64) *Reader {
-	r, err := NewReader(src, size, md5Hex, sha256Hex, actualSize)
+	r, err := NewReader(context.Background(), src, size, md5Hex, sha256Hex, actualSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +304,7 @@ func TestHashReaderInvalidArguments(t *testing.T) {
 
 	for i, testCase := range testCases {
 		t.Run(fmt.Sprintf("case-%d", i+1), func(t *testing.T) {
-			_, err := NewReader(testCase.src, testCase.size, testCase.md5hex, testCase.sha256hex, testCase.actualSize)
+			_, err := NewReader(context.Background(), testCase.src, testCase.size, testCase.md5hex, testCase.sha256hex, testCase.actualSize)
 			if err != nil && testCase.success {
 				t.Errorf("Test %q: Expected success, but got error %s instead", testCase.desc, err)
 			}

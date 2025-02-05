@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -22,19 +22,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/minio/minio/internal/bucket/object/lock"
 	xhttp "github.com/minio/minio/internal/http"
 )
 
 var (
 	errLifecycleTooManyRules = Errorf("Lifecycle configuration allows a maximum of 1000 rules")
 	errLifecycleNoRule       = Errorf("Lifecycle configuration should have at least one rule")
-	errLifecycleDuplicateID  = Errorf("Lifecycle configuration has rule with the same ID. Rule ID must be unique.")
+	errLifecycleDuplicateID  = Errorf("Rule ID must be unique. Found same ID for more than one rule")
 	errXMLNotWellFormed      = Errorf("The XML you provided was not well-formed or did not validate against our published schema")
+	errLifecycleBucketLocked = Errorf("ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket")
 )
 
 const (
@@ -65,21 +67,58 @@ const (
 	DeleteRestoredAction
 	// DeleteRestoredVersionAction deletes a particular version that was temporarily restored
 	DeleteRestoredVersionAction
-
+	// DeleteAllVersionsAction deletes all versions when an object expires
+	DeleteAllVersionsAction
+	// DelMarkerDeleteAllVersionsAction deletes all versions when an object with delete marker as latest version expires
+	DelMarkerDeleteAllVersionsAction
 	// ActionCount must be the last action and shouldn't be used as a regular action.
 	ActionCount
 )
 
+// DeleteRestored - Returns true if action demands delete on restored objects
+func (a Action) DeleteRestored() bool {
+	return a == DeleteRestoredAction || a == DeleteRestoredVersionAction
+}
+
+// DeleteVersioned - Returns true if action demands delete on a versioned object
+func (a Action) DeleteVersioned() bool {
+	return a == DeleteVersionAction || a == DeleteRestoredVersionAction
+}
+
+// DeleteAll - Returns true if the action demands deleting all versions of an object
+func (a Action) DeleteAll() bool {
+	return a == DeleteAllVersionsAction || a == DelMarkerDeleteAllVersionsAction
+}
+
+// Delete - Returns true if action demands delete on all objects (including restored)
+func (a Action) Delete() bool {
+	if a.DeleteRestored() {
+		return true
+	}
+	return a == DeleteVersionAction || a == DeleteAction || a == DeleteAllVersionsAction || a == DelMarkerDeleteAllVersionsAction
+}
+
 // Lifecycle - Configuration for bucket lifecycle.
 type Lifecycle struct {
-	XMLName xml.Name `xml:"LifecycleConfiguration"`
-	Rules   []Rule   `xml:"Rule"`
+	XMLName         xml.Name   `xml:"LifecycleConfiguration"`
+	Rules           []Rule     `xml:"Rule"`
+	ExpiryUpdatedAt *time.Time `xml:"ExpiryUpdatedAt,omitempty"`
 }
 
 // HasTransition returns 'true' if lifecycle document has Transition enabled.
 func (lc Lifecycle) HasTransition() bool {
 	for _, rule := range lc.Rules {
 		if rule.Transition.IsEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
+// HasExpiry returns 'true' if lifecycle document has Expiry enabled.
+func (lc Lifecycle) HasExpiry() bool {
+	for _, rule := range lc.Rules {
+		if !rule.Expiration.IsNull() || !rule.NoncurrentVersionExpiration.IsNull() {
 			return true
 		}
 	}
@@ -104,8 +143,7 @@ func (lc *Lifecycle) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err e
 			return err
 		}
 
-		switch se := t.(type) {
-		case xml.StartElement:
+		if se, ok := t.(xml.StartElement); ok {
 			switch se.Name.Local {
 			case "Rule":
 				var r Rule
@@ -113,6 +151,12 @@ func (lc *Lifecycle) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err e
 					return err
 				}
 				lc.Rules = append(lc.Rules, r)
+			case "ExpiryUpdatedAt":
+				var t time.Time
+				if err = d.DecodeElement(&t, &start); err != nil {
+					return err
+				}
+				lc.ExpiryUpdatedAt = &t
 			default:
 				return xml.UnmarshalError(fmt.Sprintf("expected element type <Rule> but have <%s>", se.Name.Local))
 			}
@@ -132,7 +176,8 @@ func (lc Lifecycle) HasActiveRules(prefix string) bool {
 		}
 
 		if len(prefix) > 0 && len(rule.GetPrefix()) > 0 {
-			// If recursive, we can skip this rule if it doesn't match the tested prefix.
+			// we can skip this rule if it doesn't match the tested
+			// prefix.
 			if !strings.HasPrefix(prefix, rule.GetPrefix()) && !strings.HasPrefix(rule.GetPrefix(), prefix) {
 				continue
 			}
@@ -147,13 +192,13 @@ func (lc Lifecycle) HasActiveRules(prefix string) bool {
 		if !rule.NoncurrentVersionTransition.IsNull() {
 			return true
 		}
-		if rule.Expiration.IsNull() && rule.Transition.IsNull() {
-			continue
-		}
 		if !rule.Expiration.IsDateNull() && rule.Expiration.Date.Before(time.Now().UTC()) {
 			return true
 		}
 		if !rule.Expiration.IsDaysNull() {
+			return true
+		}
+		if rule.Expiration.DeleteMarker.val {
 			return true
 		}
 		if !rule.Transition.IsDateNull() && rule.Transition.Date.Before(time.Now().UTC()) {
@@ -193,7 +238,7 @@ func ParseLifecycleConfig(reader io.Reader) (*Lifecycle, error) {
 }
 
 // Validate - validates the lifecycle configuration
-func (lc Lifecycle) Validate() error {
+func (lc Lifecycle) Validate(lr lock.Retention) error {
 	// Lifecycle config can't have more than 1000 rules
 	if len(lc.Rules) > 1000 {
 		return errLifecycleTooManyRules
@@ -207,6 +252,9 @@ func (lc Lifecycle) Validate() error {
 	for _, r := range lc.Rules {
 		if err := r.Validate(); err != nil {
 			return err
+		}
+		if lr.LockEnabled && (r.Expiration.DeleteAll.val || !r.DelMarkerExpiration.Empty()) {
+			return errLifecycleBucketLocked
 		}
 	}
 	// Make sure Rule ID is unique
@@ -240,6 +288,9 @@ func (lc Lifecycle) FilterRules(obj ObjectOpts) []Rule {
 		if !rule.Filter.TestTags(obj.UserTags) {
 			continue
 		}
+		if !obj.DeleteMarker && !rule.Filter.BySize(obj.Size) {
+			continue
+		}
 		rules = append(rules, rule)
 	}
 	return rules
@@ -251,6 +302,7 @@ type ObjectOpts struct {
 	Name             string
 	UserTags         string
 	ModTime          time.Time
+	Size             int64
 	VersionID        string
 	IsLatest         bool
 	DeleteMarker     bool
@@ -270,39 +322,12 @@ func (o ObjectOpts) ExpiredObjectDeleteMarker() bool {
 
 // Event contains a lifecycle action with associated info
 type Event struct {
-	Action       Action
-	RuleID       string
-	Due          time.Time
-	StorageClass string
-}
-
-type lifecycleEvents []Event
-
-func (es lifecycleEvents) Len() int {
-	return len(es)
-}
-
-func (es lifecycleEvents) Swap(i, j int) {
-	es[i], es[j] = es[j], es[i]
-}
-
-func (es lifecycleEvents) Less(i, j int) bool {
-	if es[i].Due.Equal(es[j].Due) {
-		// Prefer Expiration over Transition for both current and noncurrent
-		// versions
-		switch es[i].Action {
-		case DeleteAction, DeleteVersionAction:
-			return true
-		}
-		switch es[j].Action {
-		case DeleteAction, DeleteVersionAction:
-			return false
-		}
-		return true
-	}
-
-	// Prefer earlier occurring event
-	return es[i].Due.Before(es[j].Due)
+	Action                  Action
+	RuleID                  string
+	Due                     time.Time
+	NoncurrentDays          int
+	NewerNoncurrentVersions int
+	StorageClass            string
 }
 
 // Eval returns the lifecycle event applicable now.
@@ -365,6 +390,21 @@ func (lc Lifecycle) eval(obj ObjectOpts, now time.Time) Event {
 			}
 		}
 
+		// DelMarkerExpiration
+		if obj.IsLatest && obj.DeleteMarker && !rule.DelMarkerExpiration.Empty() {
+			if due, ok := rule.DelMarkerExpiration.NextDue(obj); ok && (now.IsZero() || now.After(due)) {
+				events = append(events, Event{
+					Action: DelMarkerDeleteAllVersionsAction,
+					RuleID: rule.ID,
+					Due:    due,
+				})
+			}
+			// No other conflicting actions in this rule can apply to an object with current version as DEL marker
+			// Note: There could be other rules with earlier expiration which need to be considered.
+			// See TestDelMarkerExpiration
+			continue
+		}
+
 		// Skip rules with newer noncurrent versions specified. These rules are
 		// not handled at an individual version level. eval applies only to a
 		// specific version.
@@ -412,11 +452,17 @@ func (lc Lifecycle) eval(obj ObjectOpts, now time.Time) Event {
 				}
 			case !rule.Expiration.IsDaysNull():
 				if expectedExpiry := ExpectedExpiryTime(obj.ModTime, int(rule.Expiration.Days)); now.IsZero() || now.After(expectedExpiry) {
-					events = append(events, Event{
+					event := Event{
 						Action: DeleteAction,
 						RuleID: rule.ID,
 						Due:    expectedExpiry,
-					})
+					}
+					if rule.Expiration.DeleteAll.val {
+						// Expires all versions of this object once the latest object is old enough.
+						// This is a MinIO only extension.
+						event.Action = DeleteAllVersionsAction
+					}
+					events = append(events, event)
 				}
 			}
 
@@ -434,7 +480,31 @@ func (lc Lifecycle) eval(obj ObjectOpts, now time.Time) Event {
 	}
 
 	if len(events) > 0 {
-		sort.Sort(lifecycleEvents(events))
+		slices.SortFunc(events, func(a, b Event) int {
+			// Prefer Expiration over Transition for both current
+			// and noncurrent versions when,
+			// - now is past the expected time to action
+			// - expected time to action is the same for both actions
+			if now.After(a.Due) && now.After(b.Due) || a.Due.Equal(b.Due) {
+				switch a.Action {
+				case DeleteAllVersionsAction, DelMarkerDeleteAllVersionsAction,
+					DeleteAction, DeleteVersionAction:
+					return -1
+				}
+				switch b.Action {
+				case DeleteAllVersionsAction, DelMarkerDeleteAllVersionsAction,
+					DeleteAction, DeleteVersionAction:
+					return 1
+				}
+				return -1
+			}
+
+			// Prefer earlier occurring event
+			if a.Due.Before(b.Due) {
+				return -1
+			}
+			return 1
+		})
 		return events[0]
 	}
 
@@ -462,7 +532,7 @@ func ExpectedExpiryTime(modTime time.Time, days int) time.Time {
 func (lc Lifecycle) SetPredictionHeaders(w http.ResponseWriter, obj ObjectOpts) {
 	event := lc.eval(obj, time.Time{})
 	switch event.Action {
-	case DeleteAction, DeleteVersionAction:
+	case DeleteAction, DeleteVersionAction, DeleteAllVersionsAction, DelMarkerDeleteAllVersionsAction:
 		w.Header()[xhttp.AmzExpiration] = []string{
 			fmt.Sprintf(`expiry-date="%s", rule-id="%s"`, event.Due.Format(http.TimeFormat), event.RuleID),
 		}
@@ -475,15 +545,17 @@ func (lc Lifecycle) SetPredictionHeaders(w http.ResponseWriter, obj ObjectOpts) 
 
 // NoncurrentVersionsExpirationLimit returns the number of noncurrent versions
 // to be retained from the first applicable rule per S3 behavior.
-func (lc Lifecycle) NoncurrentVersionsExpirationLimit(obj ObjectOpts) (string, int, int) {
-	var lim int
-	var days int
-	var ruleID string
+func (lc Lifecycle) NoncurrentVersionsExpirationLimit(obj ObjectOpts) Event {
 	for _, rule := range lc.FilterRules(obj) {
 		if rule.NoncurrentVersionExpiration.NewerNoncurrentVersions == 0 {
 			continue
 		}
-		return rule.ID, int(rule.NoncurrentVersionExpiration.NoncurrentDays), rule.NoncurrentVersionExpiration.NewerNoncurrentVersions
+		return Event{
+			Action:                  DeleteVersionAction,
+			RuleID:                  rule.ID,
+			NoncurrentDays:          int(rule.NoncurrentVersionExpiration.NoncurrentDays),
+			NewerNoncurrentVersions: rule.NoncurrentVersionExpiration.NewerNoncurrentVersions,
+		}
 	}
-	return ruleID, days, lim
+	return Event{}
 }

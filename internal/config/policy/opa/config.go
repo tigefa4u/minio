@@ -24,9 +24,9 @@ import (
 	"net/http"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/env"
-	iampolicy "github.com/minio/pkg/iam/policy"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // Env IAM OPA URL
@@ -42,12 +42,14 @@ const (
 var (
 	DefaultKVS = config.KVS{
 		config.KV{
-			Key:   URL,
-			Value: "",
+			Key:           URL,
+			Value:         "",
+			HiddenIfEmpty: true,
 		},
 		config.KV{
-			Key:   AuthToken,
-			Value: "",
+			Key:           AuthToken,
+			Value:         "",
+			HiddenIfEmpty: true,
 		},
 	}
 )
@@ -162,7 +164,7 @@ func New(args Args) *Opa {
 }
 
 // IsAllowed - checks given policy args is allowed to continue the REST API.
-func (o *Opa) IsAllowed(args iampolicy.Args) (bool, error) {
+func (o *Opa) IsAllowed(args policy.Args) (bool, error) {
 	if o == nil {
 		return false, nil
 	}

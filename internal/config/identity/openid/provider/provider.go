@@ -21,6 +21,8 @@ import "errors"
 
 // DiscoveryDoc - parses the output from openid-configuration
 // for example https://accounts.google.com/.well-known/openid-configuration
+//
+//nolint:unused
 type DiscoveryDoc struct {
 	Issuer                           string   `json:"issuer,omitempty"`
 	AuthEndpoint                     string   `json:"authorization_endpoint,omitempty"`
@@ -51,7 +53,7 @@ var (
 	ErrAccessTokenExpired = errors.New("access_token expired or unauthorized")
 )
 
-// Provider implements indentity provider specific admin operations, such as
+// Provider implements identity provider specific admin operations, such as
 // looking up users, fetching additional attributes etc.
 type Provider interface {
 	LoginWithUser(username, password string) error

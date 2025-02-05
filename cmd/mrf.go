@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -15,84 +15,79 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//go:generate msgp -file=$GOFILE
+
 package cmd
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
-	"github.com/minio/minio/internal/logger"
+	"github.com/google/uuid"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/pkg/v3/wildcard"
+	"github.com/tinylib/msgp/msgp"
 )
 
 const (
-	mrfInfoResetInterval = 10 * time.Second
-	mrfOpsQueueSize      = 10000
+	mrfOpsQueueSize = 100000
 )
 
-// partialOperation is a successful upload/delete of an object
-// but not written in all disks (having quorum)
-type partialOperation struct {
-	bucket    string
-	object    string
-	versionID string
-	size      int64
-	setIndex  int
-	poolIndex int
-}
+const (
+	healDir              = ".heal"
+	healMRFDir           = bucketMetaPrefix + SlashSeparator + healDir + SlashSeparator + "mrf"
+	healMRFMetaFormat    = 1
+	healMRFMetaVersionV1 = 1
+)
 
-type setInfo struct {
-	index, pool int
+// PartialOperation is a successful upload/delete of an object
+// but not written in all disks (having quorum)
+type PartialOperation struct {
+	Bucket              string
+	Object              string
+	VersionID           string
+	Versions            []byte
+	SetIndex, PoolIndex int
+	Queued              time.Time
+	BitrotScan          bool
 }
 
 // mrfState sncapsulates all the information
 // related to the global background MRF.
 type mrfState struct {
-	ready int32 // ref: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
-	_     int32 // For 64 bits alignment
+	opCh chan PartialOperation
 
-	ctx       context.Context
-	objectAPI ObjectLayer
-
-	mu                sync.Mutex
-	opCh              chan partialOperation
-	pendingOps        map[partialOperation]setInfo
-	setReconnectEvent chan setInfo
-
-	itemsHealed  uint64
-	bytesHealed  uint64
-	pendingItems uint64
-	pendingBytes uint64
-
-	triggeredAt time.Time
+	closed  int32
+	closing int32
+	wg      sync.WaitGroup
 }
 
-// Initialize healing MRF subsystem
-func (m *mrfState) init(ctx context.Context, objAPI ObjectLayer) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.ctx = ctx
-	m.objectAPI = objAPI
-	m.opCh = make(chan partialOperation, mrfOpsQueueSize)
-	m.pendingOps = make(map[partialOperation]setInfo)
-	m.setReconnectEvent = make(chan setInfo)
-
-	go globalMRFState.maintainMRFList()
-	go globalMRFState.healRoutine()
-
-	atomic.StoreInt32(&m.ready, 1)
-}
-
-func (m *mrfState) initialized() bool {
-	return atomic.LoadInt32(&m.ready) != 0
+func newMRFState() mrfState {
+	return mrfState{
+		opCh: make(chan PartialOperation, mrfOpsQueueSize),
+	}
 }
 
 // Add a partial S3 operation (put/delete) when one or more disks are offline.
-func (m *mrfState) addPartialOp(op partialOperation) {
-	if !m.initialized() {
+func (m *mrfState) addPartialOp(op PartialOperation) {
+	if m == nil {
+		return
+	}
+
+	if atomic.LoadInt32(&m.closed) == 1 {
+		return
+	}
+
+	m.wg.Add(1)
+	defer m.wg.Done()
+
+	if atomic.LoadInt32(&m.closing) == 1 {
 		return
 	}
 
@@ -102,145 +97,187 @@ func (m *mrfState) addPartialOp(op partialOperation) {
 	}
 }
 
-// Receive the new set (disk) reconnection event
-func (m *mrfState) newSetReconnected(pool, set int) {
-	if !m.initialized() {
-		return
+// Do not accept new MRF operations anymore and start to save
+// the current heal status in one available disk
+func (m *mrfState) shutdown() {
+	atomic.StoreInt32(&m.closing, 1)
+	m.wg.Wait()
+	close(m.opCh)
+	atomic.StoreInt32(&m.closed, 1)
+
+	if len(m.opCh) > 0 {
+		healingLogEvent(context.Background(), "Saving MRF healing data (%d entries)", len(m.opCh))
 	}
 
-	idler := time.NewTimer(100 * time.Millisecond)
-	defer idler.Stop()
+	newReader := func() io.ReadCloser {
+		r, w := io.Pipe()
+		go func() {
+			// Initialize MRF meta header.
+			var data [4]byte
+			binary.LittleEndian.PutUint16(data[0:2], healMRFMetaFormat)
+			binary.LittleEndian.PutUint16(data[2:4], healMRFMetaVersionV1)
+			mw := msgp.NewWriter(w)
+			n, err := mw.Write(data[:])
+			if err != nil {
+				w.CloseWithError(err)
+				return
+			}
+			if n != len(data) {
+				w.CloseWithError(io.ErrShortWrite)
+				return
+			}
+			for item := range m.opCh {
+				err = item.EncodeMsg(mw)
+				if err != nil {
+					break
+				}
+			}
+			mw.Flush()
+			w.CloseWithError(err)
+		}()
+		return r
+	}
 
-	select {
-	case m.setReconnectEvent <- setInfo{index: set, pool: pool}:
-	case <-idler.C:
+	globalLocalDrivesMu.RLock()
+	localDrives := cloneDrives(globalLocalDrivesMap)
+	globalLocalDrivesMu.RUnlock()
+
+	for _, localDrive := range localDrives {
+		r := newReader()
+		err := localDrive.CreateFile(context.Background(), "", minioMetaBucket, pathJoin(healMRFDir, "list.bin"), -1, r)
+		r.Close()
+		if err == nil {
+			break
+		}
 	}
 }
 
-// Get current MRF stats of the last MRF activity
-func (m *mrfState) getCurrentMRFRoundInfo() madmin.MRFStatus {
-	m.mu.Lock()
-	triggeredAt := m.triggeredAt
-	itemsHealed := m.itemsHealed
-	bytesHealed := m.bytesHealed
-	pendingItems := m.pendingItems
-	pendingBytes := m.pendingBytes
-	m.mu.Unlock()
+func (m *mrfState) startMRFPersistence() {
+	loadMRF := func(rc io.ReadCloser, opCh chan PartialOperation) error {
+		defer rc.Close()
+		var data [4]byte
+		n, err := rc.Read(data[:])
+		if err != nil {
+			return err
+		}
+		if n != len(data) {
+			return errors.New("heal mrf: no data")
+		}
+		// Read resync meta header
+		switch binary.LittleEndian.Uint16(data[0:2]) {
+		case healMRFMetaFormat:
+		default:
+			return fmt.Errorf("heal mrf: unknown format: %d", binary.LittleEndian.Uint16(data[0:2]))
+		}
+		switch binary.LittleEndian.Uint16(data[2:4]) {
+		case healMRFMetaVersionV1:
+		default:
+			return fmt.Errorf("heal mrf: unknown version: %d", binary.LittleEndian.Uint16(data[2:4]))
+		}
 
-	if pendingItems == 0 {
-		return madmin.MRFStatus{}
+		mr := msgp.NewReader(rc)
+		for {
+			op := PartialOperation{}
+			err = op.DecodeMsg(mr)
+			if err != nil {
+				break
+			}
+			opCh <- op
+		}
+
+		return nil
 	}
 
-	return madmin.MRFStatus{
-		Started:     triggeredAt,
-		ItemsHealed: itemsHealed,
-		BytesHealed: bytesHealed,
-		TotalItems:  itemsHealed + pendingItems,
-		TotalBytes:  bytesHealed + pendingBytes,
-	}
-}
+	globalLocalDrivesMu.RLock()
+	localDrives := cloneDrives(globalLocalDrivesMap)
+	globalLocalDrivesMu.RUnlock()
 
-// maintainMRFList gathers the list of successful partial uploads
-// from all underlying er.sets and puts them in a global map which
-// should not have more than 10000 entries.
-func (m *mrfState) maintainMRFList() {
-	for fOp := range m.opCh {
-		m.mu.Lock()
-		if len(m.pendingOps) > mrfOpsQueueSize {
-			m.mu.Unlock()
+	for _, localDrive := range localDrives {
+		if localDrive == nil {
 			continue
 		}
-
-		m.pendingOps[fOp] = setInfo{index: fOp.setIndex, pool: fOp.poolIndex}
-		m.pendingItems++
-		if fOp.size > 0 {
-			m.pendingBytes += uint64(fOp.size)
+		rc, err := localDrive.ReadFileStream(context.Background(), minioMetaBucket, pathJoin(healMRFDir, "list.bin"), 0, -1)
+		if err != nil {
+			continue
 		}
-
-		m.mu.Unlock()
-	}
-}
-
-// Reset current MRF stats
-func (m *mrfState) resetMRFInfoIfNoPendingOps() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.pendingItems > 0 {
-		return
+		err = loadMRF(rc, m.opCh)
+		if err != nil {
+			continue
+		}
+		// finally delete the file after processing mrf entries
+		localDrive.Delete(GlobalContext, minioMetaBucket, pathJoin(healMRFDir, "list.bin"), DeleteOptions{})
+		break
 	}
 
-	m.itemsHealed = 0
-	m.bytesHealed = 0
-	m.pendingItems = 0
-	m.pendingBytes = 0
-	m.triggeredAt = time.Time{}
+	return
 }
+
+var healSleeper = newDynamicSleeper(5, time.Second, false)
 
 // healRoutine listens to new disks reconnection events and
 // issues healing requests for queued objects belonging to the
 // corresponding erasure set
-func (m *mrfState) healRoutine() {
-	idler := time.NewTimer(mrfInfoResetInterval)
-	defer idler.Stop()
-
-	mrfHealingOpts := madmin.HealOpts{
-		ScanMode: madmin.HealNormalScan,
-		Remove:   healDeleteDangling,
-	}
-
+func (m *mrfState) healRoutine(z *erasureServerPools) {
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-GlobalContext.Done():
 			return
-		case <-idler.C:
-			m.resetMRFInfoIfNoPendingOps()
-			idler.Reset(mrfInfoResetInterval)
-		case setInfo := <-m.setReconnectEvent:
-			// Get the list of objects related the er.set
-			// to which the connected disk belongs.
-			var mrfOperations []partialOperation
-			m.mu.Lock()
-			for k, v := range m.pendingOps {
-				if v == setInfo {
-					mrfOperations = append(mrfOperations, k)
-				}
-			}
-			m.mu.Unlock()
-
-			if len(mrfOperations) == 0 {
-				continue
+		case u, ok := <-m.opCh:
+			if !ok {
+				return
 			}
 
-			m.mu.Lock()
-			m.triggeredAt = time.Now().UTC()
-			m.mu.Unlock()
-
-			// Heal objects
-			for _, u := range mrfOperations {
-				_, err := m.objectAPI.HealObject(m.ctx, u.bucket, u.object, u.versionID, mrfHealingOpts)
-				m.mu.Lock()
-				if err == nil {
-					m.itemsHealed++
-					m.bytesHealed += uint64(u.size)
+			// We might land at .metacache, .trash, .multipart
+			// no need to heal them skip, only when bucket
+			// is '.minio.sys'
+			if u.Bucket == minioMetaBucket {
+				// No MRF needed for temporary objects
+				if wildcard.Match("buckets/*/.metacache/*", u.Object) {
+					continue
 				}
-				m.pendingItems--
-				m.pendingBytes -= uint64(u.size)
-				delete(m.pendingOps, u)
-				m.mu.Unlock()
-
-				if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-					// Log healing error if any
-					logger.LogIf(m.ctx, err)
+				if wildcard.Match("tmp/*", u.Object) {
+					continue
+				}
+				if wildcard.Match("multipart/*", u.Object) {
+					continue
+				}
+				if wildcard.Match("tmp-old/*", u.Object) {
+					continue
 				}
 			}
 
-			waitForLowHTTPReq()
+			now := time.Now()
+			if now.Sub(u.Queued) < time.Second {
+				// let recently failed networks to reconnect
+				// making MRF wait for 1s before retrying,
+				// i.e 4 reconnect attempts.
+				time.Sleep(time.Second)
+			}
+
+			// wait on timer per heal
+			wait := healSleeper.Timer(context.Background())
+
+			scan := madmin.HealNormalScan
+			if u.BitrotScan {
+				scan = madmin.HealDeepScan
+			}
+
+			if u.Object == "" {
+				healBucket(u.Bucket, scan)
+			} else {
+				if len(u.Versions) > 0 {
+					vers := len(u.Versions) / 16
+					if vers > 0 {
+						for i := 0; i < vers; i++ {
+							healObject(u.Bucket, u.Object, uuid.UUID(u.Versions[16*i:]).String(), scan)
+						}
+					}
+				} else {
+					healObject(u.Bucket, u.Object, u.VersionID, scan)
+				}
+			}
+
+			wait()
 		}
 	}
-}
-
-// Initialize healing MRF
-func initHealMRF(ctx context.Context, obj ObjectLayer) {
-	globalMRFState.init(ctx, obj)
 }

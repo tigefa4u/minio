@@ -26,19 +26,18 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/gorilla/mux"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
 	cfgldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
-	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
-	"github.com/minio/pkg/ldap"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/ldap"
+	"github.com/minio/pkg/v3/policy"
 )
 
-func (a adminAPIHandlers) addOrUpdateIDPHandler(ctx context.Context, w http.ResponseWriter, r *http.Request, isUpdate bool) {
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+func addOrUpdateIDPHandler(ctx context.Context, w http.ResponseWriter, r *http.Request, isUpdate bool) {
+	objectAPI, cred := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -60,7 +59,7 @@ func (a adminAPIHandlers) addOrUpdateIDPHandler(ctx context.Context, w http.Resp
 	password := cred.SecretKey
 	reqBytes, err := madmin.DecryptData(password, io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
-		logger.LogIf(ctx, err, logger.Application)
+		adminLogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), r.URL)
 		return
 	}
@@ -86,7 +85,7 @@ func (a adminAPIHandlers) addOrUpdateIDPHandler(ctx context.Context, w http.Resp
 		if idpCfgType == madmin.LDAPIDPCfg && cfgName != madmin.Default {
 			// LDAP does not support multiple configurations. So cfgName must be
 			// empty or `madmin.Default`.
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrBadRequest), r.URL)
+			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigLDAPNonDefaultConfigName), r.URL)
 			return
 		}
 	}
@@ -121,11 +120,11 @@ func (a adminAPIHandlers) addOrUpdateIDPHandler(ctx context.Context, w http.Resp
 
 	// IDP config is not dynamic. Sanity check.
 	if dynamic {
-		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInternalError), err.Error(), r.URL)
+		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInternalError), "", r.URL)
 		return
 	}
 
-	if err = validateConfig(cfg, subSys); err != nil {
+	if err = validateConfig(ctx, cfg, subSys); err != nil {
 
 		var validationErr ldap.Validation
 		if errors.As(err, &validationErr) {
@@ -178,9 +177,9 @@ func handleCreateUpdateValidation(s config.Config, subSys, cfgTarget string, isU
 	var cfgInfos []madmin.IDPCfgInfo
 	switch subSys {
 	case madmin.IdentityOpenIDSubSys:
-		cfgInfos, _ = globalOpenIDConfig.GetConfigInfo(s, cfgTarget)
+		cfgInfos, _ = globalIAMSys.OpenIDConfig.GetConfigInfo(s, cfgTarget)
 	case madmin.IdentityLDAPSubSys:
-		cfgInfos, _ = globalLDAPConfig.GetConfigInfo(s, cfgTarget)
+		cfgInfos, _ = globalIAMSys.LDAPConfig.GetConfigInfo(s, cfgTarget)
 	}
 
 	if len(cfgInfos) > 0 && !isUpdate {
@@ -198,32 +197,29 @@ func handleCreateUpdateValidation(s config.Config, subSys, cfgTarget string, isU
 //
 // PUT <admin-prefix>/idp-cfg/openid/_ -> create (default) named config `_`
 func (a adminAPIHandlers) AddIdentityProviderCfg(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "AddIdentityProviderCfg")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	a.addOrUpdateIDPHandler(ctx, w, r, false)
+	addOrUpdateIDPHandler(ctx, w, r, false)
 }
 
 // UpdateIdentityProviderCfg: updates an existing IDP config for openid/ldap.
 //
-// PATCH <admin-prefix>/idp-cfg/openid/dex1 -> update named config `dex1`
+// POST <admin-prefix>/idp-cfg/openid/dex1 -> update named config `dex1`
 //
-// PATCH <admin-prefix>/idp-cfg/openid/_ -> update (default) named config `_`
+// POST <admin-prefix>/idp-cfg/openid/_ -> update (default) named config `_`
 func (a adminAPIHandlers) UpdateIdentityProviderCfg(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "UpdateIdentityProviderCfg")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	a.addOrUpdateIDPHandler(ctx, w, r, true)
+	addOrUpdateIDPHandler(ctx, w, r, true)
 }
 
 // ListIdentityProviderCfg:
 //
 // GET <admin-prefix>/idp-cfg/openid -> lists openid provider configs.
 func (a adminAPIHandlers) ListIdentityProviderCfg(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListIdentityProviderCfg")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, cred := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -240,10 +236,10 @@ func (a adminAPIHandlers) ListIdentityProviderCfg(w http.ResponseWriter, r *http
 	switch idpCfgType {
 	case madmin.OpenidIDPCfg:
 		cfg := globalServerConfig.Clone()
-		cfgList, err = globalOpenIDConfig.GetConfigList(cfg)
+		cfgList, err = globalIAMSys.OpenIDConfig.GetConfigList(cfg)
 	case madmin.LDAPIDPCfg:
 		cfg := globalServerConfig.Clone()
-		cfgList, err = globalLDAPConfig.GetConfigList(cfg)
+		cfgList, err = globalIAMSys.LDAPConfig.GetConfigList(cfg)
 
 	default:
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
@@ -274,10 +270,9 @@ func (a adminAPIHandlers) ListIdentityProviderCfg(w http.ResponseWriter, r *http
 //
 // GET <admin-prefix>/idp-cfg/openid/dex_test
 func (a adminAPIHandlers) GetIdentityProviderCfg(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "GetIdentityProviderCfg")
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+	ctx := r.Context()
 
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, cred := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -296,9 +291,9 @@ func (a adminAPIHandlers) GetIdentityProviderCfg(w http.ResponseWriter, r *http.
 	var err error
 	switch idpCfgType {
 	case madmin.OpenidIDPCfg:
-		cfgInfos, err = globalOpenIDConfig.GetConfigInfo(cfg, cfgName)
+		cfgInfos, err = globalIAMSys.OpenIDConfig.GetConfigInfo(cfg, cfgName)
 	case madmin.LDAPIDPCfg:
-		cfgInfos, err = globalLDAPConfig.GetConfigInfo(cfg, cfgName)
+		cfgInfos, err = globalIAMSys.LDAPConfig.GetConfigInfo(cfg, cfgName)
 	}
 	if err != nil {
 		if errors.Is(err, openid.ErrProviderConfigNotFound) || errors.Is(err, cfgldap.ErrProviderConfigNotFound) {
@@ -334,11 +329,9 @@ func (a adminAPIHandlers) GetIdentityProviderCfg(w http.ResponseWriter, r *http.
 //
 // DELETE <admin-prefix>/idp-cfg/openid/dex_test
 func (a adminAPIHandlers) DeleteIdentityProviderCfg(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "DeleteIdentityProviderCfg")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -355,7 +348,7 @@ func (a adminAPIHandlers) DeleteIdentityProviderCfg(w http.ResponseWriter, r *ht
 	switch idpCfgType {
 	case madmin.OpenidIDPCfg:
 		subSys = config.IdentityOpenIDSubSys
-		cfgInfos, err := globalOpenIDConfig.GetConfigInfo(cfgCopy, cfgName)
+		cfgInfos, err := globalIAMSys.OpenIDConfig.GetConfigInfo(cfgCopy, cfgName)
 		if err != nil {
 			if errors.Is(err, openid.ErrProviderConfigNotFound) {
 				writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminNoSuchConfigTarget), r.URL)
@@ -380,7 +373,7 @@ func (a adminAPIHandlers) DeleteIdentityProviderCfg(w http.ResponseWriter, r *ht
 		}
 	case madmin.LDAPIDPCfg:
 		subSys = config.IdentityLDAPSubSys
-		cfgInfos, err := globalLDAPConfig.GetConfigInfo(cfgCopy, cfgName)
+		cfgInfos, err := globalIAMSys.LDAPConfig.GetConfigInfo(cfgCopy, cfgName)
 		if err != nil {
 			if errors.Is(err, openid.ErrProviderConfigNotFound) {
 				writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminNoSuchConfigTarget), r.URL)
@@ -422,7 +415,17 @@ func (a adminAPIHandlers) DeleteIdentityProviderCfg(w http.ResponseWriter, r *ht
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
-	if err = validateConfig(cfg, subSys); err != nil {
+	if err = validateConfig(ctx, cfg, subSys); err != nil {
+
+		var validationErr ldap.Validation
+		if errors.As(err, &validationErr) {
+			// If we got an LDAP validation error, we need to send appropriate
+			// error message back to client (likely mc).
+			writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigLDAPValidation),
+				validationErr.FormatError(), r.URL)
+			return
+		}
+
 		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
 		return
 	}

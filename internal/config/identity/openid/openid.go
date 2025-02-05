@@ -29,15 +29,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/arn"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/identity/openid/provider"
 	"github.com/minio/minio/internal/hash/sha256"
-	iampolicy "github.com/minio/pkg/iam/policy"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // OpenID keys and envs.
@@ -89,7 +90,7 @@ var (
 		},
 		config.KV{
 			Key:   ClaimName,
-			Value: iampolicy.PolicyName,
+			Value: policy.PolicyName,
 		},
 		config.KV{
 			Key:   ClaimUserinfo,
@@ -100,12 +101,14 @@ var (
 			Value: "",
 		},
 		config.KV{
-			Key:   ClaimPrefix,
-			Value: "",
+			Key:           ClaimPrefix,
+			Value:         "",
+			HiddenIfEmpty: true,
 		},
 		config.KV{
-			Key:   RedirectURI,
-			Value: "",
+			Key:           RedirectURI,
+			Value:         "",
+			HiddenIfEmpty: true,
 		},
 		config.KV{
 			Key:   RedirectURIDynamic,
@@ -230,7 +233,7 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		getCfgVal := func(cfgParam string) string {
 			// As parameters are already validated, we skip checking
 			// if the config param was found.
-			val, _ := s.ResolveConfigParam(config.IdentityOpenIDSubSys, cfgName, cfgParam)
+			val, _, _ := s.ResolveConfigParam(config.IdentityOpenIDSubSys, cfgName, cfgParam, false)
 			return val
 		}
 
@@ -243,11 +246,8 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		// parameters are non-empty.
 		var (
 			cfgEnableVal        = getCfgVal(config.Enable)
-			isExplicitlyEnabled = false
+			isExplicitlyEnabled = cfgEnableVal != ""
 		)
-		if cfgEnableVal != "" {
-			isExplicitlyEnabled = true
-		}
 
 		var enabled bool
 		if isExplicitlyEnabled {
@@ -310,9 +310,9 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		}
 
 		// Check if claim name is the non-default value and role policy is set.
-		if p.ClaimName != iampolicy.PolicyName && p.RolePolicy != "" {
+		if p.ClaimName != policy.PolicyName && p.RolePolicy != "" {
 			// In the unlikely event that the user specifies
-			// `iampolicy.PolicyName` as the claim name explicitly and sets
+			// `policy.PolicyName` as the claim name explicitly and sets
 			// a role policy, this check is thwarted, but we will be using
 			// the role policy anyway.
 			return c, config.Errorf("Role Policy (=`%s`) and Claim Name (=`%s`) cannot both be set", p.RolePolicy, p.ClaimName)
@@ -416,24 +416,28 @@ func (r *Config) GetConfigInfo(s config.Config, cfgName string) ([]madmin.IDPCfg
 		return nil, ErrProviderConfigNotFound
 	}
 
-	kvsrcs, err := s.GetResolvedConfigParams(config.IdentityOpenIDSubSys, cfgName)
+	kvsrcs, err := s.GetResolvedConfigParams(config.IdentityOpenIDSubSys, cfgName, true)
 	if err != nil {
 		return nil, err
 	}
 
 	res := make([]madmin.IDPCfgInfo, 0, len(kvsrcs)+1)
 	for _, kvsrc := range kvsrcs {
-		// skip default values.
+		// skip returning default config values.
 		if kvsrc.Src == config.ValueSourceDef {
 			if kvsrc.Key != madmin.EnableKey {
 				continue
 			}
-			// set an explicit on/off from live configuration.
-			kvsrc.Value = "off"
-			if _, ok := r.ProviderCfgs[cfgName]; ok {
-				if r.Enabled {
-					kvsrc.Value = "on"
-				}
+			// for EnableKey we set an explicit on/off from live configuration
+			// if it is present.
+			if _, ok := r.ProviderCfgs[cfgName]; !ok {
+				// No live config is present
+				continue
+			}
+			if r.Enabled {
+				kvsrc.Value = "on"
+			} else {
+				kvsrc.Value = "off"
 			}
 		}
 		res = append(res, madmin.IDPCfgInfo{
@@ -507,13 +511,11 @@ func (r *Config) GetSettings() madmin.OpenIDSettings {
 		return res
 	}
 	h := sha256.New()
+	hashedSecret := ""
 	for arn, provCfg := range r.arnProviderCfgsMap {
-		hashedSecret := ""
-		{
-			h.Reset()
-			h.Write([]byte(provCfg.ClientSecret))
-			hashedSecret = base64.RawURLEncoding.EncodeToString(h.Sum(nil))
-		}
+		h.Write([]byte(provCfg.ClientSecret))
+		hashedSecret = base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+		h.Reset()
 		if arn != DummyRoleARN {
 			if res.Roles == nil {
 				res.Roles = make(map[string]madmin.OpenIDProviderSettings)
@@ -598,8 +600,12 @@ func (r Config) GetRoleInfo() map[arn.ARN]string {
 
 // GetDefaultExpiration - returns the expiration seconds expected.
 func GetDefaultExpiration(dsecs string) (time.Duration, error) {
-	defaultExpiryDuration := time.Duration(60) * time.Minute // Defaults to 1hr.
-	if dsecs != "" {
+	timeout := env.Get(config.EnvMinioStsDuration, "")
+	defaultExpiryDuration, err := time.ParseDuration(timeout)
+	if err != nil {
+		defaultExpiryDuration = time.Hour
+	}
+	if timeout == "" && dsecs != "" {
 		expirySecs, err := strconv.ParseInt(dsecs, 10, 64)
 		if err != nil {
 			return 0, auth.ErrInvalidDuration
@@ -608,11 +614,18 @@ func GetDefaultExpiration(dsecs string) (time.Duration, error) {
 		// The duration, in seconds, of the role session.
 		// The value can range from 900 seconds (15 minutes)
 		// up to 365 days.
-		if expirySecs < 900 || expirySecs > 31536000 {
+		if expirySecs < config.MinExpiration || expirySecs > config.MaxExpiration {
 			return 0, auth.ErrInvalidDuration
 		}
 
 		defaultExpiryDuration = time.Duration(expirySecs) * time.Second
+	} else if timeout == "" && dsecs == "" {
+		return time.Hour, nil
 	}
+
+	if defaultExpiryDuration.Seconds() < config.MinExpiration || defaultExpiryDuration.Seconds() > config.MaxExpiration {
+		return 0, auth.ErrInvalidDuration
+	}
+
 	return defaultExpiryDuration, nil
 }

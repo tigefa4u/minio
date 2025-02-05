@@ -20,8 +20,10 @@ package cmd
 import (
 	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 )
+
+//go:generate msgp -file=$GOFILE -unexported
 
 type lastDayTierStats struct {
 	Bins      [24]tierStats
@@ -101,9 +103,8 @@ func (l DailyAllTierStats) merge(m DailyAllTierStats) {
 
 func (l DailyAllTierStats) addToTierInfo(tierInfos []madmin.TierInfo) []madmin.TierInfo {
 	for i := range tierInfos {
-		var lst lastDayTierStats
-		var ok bool
-		if lst, ok = l[tierInfos[i].Name]; !ok {
+		lst, ok := l[tierInfos[i].Name]
+		if !ok {
 			continue
 		}
 		for hr, st := range lst.Bins {

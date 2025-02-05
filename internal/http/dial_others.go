@@ -30,18 +30,17 @@ import (
 // TODO: if possible implement for non-linux platforms, not a priority at the moment
 //
 //nolint:unused
-func setTCPParameters(string, string, syscall.RawConn) error {
-	return nil
+func setTCPParametersFn(opts TCPOptions) func(network, address string, c syscall.RawConn) error {
+	return func(network, address string, c syscall.RawConn) error {
+		return nil
+	}
 }
 
 // DialContext is a function to make custom Dial for internode communications
 type DialContext func(ctx context.Context, network, address string) (net.Conn, error)
 
-// NewInternodeDialContext setups a custom dialer for internode communication
-var NewInternodeDialContext = NewCustomDialContext
-
-// NewCustomDialContext configures a custom dialer for internode communications
-func NewCustomDialContext(dialTimeout time.Duration) DialContext {
+// NewInternodeDialContext configures a custom dialer for internode communications
+func NewInternodeDialContext(dialTimeout time.Duration, _ TCPOptions) DialContext {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		dialer := &net.Dialer{
 			Timeout: dialTimeout,

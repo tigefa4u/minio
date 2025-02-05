@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -19,24 +19,18 @@ package api
 
 import "github.com/minio/minio/internal/config"
 
-// Help template for storageclass feature.
 var (
 	defaultHelpPostfix = func(key string) string {
 		return config.DefaultHelpPostfix(DefaultKVS, key)
 	}
 
+	// Help holds configuration keys and their default values for api subsystem.
 	Help = config.HelpKVS{
 		config.HelpKV{
 			Key:         apiRequestsMax,
-			Description: `set the maximum number of concurrent requests` + defaultHelpPostfix(apiRequestsMax),
+			Description: `set the maximum number of concurrent requests (default: auto)`,
 			Optional:    true,
 			Type:        "number",
-		},
-		config.HelpKV{
-			Key:         apiRequestsDeadline,
-			Description: `set the deadline for API requests waiting to be processed` + defaultHelpPostfix(apiRequestsDeadline),
-			Optional:    true,
-			Type:        "duration",
 		},
 		config.HelpKV{
 			Key:         apiClusterDeadline,
@@ -58,7 +52,7 @@ var (
 		},
 		config.HelpKV{
 			Key:         apiListQuorum,
-			Description: `set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict"` + defaultHelpPostfix(apiListQuorum),
+			Description: `set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict", "auto"` + defaultHelpPostfix(apiListQuorum),
 			Optional:    true,
 			Type:        "string",
 		},
@@ -67,6 +61,12 @@ var (
 			Description: `set replication priority` + defaultHelpPostfix(apiReplicationPriority),
 			Optional:    true,
 			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         apiReplicationMaxWorkers,
+			Description: `set the maximum number of replication workers` + defaultHelpPostfix(apiReplicationMaxWorkers),
+			Optional:    true,
+			Type:        "number",
 		},
 		config.HelpKV{
 			Key:         apiTransitionWorkers,
@@ -93,10 +93,28 @@ var (
 			Type:        "duration",
 		},
 		config.HelpKV{
-			Key:         apiDisableODirect,
-			Description: "set to disable O_DIRECT for reads under special conditions. NOTE: it is not recommended to disable O_DIRECT without prior testing." + defaultHelpPostfix(apiDisableODirect),
+			Key:         apiODirect,
+			Description: "set to enable or disable O_DIRECT for writes under special conditions. NOTE: do not disable O_DIRECT without prior testing" + defaultHelpPostfix(apiODirect),
 			Optional:    true,
 			Type:        "boolean",
+		},
+		config.HelpKV{
+			Key:         apiRootAccess,
+			Description: "turn 'off' root credential access for all API calls including s3, admin operations" + defaultHelpPostfix(apiRootAccess),
+			Optional:    true,
+			Type:        "boolean",
+		},
+		config.HelpKV{
+			Key:         apiSyncEvents,
+			Description: "set to enable synchronous bucket notifications" + defaultHelpPostfix(apiSyncEvents),
+			Optional:    true,
+			Type:        "boolean",
+		},
+		config.HelpKV{
+			Key:         apiObjectMaxVersions,
+			Description: "set max allowed number of versions per object" + defaultHelpPostfix(apiObjectMaxVersions),
+			Optional:    true,
+			Type:        "number",
 		},
 	}
 )

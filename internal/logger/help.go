@@ -25,13 +25,6 @@ import (
 var (
 	Help = config.HelpKVS{
 		config.HelpKV{
-			Key:         config.Enable,
-			Description: "set to 'on' to enable the logger webhook",
-			Optional:    true,
-			Type:        "on|off",
-			Sensitive:   false,
-		},
-		config.HelpKV{
 			Key:         Endpoint,
 			Description: `HTTP(s) endpoint e.g. "http://localhost:8080/minio/logs/server"`,
 			Type:        "url",
@@ -43,26 +36,63 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         ClientCert,
-			Description: "mTLS certificate for Logger Webhook authentication",
+			Description: "mTLS certificate for webhook authentication",
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
 		},
 		config.HelpKV{
 			Key:         ClientKey,
-			Description: "mTLS certificate key for Logger Webhook authentication",
+			Description: "mTLS certificate key for webhook authentication",
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
 		},
 		config.HelpKV{
-			Key:         QueueSize,
-			Description: "configure channel queue size for Logger Webhook targets",
+			Key:         BatchSize,
+			Description: "Number of events per HTTP send to webhook target",
 			Optional:    true,
 			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         QueueSize,
+			Description: "configure channel queue size for webhook targets",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         QueueDir,
+			Description: `staging dir for undelivered logger messages e.g. '/home/logger-events'`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         Proxy,
+			Description: "proxy url endpoint e.g. http(s)://proxy",
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         MaxRetry,
+			Description: `maximum retry count before we start dropping logged event(s)`,
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         RetryInterval,
+			Description: `sleep between each retries, allowed maximum value is '1m' e.g. '10s'`,
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
+			Key:         httpTimeout,
+			Description: `defines the maximum duration for each http request`,
+			Optional:    true,
+			Type:        "duration",
 		},
 		config.HelpKV{
 			Key:         config.Comment,
@@ -73,13 +103,6 @@ var (
 	}
 
 	HelpWebhook = config.HelpKVS{
-		config.HelpKV{
-			Key:         config.Enable,
-			Description: "set to 'on' to enable the audit logger",
-			Optional:    true,
-			Type:        "on|off",
-			Sensitive:   false,
-		},
 		config.HelpKV{
 			Key:         Endpoint,
 			Description: `HTTP(s) endpoint e.g. "http://localhost:8080/minio/logs/audit"`,
@@ -92,26 +115,57 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         ClientCert,
-			Description: "mTLS certificate for Audit Webhook authentication",
+			Description: "mTLS certificate for webhook authentication",
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
 		},
 		config.HelpKV{
 			Key:         ClientKey,
-			Description: "mTLS certificate key for Audit Webhook authentication",
+			Description: "mTLS certificate key for webhook authentication",
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
 		},
 		config.HelpKV{
-			Key:         QueueSize,
-			Description: "configure channel queue size for Audit Webhook targets",
+			Key:         BatchSize,
+			Description: "Number of events per HTTP send to webhook target",
 			Optional:    true,
 			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         QueueSize,
+			Description: "configure channel queue size for webhook targets",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         QueueDir,
+			Description: `staging dir for undelivered audit messages e.g. '/home/audit-events'`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         MaxRetry,
+			Description: `maximum retry count before we start dropping audit event(s)`,
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         RetryInterval,
+			Description: `sleep between each retries, allowed maximum value is '1m' e.g. '10s'`,
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
+			Key:         httpTimeout,
+			Description: `defines the maximum duration for each http request`,
+			Optional:    true,
+			Type:        "duration",
 		},
 		config.HelpKV{
 			Key:         config.Comment,
@@ -122,13 +176,6 @@ var (
 	}
 
 	HelpKafka = config.HelpKVS{
-		config.HelpKV{
-			Key:         config.Enable,
-			Description: "set to 'on' to enable kafka audit logging",
-			Optional:    true,
-			Type:        "on|off",
-			Sensitive:   false,
-		},
 		config.HelpKV{
 			Key:         KafkaBrokers,
 			Description: "comma separated list of Kafka broker addresses",
@@ -153,6 +200,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         KafkaSASLMechanism,
@@ -201,6 +249,18 @@ var (
 		config.HelpKV{
 			Key:         KafkaVersion,
 			Description: "specify the version of the Kafka cluster",
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         QueueSize,
+			Description: "configure channel queue size for Kafka targets",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         QueueDir,
+			Description: `staging dir for undelivered audit messages to Kafka e.g. '/home/audit-events'`,
 			Optional:    true,
 			Type:        "string",
 		},

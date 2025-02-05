@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -53,13 +54,26 @@ const (
 
 	// Total length of the alpha numeric table.
 	alphaNumericTableLen = byte(len(alphaNumericTable))
+
+	reservedChars = "=,"
 )
 
 // Common errors generated for access and secret key validation.
 var (
-	ErrInvalidAccessKeyLength = fmt.Errorf("access key length should be between %d and %d", accessKeyMinLen, accessKeyMaxLen)
-	ErrInvalidSecretKeyLength = fmt.Errorf("secret key length should be between %d and %d", secretKeyMinLen, secretKeyMaxLen)
+	ErrInvalidAccessKeyLength   = fmt.Errorf("access key length should be between %d and %d", accessKeyMinLen, accessKeyMaxLen)
+	ErrInvalidSecretKeyLength   = fmt.Errorf("secret key length should be between %d and %d", secretKeyMinLen, secretKeyMaxLen)
+	ErrNoAccessKeyWithSecretKey = fmt.Errorf("access key must be specified if secret key is specified")
+	ErrNoSecretKeyWithAccessKey = fmt.Errorf("secret key must be specified if access key is specified")
+	ErrContainsReservedChars    = fmt.Errorf("access key contains one of reserved characters '=' or ','")
 )
+
+// AnonymousCredentials simply points to empty credentials
+var AnonymousCredentials = Credentials{}
+
+// ContainsReservedChars - returns whether the input string contains reserved characters.
+func ContainsReservedChars(s string) bool {
+	return strings.ContainsAny(s, reservedChars)
+}
 
 // IsAccessKeyValid - validate access key for right length.
 func IsAccessKeyValid(accessKey string) bool {
@@ -85,6 +99,9 @@ var (
 	}
 )
 
+// claim key found in credentials which are service accounts
+const iamPolicyClaimNameSA = "sa-policy"
+
 const (
 	// AccountOn indicates that credentials are enabled
 	AccountOn = "on"
@@ -102,7 +119,13 @@ type Credentials struct {
 	ParentUser   string                 `xml:"-" json:"parentUser,omitempty"`
 	Groups       []string               `xml:"-" json:"groups,omitempty"`
 	Claims       map[string]interface{} `xml:"-" json:"claims,omitempty"`
-	Comment      string                 `xml:"-" json:"comment,omitempty"`
+	Name         string                 `xml:"-" json:"name,omitempty"`
+	Description  string                 `xml:"-" json:"description,omitempty"`
+
+	// Deprecated: In favor of Description - when reading credentials from
+	// storage the value of this field is placed in the Description field above
+	// if the existing Description from storage is empty.
+	Comment string `xml:"-" json:"comment,omitempty"`
 }
 
 func (cred Credentials) String() string {
@@ -137,7 +160,16 @@ func (cred Credentials) IsTemp() bool {
 
 // IsServiceAccount - returns whether credential is a service account or not
 func (cred Credentials) IsServiceAccount() bool {
-	return cred.ParentUser != "" && (cred.Expiration.IsZero() || cred.Expiration.Equal(timeSentinel))
+	_, ok := cred.Claims[iamPolicyClaimNameSA]
+	return cred.ParentUser != "" && ok
+}
+
+// IsImpliedPolicy - returns if the policy is implied via ParentUser or not.
+func (cred Credentials) IsImpliedPolicy() bool {
+	if cred.IsServiceAccount() {
+		return cred.Claims[iamPolicyClaimNameSA] == "inherited-policy"
+	}
+	return false
 }
 
 // IsValid - returns whether credential is valid or not.
@@ -196,37 +228,68 @@ func ExpToInt64(expI interface{}) (expAt int64, err error) {
 // GenerateCredentials - creates randomly generated credentials of maximum
 // allowed length.
 func GenerateCredentials() (accessKey, secretKey string, err error) {
-	readBytes := func(size int) (data []byte, err error) {
-		data = make([]byte, size)
-		var n int
-		if n, err = rand.Read(data); err != nil {
-			return nil, err
-		} else if n != size {
-			return nil, fmt.Errorf("Not enough data. Expected to read: %v bytes, got: %v bytes", size, n)
-		}
-		return data, nil
-	}
-
-	// Generate access key.
-	keyBytes, err := readBytes(accessKeyMaxLen)
+	accessKey, err = GenerateAccessKey(accessKeyMaxLen, rand.Reader)
 	if err != nil {
 		return "", "", err
 	}
-	for i := 0; i < accessKeyMaxLen; i++ {
-		keyBytes[i] = alphaNumericTable[keyBytes[i]%alphaNumericTableLen]
-	}
-	accessKey = string(keyBytes)
-
-	// Generate secret key.
-	keyBytes, err = readBytes(secretKeyMaxLen)
+	secretKey, err = GenerateSecretKey(secretKeyMaxLen, rand.Reader)
 	if err != nil {
 		return "", "", err
 	}
-
-	secretKey = strings.ReplaceAll(string([]byte(base64.StdEncoding.EncodeToString(keyBytes))[:secretKeyMaxLen]),
-		"/", "+")
-
 	return accessKey, secretKey, nil
+}
+
+// GenerateAccessKey returns a new access key generated randomly using
+// the given io.Reader. If random is nil, crypto/rand.Reader is used.
+// If length <= 0, the access key length is chosen automatically.
+//
+// GenerateAccessKey returns an error if length is too small for a valid
+// access key.
+func GenerateAccessKey(length int, random io.Reader) (string, error) {
+	if random == nil {
+		random = rand.Reader
+	}
+	if length <= 0 {
+		length = accessKeyMaxLen
+	}
+	if length < accessKeyMinLen {
+		return "", errors.New("auth: access key length is too short")
+	}
+
+	key := make([]byte, length)
+	if _, err := io.ReadFull(random, key); err != nil {
+		return "", err
+	}
+	for i := range key {
+		key[i] = alphaNumericTable[key[i]%alphaNumericTableLen]
+	}
+	return string(key), nil
+}
+
+// GenerateSecretKey returns a new secret key generated randomly using
+// the given io.Reader. If random is nil, crypto/rand.Reader is used.
+// If length <= 0, the secret key length is chosen automatically.
+//
+// GenerateSecretKey returns an error if length is too small for a valid
+// secret key.
+func GenerateSecretKey(length int, random io.Reader) (string, error) {
+	if random == nil {
+		random = rand.Reader
+	}
+	if length <= 0 {
+		length = secretKeyMaxLen
+	}
+	if length < secretKeyMinLen {
+		return "", errors.New("auth: secret key length is too short")
+	}
+
+	key := make([]byte, base64.RawStdEncoding.DecodedLen(length))
+	if _, err := io.ReadFull(random, key); err != nil {
+		return "", err
+	}
+
+	s := base64.RawStdEncoding.EncodeToString(key)
+	return strings.ReplaceAll(s, "/", "+"), nil
 }
 
 // GetNewCredentialsWithMetadata generates and returns new credential with expiry.

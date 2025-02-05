@@ -19,20 +19,32 @@ package hash
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"hash"
 	"hash/crc32"
+	"hash/crc64"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/logger"
 )
+
+func hashLogIf(ctx context.Context, err error) {
+	logger.LogIf(ctx, "hash", err)
+}
 
 // MinIOMultipartChecksum is as metadata on multipart uploads to indicate checksum type.
 const MinIOMultipartChecksum = "x-minio-multipart-checksum"
+
+// MinIOMultipartChecksumType is as metadata on multipart uploads to indicate checksum type.
+const MinIOMultipartChecksumType = "x-minio-multipart-checksum-type"
 
 // ChecksumType contains information about the checksum type.
 type ChecksumType uint32
@@ -53,16 +65,31 @@ const (
 	ChecksumCRC32C
 	// ChecksumInvalid indicates an invalid checksum.
 	ChecksumInvalid
+	// ChecksumMultipart indicates the checksum is from a multipart upload.
+	ChecksumMultipart
+	// ChecksumIncludesMultipart indicates the checksum also contains part checksums.
+	ChecksumIncludesMultipart
+	// ChecksumCRC64NVME indicates CRC64 with 0xad93d23594c93659 polynomial.
+	ChecksumCRC64NVME
+	// ChecksumFullObject indicates the checksum is of the full object,
+	// not checksum of checksums. Should only be set on ChecksumMultipart
+	ChecksumFullObject
 
 	// ChecksumNone indicates no checksum.
 	ChecksumNone ChecksumType = 0
+
+	baseTypeMask = ChecksumSHA256 | ChecksumSHA1 | ChecksumCRC32 | ChecksumCRC32C | ChecksumCRC64NVME
 )
+
+// BaseChecksumTypes is a list of all the base checksum types.
+var BaseChecksumTypes = []ChecksumType{ChecksumSHA256, ChecksumSHA1, ChecksumCRC32, ChecksumCRC64NVME, ChecksumCRC32C}
 
 // Checksum is a type and base 64 encoded value.
 type Checksum struct {
-	Type    ChecksumType
-	Encoded string
-	Raw     []byte
+	Type      ChecksumType
+	Encoded   string
+	Raw       []byte
+	WantParts int
 }
 
 // Is returns if c is all of t.
@@ -71,6 +98,11 @@ func (c ChecksumType) Is(t ChecksumType) bool {
 		return c == ChecksumNone
 	}
 	return c&t == t
+}
+
+// Base returns the base checksum (if any)
+func (c ChecksumType) Base() ChecksumType {
+	return c & baseTypeMask
 }
 
 // Key returns the header key.
@@ -85,6 +117,8 @@ func (c ChecksumType) Key() string {
 		return xhttp.AmzChecksumSHA1
 	case c.Is(ChecksumSHA256):
 		return xhttp.AmzChecksumSHA256
+	case c.Is(ChecksumCRC64NVME):
+		return xhttp.AmzChecksumCRC64NVME
 	}
 	return ""
 }
@@ -100,30 +134,54 @@ func (c ChecksumType) RawByteLen() int {
 		return sha1.Size
 	case c.Is(ChecksumSHA256):
 		return sha256.Size
+	case c.Is(ChecksumCRC64NVME):
+		return crc64.Size
 	}
 	return 0
 }
 
 // IsSet returns whether the type is valid and known.
 func (c ChecksumType) IsSet() bool {
-	return !c.Is(ChecksumInvalid) && !c.Is(ChecksumNone)
+	return !c.Is(ChecksumInvalid) && !c.Base().Is(ChecksumNone)
 }
 
-// NewChecksumType returns a checksum type based on the algorithm string.
-func NewChecksumType(alg string) ChecksumType {
+// NewChecksumType returns a checksum type based on the algorithm string and obj type.
+func NewChecksumType(alg, objType string) ChecksumType {
+	full := ChecksumFullObject
+	if objType != xhttp.AmzChecksumTypeFullObject {
+		full = 0
+	}
+
 	switch strings.ToUpper(alg) {
 	case "CRC32":
-		return ChecksumCRC32
+		return ChecksumCRC32 | full
 	case "CRC32C":
-		return ChecksumCRC32C
+		return ChecksumCRC32C | full
 	case "SHA1":
+		if full != 0 {
+			return ChecksumInvalid
+		}
 		return ChecksumSHA1
 	case "SHA256":
+		if full != 0 {
+			return ChecksumInvalid
+		}
 		return ChecksumSHA256
+	case "CRC64NVME":
+		// AWS seems to ignore full value, and just assume it.
+		return ChecksumCRC64NVME
 	case "":
+		if full != 0 {
+			return ChecksumInvalid
+		}
 		return ChecksumNone
 	}
 	return ChecksumInvalid
+}
+
+// NewChecksumHeader returns a checksum type based on the algorithm string.
+func NewChecksumHeader(h http.Header) ChecksumType {
+	return NewChecksumType(h.Get(xhttp.AmzChecksumAlgo), h.Get(xhttp.AmzChecksumType))
 }
 
 // String returns the type as a string.
@@ -137,10 +195,33 @@ func (c ChecksumType) String() string {
 		return "SHA1"
 	case c.Is(ChecksumSHA256):
 		return "SHA256"
+	case c.Is(ChecksumCRC64NVME):
+		return "CRC64NVME"
 	case c.Is(ChecksumNone):
 		return ""
 	}
 	return "invalid"
+}
+
+// FullObjectRequested will return if the checksum type indicates full object checksum was requested.
+func (c ChecksumType) FullObjectRequested() bool {
+	return c&(ChecksumFullObject) == ChecksumFullObject || c.Is(ChecksumCRC64NVME)
+}
+
+// ObjType returns a string to return as x-amz-checksum-type.
+func (c ChecksumType) ObjType() string {
+	if c.FullObjectRequested() {
+		return xhttp.AmzChecksumTypeFullObject
+	}
+	if c.IsSet() {
+		return xhttp.AmzChecksumTypeComposite
+	}
+	return ""
+}
+
+// CanMerge will return if the checksum type indicates that checksums can be merged.
+func (c ChecksumType) CanMerge() bool {
+	return c.Is(ChecksumCRC64NVME) || c.Is(ChecksumCRC32C) || c.Is(ChecksumCRC32)
 }
 
 // Hasher returns a hasher corresponding to the checksum type.
@@ -155,11 +236,13 @@ func (c ChecksumType) Hasher() hash.Hash {
 		return sha1.New()
 	case c.Is(ChecksumSHA256):
 		return sha256.New()
+	case c.Is(ChecksumCRC64NVME):
+		return crc64.New(crc64Table)
 	}
 	return nil
 }
 
-// Trailing return whether the checksum is traling.
+// Trailing return whether the checksum is trailing.
 func (c ChecksumType) Trailing() bool {
 	return c.Is(ChecksumTrailing)
 }
@@ -180,7 +263,7 @@ func NewChecksumFromData(t ChecksumType, data []byte) *Checksum {
 }
 
 // ReadCheckSums will read checksums from b and return them.
-func ReadCheckSums(b []byte) map[string]string {
+func ReadCheckSums(b []byte, part int) map[string]string {
 	res := make(map[string]string, 1)
 	for len(b) > 0 {
 		t, n := binary.Uvarint(b)
@@ -194,11 +277,89 @@ func ReadCheckSums(b []byte) map[string]string {
 		if length == 0 || len(b) < length {
 			break
 		}
-		res[typ.String()] = base64.StdEncoding.EncodeToString(b[:length])
+		cs := base64.StdEncoding.EncodeToString(b[:length])
 		b = b[length:]
+		if typ.Is(ChecksumMultipart) {
+			t, n := binary.Uvarint(b)
+			if n < 0 {
+				break
+			}
+			if !typ.FullObjectRequested() {
+				cs = fmt.Sprintf("%s-%d", cs, t)
+			} else if part <= 0 {
+				res[xhttp.AmzChecksumType] = xhttp.AmzChecksumTypeFullObject
+			}
+			b = b[n:]
+			if part > 0 {
+				cs = ""
+			}
+			if typ.Is(ChecksumIncludesMultipart) {
+				wantLen := int(t) * length
+				if len(b) < wantLen {
+					break
+				}
+				// Read part checksum
+				if part > 0 && uint64(part) <= t {
+					offset := (part - 1) * length
+					partCs := b[offset:]
+					cs = base64.StdEncoding.EncodeToString(partCs[:length])
+				}
+				b = b[wantLen:]
+			}
+		} else if part > 1 {
+			// For non-multipart, checksum is part 1.
+			cs = ""
+		}
+		if cs != "" {
+			res[typ.String()] = cs
+		}
 	}
 	if len(res) == 0 {
 		res = nil
+	}
+	return res
+}
+
+// ReadPartCheckSums will read all part checksums from b and return them.
+func ReadPartCheckSums(b []byte) (res []map[string]string) {
+	for len(b) > 0 {
+		t, n := binary.Uvarint(b)
+		if n <= 0 {
+			break
+		}
+		b = b[n:]
+
+		typ := ChecksumType(t)
+		length := typ.RawByteLen()
+		if length == 0 || len(b) < length {
+			break
+		}
+		// Skip main checksum
+		b = b[length:]
+		parts, n := binary.Uvarint(b)
+		if n <= 0 {
+			break
+		}
+		if !typ.Is(ChecksumIncludesMultipart) {
+			continue
+		}
+
+		if len(res) == 0 {
+			res = make([]map[string]string, parts)
+		}
+		b = b[n:]
+		for part := 0; part < int(parts); part++ {
+			if len(b) < length {
+				break
+			}
+			// Read part checksum
+			cs := base64.StdEncoding.EncodeToString(b[:length])
+			b = b[length:]
+			if res[part] == nil {
+				res[part] = make(map[string]string, 1)
+			}
+			res[part][typ.String()] = cs
+		}
 	}
 	return res
 }
@@ -208,11 +369,25 @@ func NewChecksumWithType(alg ChecksumType, value string) *Checksum {
 	if !alg.IsSet() {
 		return nil
 	}
+	wantParts := 0
+	if strings.ContainsRune(value, '-') {
+		valSplit := strings.Split(value, "-")
+		if len(valSplit) != 2 {
+			return nil
+		}
+		value = valSplit[0]
+		nParts, err := strconv.Atoi(valSplit[1])
+		if err != nil {
+			return nil
+		}
+		alg |= ChecksumMultipart
+		wantParts = nParts
+	}
 	bvalue, err := base64.StdEncoding.DecodeString(value)
 	if err != nil {
 		return nil
 	}
-	c := Checksum{Type: alg, Encoded: value, Raw: bvalue}
+	c := Checksum{Type: alg, Encoded: value, Raw: bvalue, WantParts: wantParts}
 	if !c.Valid() {
 		return nil
 	}
@@ -221,23 +396,50 @@ func NewChecksumWithType(alg ChecksumType, value string) *Checksum {
 
 // NewChecksumString returns a new checksum from specified algorithm and base64 encoded value.
 func NewChecksumString(alg, value string) *Checksum {
-	return NewChecksumWithType(NewChecksumType(alg), value)
+	return NewChecksumWithType(NewChecksumType(alg, ""), value)
 }
 
 // AppendTo will append the checksum to b.
+// 'parts' is used when checksum has ChecksumMultipart set.
 // ReadCheckSums reads the values back.
-func (c *Checksum) AppendTo(b []byte) []byte {
+func (c *Checksum) AppendTo(b []byte, parts []byte) []byte {
 	if c == nil {
 		return nil
 	}
 	var tmp [binary.MaxVarintLen32]byte
 	n := binary.PutUvarint(tmp[:], uint64(c.Type))
 	crc := c.Raw
+	if c.Type.Trailing() {
+		// When we serialize we don't care if it was trailing.
+		c.Type ^= ChecksumTrailing
+	}
 	if len(crc) != c.Type.RawByteLen() {
 		return b
 	}
 	b = append(b, tmp[:n]...)
 	b = append(b, crc...)
+	if c.Type.Is(ChecksumMultipart) {
+		var checksums int
+		if c.WantParts > 0 && !c.Type.Is(ChecksumIncludesMultipart) {
+			checksums = c.WantParts
+		}
+		// Ensure we don't divide by 0:
+		if c.Type.RawByteLen() == 0 || len(parts)%c.Type.RawByteLen() != 0 {
+			hashLogIf(context.Background(), fmt.Errorf("internal error: Unexpected checksum length: %d, each checksum %d", len(parts), c.Type.RawByteLen()))
+			checksums = 0
+			parts = nil
+		} else if len(parts) > 0 {
+			checksums = len(parts) / c.Type.RawByteLen()
+		}
+		if !c.Type.Is(ChecksumIncludesMultipart) {
+			parts = nil
+		}
+		n := binary.PutUvarint(tmp[:], uint64(checksums))
+		b = append(b, tmp[:n]...)
+		if len(parts) > 0 {
+			b = append(b, parts...)
+		}
+	}
 	return b
 }
 
@@ -246,15 +448,14 @@ func (c Checksum) Valid() bool {
 	if c.Type == ChecksumInvalid {
 		return false
 	}
-	if len(c.Encoded) == 0 || c.Type.Is(ChecksumTrailing) {
-		return c.Type.Is(ChecksumNone) || c.Type.Is(ChecksumTrailing)
+	if len(c.Encoded) == 0 || c.Type.Trailing() {
+		return c.Type.Is(ChecksumNone) || c.Type.Trailing()
 	}
-	raw := c.Raw
-	return c.Type.RawByteLen() == len(raw)
+	return c.Type.RawByteLen() == len(c.Raw)
 }
 
 // Matches returns whether given content matches c.
-func (c Checksum) Matches(content []byte) error {
+func (c Checksum) Matches(content []byte, parts int) error {
 	if len(c.Encoded) == 0 {
 		return nil
 	}
@@ -264,6 +465,13 @@ func (c Checksum) Matches(content []byte) error {
 		return err
 	}
 	sum := hasher.Sum(nil)
+	if c.WantParts > 0 && c.WantParts != parts {
+		return ChecksumMismatch{
+			Want: fmt.Sprintf("%s-%d", c.Encoded, c.WantParts),
+			Got:  fmt.Sprintf("%s-%d", base64.StdEncoding.EncodeToString(sum), parts),
+		}
+	}
+
 	if !bytes.Equal(sum, c.Raw) {
 		return ChecksumMismatch{
 			Want: c.Encoded,
@@ -282,10 +490,21 @@ func (c *Checksum) AsMap() map[string]string {
 }
 
 // TransferChecksumHeader will transfer any checksum value that has been checked.
+// If checksum was trailing, they must have been added to r.Trailer.
 func TransferChecksumHeader(w http.ResponseWriter, r *http.Request) {
-	t, s := getContentChecksum(r)
-	if !t.IsSet() || t.Is(ChecksumTrailing) {
-		// TODO: Add trailing when we can read it.
+	c, err := GetContentChecksum(r.Header)
+	if err != nil || c == nil {
+		return
+	}
+	t, s := c.Type, c.Encoded
+	if !c.Type.IsSet() {
+		return
+	}
+	if c.Type.Is(ChecksumTrailing) {
+		val := r.Trailer.Get(t.Key())
+		if val != "" {
+			w.Header().Set(t.Key(), val)
+		}
 		return
 	}
 	w.Header().Set(t.Key(), s)
@@ -294,6 +513,10 @@ func TransferChecksumHeader(w http.ResponseWriter, r *http.Request) {
 // AddChecksumHeader will transfer any checksum value that has been checked.
 func AddChecksumHeader(w http.ResponseWriter, c map[string]string) {
 	for k, v := range c {
+		if k == xhttp.AmzChecksumType {
+			w.Header().Set(xhttp.AmzChecksumType, v)
+			continue
+		}
 		cksum := NewChecksumString(k, v)
 		if cksum == nil {
 			continue
@@ -307,8 +530,26 @@ func AddChecksumHeader(w http.ResponseWriter, c map[string]string) {
 // GetContentChecksum returns content checksum.
 // Returns ErrInvalidChecksum if so.
 // Returns nil, nil if no checksum.
-func GetContentChecksum(r *http.Request) (*Checksum, error) {
-	t, s := getContentChecksum(r)
+func GetContentChecksum(h http.Header) (*Checksum, error) {
+	if trailing := h.Values(xhttp.AmzTrailer); len(trailing) > 0 {
+		var res *Checksum
+		for _, header := range trailing {
+			var duplicates bool
+			for _, t := range BaseChecksumTypes {
+				if strings.EqualFold(t.Key(), header) {
+					duplicates = res != nil
+					res = NewChecksumWithType(t|ChecksumTrailing, "")
+				}
+			}
+			if duplicates {
+				return nil, ErrInvalidChecksum
+			}
+		}
+		if res != nil {
+			return res, nil
+		}
+	}
+	t, s := getContentChecksum(h)
 	if t == ChecksumNone {
 		if s == "" {
 			return nil, nil
@@ -324,26 +565,27 @@ func GetContentChecksum(r *http.Request) (*Checksum, error) {
 
 // getContentChecksum returns content checksum type and value.
 // Returns ChecksumInvalid if so.
-func getContentChecksum(r *http.Request) (t ChecksumType, s string) {
+func getContentChecksum(h http.Header) (t ChecksumType, s string) {
 	t = ChecksumNone
-	alg := r.Header.Get(xhttp.AmzChecksumAlgo)
+	alg := h.Get(xhttp.AmzChecksumAlgo)
 	if alg != "" {
-		t |= NewChecksumType(alg)
+		t |= NewChecksumHeader(h)
+		if h.Get(xhttp.AmzChecksumType) == xhttp.AmzChecksumTypeFullObject {
+			if !t.CanMerge() {
+				return ChecksumInvalid, ""
+			}
+			t |= ChecksumFullObject
+		}
 		if t.IsSet() {
 			hdr := t.Key()
-			if s = r.Header.Get(hdr); s == "" {
-				if strings.EqualFold(r.Header.Get(xhttp.AmzTrailer), hdr) {
-					t |= ChecksumTrailing
-				} else {
-					t = ChecksumInvalid
-				}
+			if s = h.Get(hdr); s == "" {
 				return ChecksumNone, ""
 			}
 		}
 		return t, s
 	}
 	checkType := func(c ChecksumType) {
-		if got := r.Header.Get(c.Key()); got != "" {
+		if got := h.Get(c.Key()); got != "" {
 			// If already set, invalid
 			if t != ChecksumNone {
 				t = ChecksumInvalid
@@ -352,11 +594,19 @@ func getContentChecksum(r *http.Request) (t ChecksumType, s string) {
 				t = c
 				s = got
 			}
+			if h.Get(xhttp.AmzChecksumType) == xhttp.AmzChecksumTypeFullObject {
+				if !t.CanMerge() {
+					t = ChecksumInvalid
+					s = ""
+					return
+				}
+				t |= ChecksumFullObject
+			}
+			return
 		}
 	}
-	checkType(ChecksumCRC32)
-	checkType(ChecksumCRC32C)
-	checkType(ChecksumSHA1)
-	checkType(ChecksumSHA256)
+	for _, t := range BaseChecksumTypes {
+		checkType(t)
+	}
 	return t, s
 }

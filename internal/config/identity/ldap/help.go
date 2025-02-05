@@ -52,6 +52,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         UserDNSearchBaseDN,
@@ -64,6 +65,12 @@ var (
 			Description: `Search filter to lookup user DN` + defaultHelpPostfix(UserDNSearchFilter),
 			Optional:    true,
 			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         UserDNAttributes,
+			Description: `"," separated list of user DN attributes e.g. "uid,cn,mail,sshPublicKey"` + defaultHelpPostfix(UserDNAttributes),
+			Optional:    true,
+			Type:        "list",
 		},
 		config.HelpKV{
 			Key:         GroupSearchFilter,

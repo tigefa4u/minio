@@ -18,25 +18,33 @@
 package http
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
+
+	"github.com/klauspost/compress/gzip"
 )
 
 // ResponseRecorder - is a wrapper to trap the http response
 // status code and to record the response body
 type ResponseRecorder struct {
 	http.ResponseWriter
+	io.ReaderFrom
 	StatusCode int
 	// Log body of 4xx or 5xx responses
 	LogErrBody bool
 	// Log body of all responses
 	LogAllBody bool
 
-	TimeToFirstByte time.Duration
-	StartTime       time.Time
+	ttfbHeader time.Duration
+	ttfbBody   time.Duration
+
+	StartTime time.Time
 	// number of bytes written
 	bytesWritten int
 	// number of bytes of response headers written
@@ -48,14 +56,48 @@ type ResponseRecorder struct {
 	headersLogged bool
 }
 
+// Hijack - hijacks the underlying connection
+func (lrw *ResponseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := lrw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not support hijacking. Type is %T", lrw.ResponseWriter)
+	}
+	return hj.Hijack()
+}
+
+// TTFB of the request - this function needs to be called
+// when the request is finished to provide accurate data
+func (lrw *ResponseRecorder) TTFB() time.Duration {
+	if lrw.ttfbBody != 0 {
+		return lrw.ttfbBody
+	}
+	return lrw.ttfbHeader
+}
+
 // NewResponseRecorder - returns a wrapped response writer to trap
 // http status codes for auditing purposes.
 func NewResponseRecorder(w http.ResponseWriter) *ResponseRecorder {
+	rf, _ := w.(io.ReaderFrom)
 	return &ResponseRecorder{
 		ResponseWriter: w,
+		ReaderFrom:     rf,
 		StatusCode:     http.StatusOK,
 		StartTime:      time.Now().UTC(),
 	}
+}
+
+// ErrNotImplemented when a functionality is not implemented
+var ErrNotImplemented = errors.New("not implemented")
+
+// ReadFrom implements support for calling internal io.ReaderFrom implementations
+// returns an error if the underlying ResponseWriter does not implement io.ReaderFrom
+func (lrw *ResponseRecorder) ReadFrom(r io.Reader) (int64, error) {
+	if lrw.ReaderFrom != nil {
+		n, err := lrw.ReaderFrom.ReadFrom(r)
+		lrw.bytesWritten += int(n)
+		return n, err
+	}
+	return 0, ErrNotImplemented
 }
 
 func (lrw *ResponseRecorder) Write(p []byte) (int, error) {
@@ -66,13 +108,19 @@ func (lrw *ResponseRecorder) Write(p []byte) (int, error) {
 	}
 	n, err := lrw.ResponseWriter.Write(p)
 	lrw.bytesWritten += n
-	if lrw.TimeToFirstByte == 0 {
-		lrw.TimeToFirstByte = time.Now().UTC().Sub(lrw.StartTime)
+	if lrw.ttfbBody == 0 {
+		lrw.ttfbBody = time.Now().UTC().Sub(lrw.StartTime)
 	}
-	gzipped := lrw.Header().Get("Content-Encoding") == "gzip"
-	if !gzipped && ((lrw.LogErrBody && lrw.StatusCode >= http.StatusBadRequest) || lrw.LogAllBody) {
-		// Always logging error responses.
-		lrw.body.Write(p)
+
+	if (lrw.LogErrBody && lrw.StatusCode >= http.StatusBadRequest) || lrw.LogAllBody {
+		// If body is > 10MB, drop it.
+		if lrw.bytesWritten+len(p) > 10<<20 {
+			lrw.LogAllBody = false
+			lrw.body = bytes.Buffer{}
+		} else {
+			// Always logging error responses.
+			lrw.body.Write(p)
+		}
 	}
 	if err != nil {
 		return n, err
@@ -99,8 +147,16 @@ var gzippedBody = []byte("<GZIP>")
 // Body - Return response body.
 func (lrw *ResponseRecorder) Body() []byte {
 	if lrw.Header().Get("Content-Encoding") == "gzip" {
-		// ... otherwise we return the <GZIP> place holder
-		return gzippedBody
+		if lrw.body.Len() > 1<<20 {
+			return gzippedBody
+		}
+		r, err := gzip.NewReader(&lrw.body)
+		if err != nil {
+			return gzippedBody
+		}
+		defer r.Close()
+		b, _ := io.ReadAll(io.LimitReader(r, 10<<20))
+		return b
 	}
 	// If there was an error response or body logging is enabled
 	// then we return the body contents
@@ -114,6 +170,7 @@ func (lrw *ResponseRecorder) Body() []byte {
 // WriteHeader - writes http status code
 func (lrw *ResponseRecorder) WriteHeader(code int) {
 	if !lrw.headersLogged {
+		lrw.ttfbHeader = time.Now().UTC().Sub(lrw.StartTime)
 		lrw.StatusCode = code
 		lrw.writeHeaders(&lrw.headers, code, lrw.ResponseWriter.Header())
 		lrw.headersLogged = true
@@ -123,7 +180,9 @@ func (lrw *ResponseRecorder) WriteHeader(code int) {
 
 // Flush - Calls the underlying Flush.
 func (lrw *ResponseRecorder) Flush() {
-	lrw.ResponseWriter.(http.Flusher).Flush()
+	if flusher, ok := lrw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 // Size - returns  the number of bytes written

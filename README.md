@@ -4,7 +4,7 @@
 
 [![MinIO](https://raw.githubusercontent.com/minio/minio/master/.github/logo.svg?sanitize=true)](https://min.io)
 
-MinIO is a High Performance Object Storage released under GNU Affero General Public License v3.0. It is API compatible with Amazon S3 cloud storage service. Use MinIO to build high performance infrastructure for machine learning, analytics and application data workloads.
+MinIO is a High Performance Object Storage released under GNU Affero General Public License v3.0. It is API compatible with Amazon S3 cloud storage service. Use MinIO to build high performance infrastructure for machine learning, analytics and application data workloads. To learn more about what MinIO is doing for AI storage, go to [AI storage documentation](https://min.io/solutions/object-storage-for-ai).
 
 This README provides quickstart instructions on running MinIO on bare metal hardware, including container-based installations. For Kubernetes environments, use the [MinIO Kubernetes Operator](https://github.com/minio/operator/blob/master/README.md).
 
@@ -86,8 +86,6 @@ chmod +x minio
 ./minio server /data
 ```
 
-Replace ``/data`` with the path to the drive or directory in which you want MinIO to store data.
-
 The following table lists supported architectures. Replace the `wget` URL with the architecture for your Linux host.
 
 | Architecture                   | URL                                                        |
@@ -95,7 +93,6 @@ The following table lists supported architectures. Replace the `wget` URL with t
 | 64-bit Intel/AMD               | <https://dl.min.io/server/minio/release/linux-amd64/minio>   |
 | 64-bit ARM                     | <https://dl.min.io/server/minio/release/linux-arm64/minio>   |
 | 64-bit PowerPC LE (ppc64le)    | <https://dl.min.io/server/minio/release/linux-ppc64le/minio> |
-| IBM Z-Series (S390X)           | <https://dl.min.io/server/minio/release/linux-s390x/minio>   |
 
 The MinIO deployment starts using default root credentials `minioadmin:minioadmin`. You can test the deployment using the MinIO Console, an embedded web-based object browser built into MinIO Server. Point a web browser running on the host machine to <http://127.0.0.1:9000> and log in with the root credentials. You can use the Browser to create buckets, upload objects, and browse the contents of the MinIO server.
 
@@ -125,7 +122,7 @@ You can also connect using any S3-compatible tool, such as the MinIO Client `mc`
 
 ## Install from Source
 
-Use the following commands to compile and run a standalone MinIO server from source. Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.19](https://golang.org/dl/#stable)
+Use the following commands to compile and run a standalone MinIO server from source. Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.21](https://golang.org/dl/#stable)
 
 ```sh
 go install github.com/minio/minio@latest
@@ -202,7 +199,7 @@ service iptables restart
 
 MinIO Server comes with an embedded web based object browser. Point your web browser to <http://127.0.0.1:9000> to ensure your server has started successfully.
 
-> NOTE: MinIO runs console on random port by default if you wish choose a specific port use `--console-address` to pick a specific interface and port.
+> NOTE: MinIO runs console on random port by default, if you wish to choose a specific port use `--console-address` to pick a specific interface and port.
 
 ### Things to consider
 
@@ -211,10 +208,6 @@ MinIO redirects browser access requests to the configured server port (i.e. `127
 For deployments behind a load balancer, proxy, or ingress rule where the MinIO host IP address or port is not public, use the `MINIO_BROWSER_REDIRECT_URL` environment variable to specify the external hostname for the redirect. The LB/Proxy must have rules for directing traffic to the Console port specifically.
 
 For example, consider a MinIO deployment behind a proxy `https://minio.example.net`, `https://console.minio.example.net` with rules for forwarding traffic on port :9000 and :9001 to MinIO and the MinIO Console respectively on the internal network. Set `MINIO_BROWSER_REDIRECT_URL` to `https://console.minio.example.net` to ensure the browser receives a valid reachable URL.
-
-Similarly, if your TLS certificates do not have the IP SAN for the MinIO server host, the MinIO Console may fail to validate the connection to the server. Use the `MINIO_SERVER_URL` environment variable  and specify the proxy-accessible hostname of the MinIO server to allow the Console to use the MinIO server API using the TLS certificate.
-
-For example: `export MINIO_SERVER_URL="https://minio.example.net"`
 
 | Dashboard                                                                                   | Creating a bucket                                                                           |
 | -------------                                                                               | -------------                                                                               |
@@ -243,7 +236,7 @@ mc admin update <minio alias, e.g., myminio>
 ### Upgrade Checklist
 
 - Test all upgrades in a lower environment (DEV, QA, UAT) before applying to production. Performing blind upgrades in production environments carries significant risk.
-- Read the release notes for MinIO *before* performing any upgrade, there is no forced requirement to upgrade to latest releases upon every releases. Some releases may not be relevant to your setup, avoid upgrading production environments unnecessarily.
+- Read the release notes for MinIO *before* performing any upgrade, there is no forced requirement to upgrade to latest release upon every release. Some release may not be relevant to your setup, avoid upgrading production environments unnecessarily.
 - If you plan to use `mc admin update`, MinIO process must have write access to the parent directory where the binary is present on the host system.
 - `mc admin update` is not supported and should be avoided in kubernetes/container environments, please upgrade containers by upgrading relevant container images.
 - **We do not recommend upgrading one MinIO server at a time, the product is designed to support parallel upgrades please follow our recommended guidelines.**
@@ -261,6 +254,6 @@ Please follow MinIO [Contributor's Guide](https://github.com/minio/minio/blob/ma
 
 ## License
 
-- MinIO source is licensed under the GNU AGPLv3 license that can be found in the [LICENSE](https://github.com/minio/minio/blob/master/LICENSE) file.
-- MinIO [Documentation](https://github.com/minio/minio/tree/master/docs) © 2021 by MinIO, Inc is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+- MinIO source is licensed under the [GNU AGPLv3](https://github.com/minio/minio/blob/master/LICENSE).
+- MinIO [documentation](https://github.com/minio/minio/tree/master/docs) is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 - [License Compliance](https://github.com/minio/minio/blob/master/COMPLIANCE.md)

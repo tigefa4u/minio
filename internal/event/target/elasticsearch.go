@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -23,7 +23,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,8 +34,11 @@ import (
 	elasticsearch7 "github.com/elastic/go-elasticsearch/v7"
 	"github.com/minio/highwayhash"
 	"github.com/minio/minio/internal/event"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/minio/internal/once"
+	"github.com/minio/minio/internal/store"
+	xnet "github.com/minio/pkg/v3/net"
 	"github.com/pkg/errors"
 )
 
@@ -69,7 +71,7 @@ const (
 	ESSUnknown ESSupportStatus = "ESSUnknown"
 	// ESSDeprecated -> support will be removed in future
 	ESSDeprecated ESSupportStatus = "ESSDeprecated"
-	// ESSUnsupported -> we wont work with this ES server
+	// ESSUnsupported -> we won't work with this ES server
 	ESSUnsupported ESSupportStatus = "ESSUnsupported"
 	// ESSSupported -> all good!
 	ESSSupported ESSupportStatus = "ESSSupported"
@@ -152,12 +154,12 @@ func (a ElasticsearchArgs) Validate() error {
 
 // ElasticsearchTarget - Elasticsearch target.
 type ElasticsearchTarget struct {
-	lazyInit lazyInit
+	initOnce once.Init
 
 	id         event.TargetID
 	args       ElasticsearchArgs
 	client     esClient
-	store      Store
+	store      store.Store[event.Event]
 	loggerOnce logger.LogOnce
 	quitCh     chan struct{}
 }
@@ -165,6 +167,11 @@ type ElasticsearchTarget struct {
 // ID - returns target ID.
 func (target *ElasticsearchTarget) ID() event.TargetID {
 	return target.id
+}
+
+// Name - returns the Name of the target.
+func (target *ElasticsearchTarget) Name() string {
+	return target.ID().String()
 }
 
 // Store returns any underlying store if set.
@@ -194,12 +201,12 @@ func (target *ElasticsearchTarget) isActive() (bool, error) {
 
 // Save - saves the events to the store if queuestore is configured, which will be replayed when the elasticsearch connection is active.
 func (target *ElasticsearchTarget) Save(eventData event.Event) error {
-	if err := target.init(); err != nil {
+	if target.store != nil {
+		_, err := target.store.Put(eventData)
 		return err
 	}
-
-	if target.store != nil {
-		return target.store.Put(eventData)
+	if err := target.init(); err != nil {
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -212,7 +219,7 @@ func (target *ElasticsearchTarget) Save(eventData event.Event) error {
 
 	err = target.send(eventData)
 	if xnet.IsNetworkOrHostDown(err, false) {
-		return errNotConnected
+		return store.ErrNotConnected
 	}
 	return err
 }
@@ -258,8 +265,8 @@ func (target *ElasticsearchTarget) send(eventData event.Event) error {
 	return nil
 }
 
-// Send - reads an event from store and sends it to Elasticsearch.
-func (target *ElasticsearchTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to Elasticsearch.
+func (target *ElasticsearchTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
@@ -272,7 +279,7 @@ func (target *ElasticsearchTarget) Send(eventKey string) error {
 		return err
 	}
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and wouldve been already been sent successfully.
@@ -284,13 +291,13 @@ func (target *ElasticsearchTarget) Send(eventKey string) error {
 
 	if err := target.send(eventData); err != nil {
 		if xnet.IsNetworkOrHostDown(err, false) {
-			return errNotConnected
+			return store.ErrNotConnected
 		}
 		return err
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - does nothing and available for interface compatibility.
@@ -339,7 +346,7 @@ func (target *ElasticsearchTarget) checkAndInitClient(ctx context.Context) error
 }
 
 func (target *ElasticsearchTarget) init() error {
-	return target.lazyInit.Do(target.initElasticsearch)
+	return target.initOnce.Do(target.initElasticsearch)
 }
 
 func (target *ElasticsearchTarget) initElasticsearch() error {
@@ -348,7 +355,7 @@ func (target *ElasticsearchTarget) initElasticsearch() error {
 
 	err := target.checkAndInitClient(ctx)
 	if err != nil {
-		if err != errNotConnected {
+		if err != store.ErrNotConnected {
 			target.loggerOnce(context.Background(), err, target.ID().String())
 		}
 		return err
@@ -359,11 +366,11 @@ func (target *ElasticsearchTarget) initElasticsearch() error {
 
 // NewElasticsearchTarget - creates new Elasticsearch target.
 func NewElasticsearchTarget(id string, args ElasticsearchArgs, loggerOnce logger.LogOnce) (*ElasticsearchTarget, error) {
-	var store Store
+	var queueStore store.Store[event.Event]
 	if args.QueueDir != "" {
 		queueDir := filepath.Join(args.QueueDir, storePrefix+"-elasticsearch-"+id)
-		store = NewQueueStore(queueDir, args.QueueLimit)
-		if err := store.Open(); err != nil {
+		queueStore = store.NewQueueStore[event.Event](queueDir, args.QueueLimit, event.StoreExtension)
+		if err := queueStore.Open(); err != nil {
 			return nil, fmt.Errorf("unable to initialize the queue store of Elasticsearch `%s`: %w", id, err)
 		}
 	}
@@ -371,13 +378,13 @@ func NewElasticsearchTarget(id string, args ElasticsearchArgs, loggerOnce logger
 	target := &ElasticsearchTarget{
 		id:         event.TargetID{ID: id, Name: "elasticsearch"},
 		args:       args,
-		store:      store,
+		store:      queueStore,
 		loggerOnce: loggerOnce,
 		quitCh:     make(chan struct{}),
 	}
 
 	if target.store != nil {
-		streamEventsFromStore(target.store, target, target.quitCh, target.loggerOnce)
+		store.StreamItems(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
 	return target, nil
@@ -415,7 +422,7 @@ func (c *esClientV7) getServerSupportStatus(ctx context.Context) (ESSupportStatu
 		c.Info.WithContext(ctx),
 	)
 	if err != nil {
-		return ESSUnknown, "", errNotConnected
+		return ESSUnknown, "", store.ErrNotConnected
 	}
 
 	defer resp.Body.Close()
@@ -469,12 +476,10 @@ func (c *esClientV7) createIndex(args ElasticsearchArgs) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer xhttp.DrainBody(resp.Body)
 		if resp.IsError() {
-			err := fmt.Errorf("Create index err: %s", res.String())
-			return err
+			return fmt.Errorf("Create index err: %v", res)
 		}
-		io.Copy(io.Discard, resp.Body)
 		return nil
 	}
 	return nil
@@ -485,10 +490,9 @@ func (c *esClientV7) ping(ctx context.Context, _ ElasticsearchArgs) (bool, error
 		c.Ping.WithContext(ctx),
 	)
 	if err != nil {
-		return false, errNotConnected
+		return false, store.ErrNotConnected
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	xhttp.DrainBody(resp.Body)
 	return !resp.IsError(), nil
 }
 
@@ -501,8 +505,7 @@ func (c *esClientV7) entryExists(ctx context.Context, index string, key string) 
 	if err != nil {
 		return false, err
 	}
-	io.Copy(io.Discard, res.Body)
-	res.Body.Close()
+	xhttp.DrainBody(res.Body)
 	return !res.IsError(), nil
 }
 
@@ -517,8 +520,7 @@ func (c *esClientV7) removeEntry(ctx context.Context, index string, key string) 
 		if err != nil {
 			return err
 		}
-		defer res.Body.Close()
-		defer io.Copy(io.Discard, res.Body)
+		defer xhttp.DrainBody(res.Body)
 		if res.IsError() {
 			return fmt.Errorf("Delete err: %s", res.String())
 		}
@@ -546,8 +548,7 @@ func (c *esClientV7) updateEntry(ctx context.Context, index string, key string, 
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
-	defer io.Copy(io.Discard, res.Body)
+	defer xhttp.DrainBody(res.Body)
 	if res.IsError() {
 		return fmt.Errorf("Update err: %s", res.String())
 	}
@@ -573,8 +574,7 @@ func (c *esClientV7) addEntry(ctx context.Context, index string, eventData event
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
-	defer io.Copy(io.Discard, res.Body)
+	defer xhttp.DrainBody(res.Body)
 	if res.IsError() {
 		return fmt.Errorf("Add err: %s", res.String())
 	}

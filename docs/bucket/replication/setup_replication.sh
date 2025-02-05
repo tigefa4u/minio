@@ -9,7 +9,7 @@ mc mb -l dest/bucket
 mc admin user add source repladmin repladmin123
 
 # create a replication policy for repladmin
-cat > repladmin-policy-source.json <<EOF
+cat >repladmin-policy-source.json <<EOF
 {
     "Version": "2012-10-17",
     "Statement": [
@@ -38,11 +38,11 @@ cat > repladmin-policy-source.json <<EOF
     ]
    }
 EOF
-mc admin policy add source repladmin-policy ./repladmin-policy-source.json
+mc admin policy create source repladmin-policy ./repladmin-policy-source.json
 cat ./repladmin-policy-source.json
 
 #assign this replication policy to repladmin
-mc admin policy set source repladmin-policy user=repladmin
+mc admin policy attach source repladmin-policy --user=repladmin
 
 ### on dest alias
 # Create a replication user : repluser on dest alias
@@ -51,7 +51,7 @@ mc admin user add dest repluser repluser123
 # create a replication policy for repluser
 # Remove "s3:GetBucketObjectLockConfiguration" if object locking is not enabled, i.e. bucket was not created with `mc mb --with-lock` option
 # Remove "s3:ReplicateDelete" if delete marker replication is not required
-cat > replpolicy.json <<EOF
+cat >replpolicy.json <<EOF
 {
  "Version": "2012-10-17",
  "Statement": [
@@ -90,12 +90,12 @@ cat > replpolicy.json <<EOF
  ]
 }
 EOF
-mc admin policy add dest replpolicy ./replpolicy.json
+mc admin policy create dest replpolicy ./replpolicy.json
 cat ./replpolicy.json
 
 # assign this replication policy to repluser
-mc admin policy set dest replpolicy user=repluser
+mc admin policy attach dest replpolicy --user=repluser
 
 # configure replication config to remote bucket at http://localhost:9000
 mc replicate add source/bucket --priority 1 --remote-bucket http://repluser:repluser123@localhost:9000/bucket \
-   --replicate existing-objects,delete,delete-marker,replica-metadata-sync
+	--replicate existing-objects,delete,delete-marker,replica-metadata-sync

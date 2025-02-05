@@ -18,15 +18,22 @@
 package event
 
 import (
+	"context"
 	"fmt"
-	"strings"
+	"runtime"
 	"sync"
 	"sync/atomic"
+
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/store"
+	"github.com/minio/pkg/v3/workers"
 )
 
 const (
+	logSubsys = "notify"
+
 	// The maximum allowed number of concurrent Send() calls to all configured notifications targets
-	maxConcurrentTargetSendCalls = 20000
+	maxConcurrentAsyncSend = 50000
 )
 
 // Target - event target interface
@@ -34,7 +41,7 @@ type Target interface {
 	ID() TargetID
 	IsActive() (bool, error)
 	Save(Event) error
-	Send(string) error
+	SendFromStore(store.Key) error
 	Close() error
 	Store() TargetStore
 }
@@ -44,27 +51,118 @@ type TargetStore interface {
 	Len() int
 }
 
-// TargetStats is a collection of stats for multiple targets.
-type TargetStats struct {
-	// CurrentSendCalls is the number of concurrent async Send calls to all targets
-	CurrentSendCalls int64
+// Stats is a collection of stats for multiple targets.
+type Stats struct {
+	TotalEvents        int64 // Deprecated
+	EventsSkipped      int64
+	CurrentQueuedCalls int64 // Deprecated
+	EventsErrorsTotal  int64 // Deprecated
+	CurrentSendCalls   int64 // Deprecated
 
-	TargetStats map[string]TargetStat
+	TargetStats map[TargetID]TargetStat
 }
 
 // TargetStat is the stats of a single target.
 type TargetStat struct {
-	ID           TargetID
-	CurrentQueue int // Populated if target has a store.
+	CurrentSendCalls int64 // CurrentSendCalls is the number of concurrent async Send calls to all targets
+	CurrentQueue     int   // Populated if target has a store.
+	TotalEvents      int64
+	FailedEvents     int64 // Number of failed events per target
 }
 
 // TargetList - holds list of targets indexed by target ID.
 type TargetList struct {
 	// The number of concurrent async Send calls to all targets
-	currentSendCalls int64
+	currentSendCalls  atomic.Int64
+	totalEvents       atomic.Int64
+	eventsSkipped     atomic.Int64
+	eventsErrorsTotal atomic.Int64
 
 	sync.RWMutex
 	targets map[TargetID]Target
+	queue   chan asyncEvent
+	ctx     context.Context
+
+	statLock    sync.RWMutex
+	targetStats map[TargetID]targetStat
+}
+
+type targetStat struct {
+	// The number of concurrent async Send calls per targets
+	currentSendCalls int64
+	// The number of total events per target
+	totalEvents int64
+	// The number of failed events per target
+	failedEvents int64
+}
+
+func (list *TargetList) getStatsByTargetID(id TargetID) (stat targetStat) {
+	list.statLock.RLock()
+	defer list.statLock.RUnlock()
+
+	return list.targetStats[id]
+}
+
+func (list *TargetList) incCurrentSendCalls(id TargetID) {
+	list.statLock.Lock()
+	defer list.statLock.Unlock()
+
+	stats, ok := list.targetStats[id]
+	if !ok {
+		stats = targetStat{}
+	}
+
+	stats.currentSendCalls++
+	list.targetStats[id] = stats
+	return
+}
+
+func (list *TargetList) decCurrentSendCalls(id TargetID) {
+	list.statLock.Lock()
+	defer list.statLock.Unlock()
+
+	stats, ok := list.targetStats[id]
+	if !ok {
+		// should not happen
+		return
+	}
+
+	stats.currentSendCalls--
+	list.targetStats[id] = stats
+	return
+}
+
+func (list *TargetList) incFailedEvents(id TargetID) {
+	list.statLock.Lock()
+	defer list.statLock.Unlock()
+
+	stats, ok := list.targetStats[id]
+	if !ok {
+		stats = targetStat{}
+	}
+
+	stats.failedEvents++
+	list.targetStats[id] = stats
+	return
+}
+
+func (list *TargetList) incTotalEvents(id TargetID) {
+	list.statLock.Lock()
+	defer list.statLock.Unlock()
+
+	stats, ok := list.targetStats[id]
+	if !ok {
+		stats = targetStat{}
+	}
+
+	stats.totalEvents++
+	list.targetStats[id] = stats
+	return
+}
+
+type asyncEvent struct {
+	ev        Event
+	targetSet TargetIDSet
 }
 
 // Add - adds unique target to target list.
@@ -144,70 +242,160 @@ func (list *TargetList) List() []TargetID {
 	return keys
 }
 
+func (list *TargetList) get(id TargetID) (Target, bool) {
+	list.RLock()
+	defer list.RUnlock()
+
+	target, ok := list.targets[id]
+	return target, ok
+}
+
 // TargetMap - returns available targets.
 func (list *TargetList) TargetMap() map[TargetID]Target {
 	list.RLock()
 	defer list.RUnlock()
-	return list.targets
+
+	ntargets := make(map[TargetID]Target, len(list.targets))
+	for k, v := range list.targets {
+		ntargets[k] = v
+	}
+	return ntargets
 }
 
 // Send - sends events to targets identified by target IDs.
-func (list *TargetList) Send(event Event, targetIDset TargetIDSet, resCh chan<- TargetIDResult) {
-	if atomic.LoadInt64(&list.currentSendCalls) > maxConcurrentTargetSendCalls {
-		err := fmt.Errorf("concurrent target notifications exceeded %d", maxConcurrentTargetSendCalls)
+func (list *TargetList) Send(event Event, targetIDset TargetIDSet, sync bool) {
+	if sync {
+		list.sendSync(event, targetIDset)
+	} else {
+		list.sendAsync(event, targetIDset)
+	}
+}
+
+func (list *TargetList) sendSync(event Event, targetIDset TargetIDSet) {
+	var wg sync.WaitGroup
+	for id := range targetIDset {
+		target, ok := list.get(id)
+		if !ok {
+			continue
+		}
+		wg.Add(1)
+		go func(id TargetID, target Target) {
+			list.currentSendCalls.Add(1)
+			list.incCurrentSendCalls(id)
+			list.incTotalEvents(id)
+			defer list.decCurrentSendCalls(id)
+			defer list.currentSendCalls.Add(-1)
+			defer wg.Done()
+
+			if err := target.Save(event); err != nil {
+				list.eventsErrorsTotal.Add(1)
+				list.incFailedEvents(id)
+				reqInfo := &logger.ReqInfo{}
+				reqInfo.AppendTags("targetID", id.String())
+				logger.LogOnceIf(logger.SetReqInfo(context.Background(), reqInfo), logSubsys, err, id.String())
+			}
+		}(id, target)
+	}
+	wg.Wait()
+	list.totalEvents.Add(1)
+}
+
+func (list *TargetList) sendAsync(event Event, targetIDset TargetIDSet) {
+	select {
+	case list.queue <- asyncEvent{
+		ev:        event,
+		targetSet: targetIDset.Clone(),
+	}:
+	case <-list.ctx.Done():
+		list.eventsSkipped.Add(int64(len(list.queue)))
+		return
+	default:
+		list.eventsSkipped.Add(1)
+		err := fmt.Errorf("concurrent target notifications exceeded %d, configured notification target is too slow to accept events for the incoming request rate", maxConcurrentAsyncSend)
 		for id := range targetIDset {
-			resCh <- TargetIDResult{ID: id, Err: err}
+			reqInfo := &logger.ReqInfo{}
+			reqInfo.AppendTags("targetID", id.String())
+			logger.LogOnceIf(logger.SetReqInfo(context.Background(), reqInfo), logSubsys, err, id.String())
 		}
 		return
 	}
-
-	go func() {
-		var wg sync.WaitGroup
-		for id := range targetIDset {
-			list.RLock()
-			target, ok := list.targets[id]
-			list.RUnlock()
-			if ok {
-				wg.Add(1)
-				go func(id TargetID, target Target) {
-					atomic.AddInt64(&list.currentSendCalls, 1)
-					defer atomic.AddInt64(&list.currentSendCalls, -1)
-					defer wg.Done()
-					tgtRes := TargetIDResult{ID: id}
-					if err := target.Save(event); err != nil {
-						tgtRes.Err = err
-					}
-					resCh <- tgtRes
-				}(id, target)
-			} else {
-				resCh <- TargetIDResult{ID: id}
-			}
-		}
-		wg.Wait()
-	}()
 }
 
 // Stats returns stats for targets.
-func (list *TargetList) Stats() TargetStats {
-	t := TargetStats{}
+func (list *TargetList) Stats() Stats {
+	t := Stats{}
 	if list == nil {
 		return t
 	}
-	t.CurrentSendCalls = atomic.LoadInt64(&list.currentSendCalls)
+	t.CurrentSendCalls = list.currentSendCalls.Load()
+	t.EventsSkipped = list.eventsSkipped.Load()
+	t.TotalEvents = list.totalEvents.Load()
+	t.CurrentQueuedCalls = int64(len(list.queue))
+	t.EventsErrorsTotal = list.eventsErrorsTotal.Load()
+
 	list.RLock()
 	defer list.RUnlock()
-	t.TargetStats = make(map[string]TargetStat, len(list.targets))
+	t.TargetStats = make(map[TargetID]TargetStat, len(list.targets))
 	for id, target := range list.targets {
-		ts := TargetStat{ID: id}
+		var currentQueue int
 		if st := target.Store(); st != nil {
-			ts.CurrentQueue = st.Len()
+			currentQueue = st.Len()
 		}
-		t.TargetStats[strings.ReplaceAll(id.String(), ":", "_")] = ts
+		stats := list.getStatsByTargetID(id)
+		t.TargetStats[id] = TargetStat{
+			CurrentSendCalls: stats.currentSendCalls,
+			CurrentQueue:     currentQueue,
+			FailedEvents:     stats.failedEvents,
+			TotalEvents:      stats.totalEvents,
+		}
 	}
+
 	return t
 }
 
+func (list *TargetList) startSendWorkers(workerCount int) {
+	if workerCount == 0 {
+		workerCount = runtime.GOMAXPROCS(0)
+	}
+	wk, err := workers.New(workerCount)
+	if err != nil {
+		panic(err)
+	}
+	for i := 0; i < workerCount; i++ {
+		wk.Take()
+		go func() {
+			defer wk.Give()
+
+			for {
+				select {
+				case av := <-list.queue:
+					list.sendSync(av.ev, av.targetSet)
+				case <-list.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	wk.Wait()
+}
+
+var startOnce sync.Once
+
+// Init initialize target send workers.
+func (list *TargetList) Init(workers int) *TargetList {
+	startOnce.Do(func() {
+		go list.startSendWorkers(workers)
+	})
+	return list
+}
+
 // NewTargetList - creates TargetList.
-func NewTargetList() *TargetList {
-	return &TargetList{targets: make(map[TargetID]Target)}
+func NewTargetList(ctx context.Context) *TargetList {
+	list := &TargetList{
+		targets:     make(map[TargetID]Target),
+		queue:       make(chan asyncEvent, maxConcurrentAsyncSend),
+		targetStats: make(map[TargetID]targetStat),
+		ctx:         ctx,
+	}
+	return list
 }

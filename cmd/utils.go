@@ -20,19 +20,19 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
@@ -40,17 +40,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/go-oidc"
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/dustin/go-humanize"
 	"github.com/felixge/fgprof"
-	"github.com/gorilla/mux"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/api"
 	xtls "github.com/minio/minio/internal/config/identity/tls"
-	"github.com/minio/minio/internal/deadlineconn"
+	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash"
@@ -58,11 +57,12 @@ import (
 	ioutilx "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/logger/message/audit"
-	"github.com/minio/minio/internal/mcontext"
 	"github.com/minio/minio/internal/rest"
-	"github.com/minio/pkg/certs"
-	"github.com/minio/pkg/env"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/certs"
+	"github.com/minio/pkg/v3/env"
+	xaudit "github.com/minio/pkg/v3/logger/message/audit"
+	xnet "github.com/minio/pkg/v3/net"
 	"golang.org/x/oauth2"
 )
 
@@ -100,11 +100,15 @@ func ErrorRespToObjectError(err error, params ...string) error {
 
 	bucket := ""
 	object := ""
+	versionID := ""
 	if len(params) >= 1 {
 		bucket = params[0]
 	}
-	if len(params) == 2 {
+	if len(params) >= 2 {
 		object = params[1]
+	}
+	if len(params) >= 3 {
+		versionID = params[2]
 	}
 
 	if xnet.IsNetworkOrHostDown(err, false) {
@@ -119,6 +123,10 @@ func ErrorRespToObjectError(err error, params ...string) error {
 	}
 
 	switch minioErr.Code {
+	case "SlowDownWrite":
+		err = InsufficientWriteQuorum{Bucket: bucket, Object: object}
+	case "SlowDownRead":
+		err = InsufficientReadQuorum{Bucket: bucket, Object: object}
 	case "PreconditionFailed":
 		err = PreConditionFailed{}
 	case "InvalidRange":
@@ -143,6 +151,12 @@ func ErrorRespToObjectError(err error, params ...string) error {
 		} else {
 			err = BucketNotFound{Bucket: bucket}
 		}
+	case "NoSuchVersion":
+		if object != "" {
+			err = ObjectNotFound{Bucket: bucket, Object: object, VersionID: versionID}
+		} else {
+			err = BucketNotFound{Bucket: bucket}
+		}
 	case "XMinioInvalidObjectName":
 		err = ObjectNameInvalid{}
 	case "AccessDenied":
@@ -156,10 +170,11 @@ func ErrorRespToObjectError(err error, params ...string) error {
 		err = InvalidUploadID{}
 	case "EntityTooSmall":
 		err = PartTooSmall{}
+	case "ReplicationPermissionCheck":
+		err = ReplicationPermissionCheck{}
 	}
 
-	switch minioErr.StatusCode {
-	case http.StatusMethodNotAllowed:
+	if minioErr.StatusCode == http.StatusMethodNotAllowed {
 		err = toObjectErr(errMethodNotAllowed, bucket, object)
 	}
 	return err
@@ -241,10 +256,28 @@ func xmlDecoder(body io.Reader, v interface{}, size int64) error {
 	return err
 }
 
-// hasContentMD5 returns true if Content-MD5 header is set.
-func hasContentMD5(h http.Header) bool {
-	_, ok := h[xhttp.ContentMD5]
-	return ok
+// validateLengthAndChecksum returns if a content checksum is set,
+// and will replace r.Body with a reader that checks the provided checksum
+func validateLengthAndChecksum(r *http.Request) bool {
+	if mdFive := r.Header.Get(xhttp.ContentMD5); mdFive != "" {
+		want, err := base64.StdEncoding.DecodeString(mdFive)
+		if err != nil {
+			return false
+		}
+		r.Body = hash.NewChecker(r.Body, md5.New(), want, r.ContentLength)
+		return true
+	}
+	cs, err := hash.GetContentChecksum(r.Header)
+	if err != nil {
+		return false
+	}
+	if cs == nil || !cs.Type.IsSet() {
+		return false
+	}
+	if cs.Valid() && !cs.Type.Trailing() {
+		r.Body = hash.NewChecker(r.Body, cs.Type.Hasher(), cs.Raw, r.ContentLength)
+	}
+	return true
 }
 
 // http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
@@ -278,19 +311,7 @@ func isMaxPartID(partID int) bool {
 	return partID > globalMaxPartID
 }
 
-func contains(slice interface{}, elem interface{}) bool {
-	v := reflect.ValueOf(slice)
-	if v.Kind() == reflect.Slice {
-		for i := 0; i < v.Len(); i++ {
-			if v.Index(i).Interface() == elem {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// profilerWrapper is created becauses pkg/profiler doesn't
+// profilerWrapper is created because pkg/profiler doesn't
 // provide any API to calculate the profiler file path in the
 // disk since the name of this latter is randomly generated.
 type profilerWrapper struct {
@@ -357,7 +378,7 @@ func getProfileData() (map[string][]byte, error) {
 }
 
 func setDefaultProfilerRates() {
-	runtime.MemProfileRate = 4096      // 512K -> 4K - Must be constant throughout application lifetime.
+	runtime.MemProfileRate = 128 << 10 // 512KB -> 128K - Must be constant throughout application lifetime.
 	runtime.SetMutexProfileFraction(0) // Disable until needed
 	runtime.SetBlockProfileRate(0)     // Disable until needed
 }
@@ -410,7 +431,12 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return nil, err
 		}
 		stop := fgprof.Start(f, fgprof.FormatPprof)
+		startedAt := time.Now()
 		prof.stopFn = func() ([]byte, error) {
+			if elapsed := time.Since(startedAt); elapsed < 100*time.Millisecond {
+				// Light hack around https://github.com/felixge/fgprof/pull/34
+				time.Sleep(100*time.Millisecond - elapsed)
+			}
 			err := stop()
 			if err != nil {
 				return nil, err
@@ -571,46 +597,38 @@ func ToS3ETag(etag string) string {
 // GetDefaultConnSettings returns default HTTP connection settings.
 func GetDefaultConnSettings() xhttp.ConnSettings {
 	return xhttp.ConnSettings{
-		DNSCache:    globalDNSCache,
+		LookupHost:  globalDNSCache.LookupHost,
 		DialTimeout: rest.DefaultTimeout,
 		RootCAs:     globalRootCAs,
+		TCPOptions:  globalTCPOptions,
 	}
 }
 
 // NewInternodeHTTPTransport returns a transport for internode MinIO
 // connections.
-func NewInternodeHTTPTransport() func() http.RoundTripper {
+func NewInternodeHTTPTransport(maxIdleConnsPerHost int) func() http.RoundTripper {
 	return xhttp.ConnSettings{
-		DNSCache:         globalDNSCache,
+		LookupHost:       globalDNSCache.LookupHost,
 		DialTimeout:      rest.DefaultTimeout,
 		RootCAs:          globalRootCAs,
 		CipherSuites:     fips.TLSCiphers(),
 		CurvePreferences: fips.TLSCurveIDs(),
 		EnableHTTP2:      false,
-	}.NewInternodeHTTPTransport()
-}
-
-// NewCustomHTTPProxyTransport is used only for proxied requests, specifically
-// only supports HTTP/1.1
-func NewCustomHTTPProxyTransport() func() *http.Transport {
-	return xhttp.ConnSettings{
-		DNSCache:         globalDNSCache,
-		DialTimeout:      rest.DefaultTimeout,
-		RootCAs:          globalRootCAs,
-		CipherSuites:     fips.TLSCiphers(),
-		CurvePreferences: fips.TLSCurveIDs(),
-		EnableHTTP2:      false,
-	}.NewCustomHTTPProxyTransport()
+		TCPOptions:       globalTCPOptions,
+	}.NewInternodeHTTPTransport(maxIdleConnsPerHost)
 }
 
 // NewHTTPTransportWithClientCerts returns a new http configuration
 // used while communicating with the cloud backends.
-func NewHTTPTransportWithClientCerts(clientCert, clientKey string) *http.Transport {
+func NewHTTPTransportWithClientCerts(clientCert, clientKey string) http.RoundTripper {
 	s := xhttp.ConnSettings{
-		DNSCache:    globalDNSCache,
-		DialTimeout: defaultDialTimeout,
-		RootCAs:     globalRootCAs,
-		EnableHTTP2: false,
+		LookupHost:       globalDNSCache.LookupHost,
+		DialTimeout:      defaultDialTimeout,
+		RootCAs:          globalRootCAs,
+		CipherSuites:     fips.TLSCiphersBackwardCompatible(),
+		CurvePreferences: fips.TLSCurveIDs(),
+		TCPOptions:       globalTCPOptions,
+		EnableHTTP2:      false,
 	}
 
 	if clientCert != "" && clientKey != "" {
@@ -618,13 +636,16 @@ func NewHTTPTransportWithClientCerts(clientCert, clientKey string) *http.Transpo
 		defer cancel()
 		transport, err := s.NewHTTPTransportWithClientCerts(ctx, clientCert, clientKey)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("failed to load client key and cert, please check your endpoint configuration: %s",
-				err.Error()))
+			internalLogIf(ctx, fmt.Errorf("Unable to load client key and cert, please check your client certificate configuration: %w", err))
+		}
+		if transport == nil {
+			// Client certs are not readable return default transport.
+			return s.NewHTTPTransportWithTimeout(1 * time.Minute)
 		}
 		return transport
 	}
 
-	return s.NewHTTPTransportWithTimeout(1 * time.Minute)
+	return globalRemoteTargetTransport
 }
 
 // NewHTTPTransport returns a new http configuration
@@ -639,75 +660,27 @@ const defaultDialTimeout = 5 * time.Second
 // NewHTTPTransportWithTimeout allows setting a timeout.
 func NewHTTPTransportWithTimeout(timeout time.Duration) *http.Transport {
 	return xhttp.ConnSettings{
-		DNSCache:    globalDNSCache,
-		DialTimeout: defaultDialTimeout,
-		RootCAs:     globalRootCAs,
-		EnableHTTP2: false,
+		LookupHost:       globalDNSCache.LookupHost,
+		DialTimeout:      defaultDialTimeout,
+		RootCAs:          globalRootCAs,
+		TCPOptions:       globalTCPOptions,
+		CipherSuites:     fips.TLSCiphersBackwardCompatible(),
+		CurvePreferences: fips.TLSCurveIDs(),
+		EnableHTTP2:      false,
 	}.NewHTTPTransportWithTimeout(timeout)
-}
-
-type dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-
-// newCustomDialContext setups a custom dialer for any external communication and proxies.
-func newCustomDialContext() dialContext {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		dialer := &net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}
-
-		conn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-
-		dconn := deadlineconn.New(conn).
-			WithReadDeadline(globalConnReadDeadline).
-			WithWriteDeadline(globalConnWriteDeadline)
-
-		return dconn, nil
-	}
 }
 
 // NewRemoteTargetHTTPTransport returns a new http configuration
 // used while communicating with the remote replication targets.
-func NewRemoteTargetHTTPTransport() func() *http.Transport {
+func NewRemoteTargetHTTPTransport(insecure bool) func() *http.Transport {
 	return xhttp.ConnSettings{
-		DialContext: newCustomDialContext(),
-		RootCAs:     globalRootCAs,
-		EnableHTTP2: false,
-	}.NewRemoteTargetHTTPTransport()
-}
-
-// Load the json (typically from disk file).
-func jsonLoad(r io.ReadSeeker, data interface{}) error {
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	return json.NewDecoder(r).Decode(data)
-}
-
-// Save to disk file in json format.
-func jsonSave(f interface {
-	io.WriteSeeker
-	Truncate(int64) error
-}, data interface{},
-) error {
-	b, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	if err = f.Truncate(0); err != nil {
-		return err
-	}
-	if _, err = f.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	_, err = f.Write(b)
-	if err != nil {
-		return err
-	}
-	return nil
+		LookupHost:       globalDNSCache.LookupHost,
+		RootCAs:          globalRootCAs,
+		CipherSuites:     fips.TLSCiphersBackwardCompatible(),
+		CurvePreferences: fips.TLSCurveIDs(),
+		TCPOptions:       globalTCPOptions,
+		EnableHTTP2:      false,
+	}.NewRemoteTargetHTTPTransport(insecure)
 }
 
 // ceilFrac takes a numerator and denominator representing a fraction
@@ -822,7 +795,7 @@ func newContext(r *http.Request, w http.ResponseWriter, api string) context.Cont
 	bucket := vars["bucket"]
 	object := likelyUnescapeGeneric(vars["object"], url.PathUnescape)
 	reqInfo := &logger.ReqInfo{
-		DeploymentID: globalDeploymentID,
+		DeploymentID: globalDeploymentID(),
 		RequestID:    reqID,
 		RemoteHost:   handlers.GetSourceIP(r),
 		Host:         getHostName(r),
@@ -833,14 +806,7 @@ func newContext(r *http.Request, w http.ResponseWriter, api string) context.Cont
 		VersionID:    strings.TrimSpace(r.Form.Get(xhttp.VersionID)),
 	}
 
-	ctx := context.WithValue(r.Context(),
-		mcontext.ContextTraceKey,
-		&mcontext.TraceCtxt{
-			AmzReqID: reqID,
-		},
-	)
-
-	return logger.SetReqInfo(ctx, reqInfo)
+	return logger.SetReqInfo(r.Context(), reqInfo)
 }
 
 // Used for registering with rest handlers (have a look at registerStorageRESTHandlers for usage example)
@@ -907,108 +873,24 @@ func lcp(strs []string, pre bool) string {
 
 // Returns the mode in which MinIO is running
 func getMinioMode() string {
-	mode := globalMinioModeFS
-	if globalIsDistErasure {
-		mode = globalMinioModeDistErasure
-	} else if globalIsErasure {
-		mode = globalMinioModeErasure
-	} else if globalIsErasureSD {
-		mode = globalMinioModeErasureSD
+	switch {
+	case globalIsDistErasure:
+		return globalMinioModeDistErasure
+	case globalIsErasure:
+		return globalMinioModeErasure
+	case globalIsErasureSD:
+		return globalMinioModeErasureSD
+	default:
+		return globalMinioModeFS
 	}
-	return mode
 }
 
 func iamPolicyClaimNameOpenID() string {
-	return globalOpenIDConfig.GetIAMPolicyClaimName()
+	return globalIAMSys.OpenIDConfig.GetIAMPolicyClaimName()
 }
 
 func iamPolicyClaimNameSA() string {
 	return "sa-policy"
-}
-
-// timedValue contains a synchronized value that is considered valid
-// for a specific amount of time.
-// An Update function must be set to provide an updated value when needed.
-type timedValue struct {
-	// Update must return an updated value.
-	// If an error is returned the cached value is not set.
-	// Only one caller will call this function at any time, others will be blocking.
-	// The returned value can no longer be modified once returned.
-	// Should be set before calling Get().
-	Update func() (interface{}, error)
-
-	// TTL for a cached value.
-	// If not set 1 second TTL is assumed.
-	// Should be set before calling Get().
-	TTL time.Duration
-
-	// When set to true, return the last cached value
-	// even if updating the value errors out
-	Relax bool
-
-	// Once can be used to initialize values for lazy initialization.
-	// Should be set before calling Get().
-	Once sync.Once
-
-	// Managed values.
-	value      interface{}
-	lastUpdate time.Time
-	mu         sync.RWMutex
-}
-
-// Get will return a cached value or fetch a new one.
-// If the Update function returns an error the value is forwarded as is and not cached.
-func (t *timedValue) Get() (interface{}, error) {
-	v := t.get(t.ttl())
-	if v != nil {
-		return v, nil
-	}
-
-	v, err := t.Update()
-	if err != nil {
-		if t.Relax {
-			// if update fails, return current
-			// cached value along with error.
-			//
-			// Let the caller decide if they want
-			// to use the returned value based
-			// on error.
-			v = t.get(0)
-			return v, err
-		}
-		return v, err
-	}
-
-	t.update(v)
-	return v, nil
-}
-
-func (t *timedValue) ttl() time.Duration {
-	ttl := t.TTL
-	if ttl <= 0 {
-		ttl = time.Second
-	}
-	return ttl
-}
-
-func (t *timedValue) get(ttl time.Duration) (v interface{}) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	v = t.value
-	if ttl <= 0 {
-		return v
-	}
-	if time.Since(t.lastUpdate) < ttl {
-		return v
-	}
-	return nil
-}
-
-func (t *timedValue) update(v interface{}) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.value = v
-	t.lastUpdate = time.Now()
 }
 
 // On MinIO a directory object is stored as a regular object with "__XLDIR__" suffix.
@@ -1028,10 +910,16 @@ func decodeDirObject(object string) string {
 	return object
 }
 
+func isDirObject(object string) bool {
+	if obj := encodeDirObject(object); obj != object {
+		object = obj
+	}
+	return HasSuffix(object, globalDirSuffix)
+}
+
 // Helper method to return total number of nodes in cluster
-func totalNodeCount() uint64 {
-	peers, _ := globalEndpoints.peers()
-	totalNodesCount := uint64(len(peers))
+func totalNodeCount() int {
+	totalNodesCount := len(globalEndpoints.Hostnames())
 	if totalNodesCount == 0 {
 		totalNodesCount = 1 // For standalone erasure coding
 	}
@@ -1047,7 +935,7 @@ type AuditLogOptions struct {
 	Object    string
 	VersionID string
 	Error     string
-	Tags      map[string]interface{}
+	Tags      map[string]string
 }
 
 // sends audit logs for internal subsystem activity
@@ -1055,26 +943,24 @@ func auditLogInternal(ctx context.Context, opts AuditLogOptions) {
 	if len(logger.AuditTargets()) == 0 {
 		return
 	}
-	entry := audit.NewEntry(globalDeploymentID)
+
+	entry := audit.NewEntry(globalDeploymentID())
 	entry.Trigger = opts.Event
 	entry.Event = opts.Event
 	entry.Error = opts.Error
 	entry.API.Name = opts.APIName
 	entry.API.Bucket = opts.Bucket
-	entry.API.Objects = []audit.ObjectVersion{{ObjectName: opts.Object, VersionID: opts.VersionID}}
+	entry.API.Objects = []xaudit.ObjectVersion{{ObjectName: opts.Object, VersionID: opts.VersionID}}
 	entry.API.Status = opts.Status
-	entry.Tags = opts.Tags
+	entry.Tags = make(map[string]interface{}, len(opts.Tags))
+	for k, v := range opts.Tags {
+		entry.Tags[k] = v
+	}
+
 	// Merge tag information if found - this is currently needed for tags
 	// set during decommissioning.
 	if reqInfo := logger.GetReqInfo(ctx); reqInfo != nil {
-		if tags := reqInfo.GetTagsMap(); len(tags) > 0 {
-			if entry.Tags == nil {
-				entry.Tags = make(map[string]interface{}, len(tags))
-			}
-			for k, v := range tags {
-				entry.Tags[k] = v
-			}
-		}
+		reqInfo.PopulateTagsMap(opts.Tags)
 	}
 	ctx = logger.SetAuditEntry(ctx, &entry)
 	logger.AuditLog(ctx, nil, nil, nil)
@@ -1244,4 +1130,49 @@ func MockOpenIDTestUserInteraction(ctx context.Context, pro OpenIDClientAppParam
 
 	// fmt.Printf("TOKEN: %s\n", rawIDToken)
 	return rawIDToken, nil
+}
+
+// unwrapAll will unwrap the returned error completely.
+func unwrapAll(err error) error {
+	for {
+		werr := errors.Unwrap(err)
+		if werr == nil {
+			return err
+		}
+		err = werr
+	}
+}
+
+// stringsHasPrefixFold tests whether the string s begins with prefix ignoring case.
+func stringsHasPrefixFold(s, prefix string) bool {
+	// Test match with case first.
+	return len(s) >= len(prefix) && (s[0:len(prefix)] == prefix || strings.EqualFold(s[0:len(prefix)], prefix))
+}
+
+func ptr[T any](a T) *T {
+	return &a
+}
+
+// sleepContext sleeps for d duration or until ctx is done.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+	}
+	return nil
+}
+
+// helper type to return either item or error.
+type itemOrErr[V any] struct {
+	Item V
+	Err  error
+}
+
+func filterStorageClass(ctx context.Context, s string) string {
+	// Veeam 14.0 and later clients are not compatible with custom storage classes.
+	if globalVeeamForceSC != "" && s != storageclass.STANDARD && s != storageclass.RRS && isVeeamClient(ctx) {
+		return globalVeeamForceSC
+	}
+	return s
 }

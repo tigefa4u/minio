@@ -327,6 +327,12 @@ func (z *MRFReplicateEntries) DecodeMsg(dc *msgp.Reader) (err error) {
 							err = msgp.WrapError(err, "Entries", za0001, "Object")
 							return
 						}
+					case "rc":
+						za0002.RetryCount, err = dc.ReadInt()
+						if err != nil {
+							err = msgp.WrapError(err, "Entries", za0001, "RetryCount")
+							return
+						}
 					default:
 						err = dc.Skip()
 						if err != nil {
@@ -373,9 +379,9 @@ func (z *MRFReplicateEntries) EncodeMsg(en *msgp.Writer) (err error) {
 			err = msgp.WrapError(err, "Entries")
 			return
 		}
-		// map header, size 2
+		// map header, size 3
 		// write "b"
-		err = en.Append(0x82, 0xa1, 0x62)
+		err = en.Append(0x83, 0xa1, 0x62)
 		if err != nil {
 			return
 		}
@@ -392,6 +398,16 @@ func (z *MRFReplicateEntries) EncodeMsg(en *msgp.Writer) (err error) {
 		err = en.WriteString(za0002.Object)
 		if err != nil {
 			err = msgp.WrapError(err, "Entries", za0001, "Object")
+			return
+		}
+		// write "rc"
+		err = en.Append(0xa2, 0x72, 0x63)
+		if err != nil {
+			return
+		}
+		err = en.WriteInt(za0002.RetryCount)
+		if err != nil {
+			err = msgp.WrapError(err, "Entries", za0001, "RetryCount")
 			return
 		}
 	}
@@ -417,13 +433,16 @@ func (z *MRFReplicateEntries) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.AppendMapHeader(o, uint32(len(z.Entries)))
 	for za0001, za0002 := range z.Entries {
 		o = msgp.AppendString(o, za0001)
-		// map header, size 2
+		// map header, size 3
 		// string "b"
-		o = append(o, 0x82, 0xa1, 0x62)
+		o = append(o, 0x83, 0xa1, 0x62)
 		o = msgp.AppendString(o, za0002.Bucket)
 		// string "o"
 		o = append(o, 0xa1, 0x6f)
 		o = msgp.AppendString(o, za0002.Object)
+		// string "rc"
+		o = append(o, 0xa2, 0x72, 0x63)
+		o = msgp.AppendInt(o, za0002.RetryCount)
 	}
 	// string "v"
 	o = append(o, 0xa1, 0x76)
@@ -498,6 +517,12 @@ func (z *MRFReplicateEntries) UnmarshalMsg(bts []byte) (o []byte, err error) {
 							err = msgp.WrapError(err, "Entries", za0001, "Object")
 							return
 						}
+					case "rc":
+						za0002.RetryCount, bts, err = msgp.ReadIntBytes(bts)
+						if err != nil {
+							err = msgp.WrapError(err, "Entries", za0001, "RetryCount")
+							return
+						}
 					default:
 						bts, err = msgp.Skip(bts)
 						if err != nil {
@@ -532,7 +557,7 @@ func (z *MRFReplicateEntries) Msgsize() (s int) {
 	if z.Entries != nil {
 		for za0001, za0002 := range z.Entries {
 			_ = za0002
-			s += msgp.StringPrefixSize + len(za0001) + 1 + 2 + msgp.StringPrefixSize + len(za0002.Bucket) + 2 + msgp.StringPrefixSize + len(za0002.Object)
+			s += msgp.StringPrefixSize + len(za0001) + 1 + 2 + msgp.StringPrefixSize + len(za0002.Bucket) + 2 + msgp.StringPrefixSize + len(za0002.Object) + 3 + msgp.IntSize
 		}
 	}
 	s += 2 + msgp.IntSize
@@ -569,6 +594,12 @@ func (z *MRFReplicateEntry) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err, "Object")
 				return
 			}
+		case "rc":
+			z.RetryCount, err = dc.ReadInt()
+			if err != nil {
+				err = msgp.WrapError(err, "RetryCount")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -582,9 +613,9 @@ func (z *MRFReplicateEntry) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z MRFReplicateEntry) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 2
+	// map header, size 3
 	// write "b"
-	err = en.Append(0x82, 0xa1, 0x62)
+	err = en.Append(0x83, 0xa1, 0x62)
 	if err != nil {
 		return
 	}
@@ -603,19 +634,32 @@ func (z MRFReplicateEntry) EncodeMsg(en *msgp.Writer) (err error) {
 		err = msgp.WrapError(err, "Object")
 		return
 	}
+	// write "rc"
+	err = en.Append(0xa2, 0x72, 0x63)
+	if err != nil {
+		return
+	}
+	err = en.WriteInt(z.RetryCount)
+	if err != nil {
+		err = msgp.WrapError(err, "RetryCount")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z MRFReplicateEntry) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 2
+	// map header, size 3
 	// string "b"
-	o = append(o, 0x82, 0xa1, 0x62)
+	o = append(o, 0x83, 0xa1, 0x62)
 	o = msgp.AppendString(o, z.Bucket)
 	// string "o"
 	o = append(o, 0xa1, 0x6f)
 	o = msgp.AppendString(o, z.Object)
+	// string "rc"
+	o = append(o, 0xa2, 0x72, 0x63)
+	o = msgp.AppendInt(o, z.RetryCount)
 	return
 }
 
@@ -649,6 +693,12 @@ func (z *MRFReplicateEntry) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "Object")
 				return
 			}
+		case "rc":
+			z.RetryCount, bts, err = msgp.ReadIntBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "RetryCount")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -663,7 +713,7 @@ func (z *MRFReplicateEntry) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z MRFReplicateEntry) Msgsize() (s int) {
-	s = 1 + 2 + msgp.StringPrefixSize + len(z.Bucket) + 2 + msgp.StringPrefixSize + len(z.Object)
+	s = 1 + 2 + msgp.StringPrefixSize + len(z.Bucket) + 2 + msgp.StringPrefixSize + len(z.Object) + 3 + msgp.IntSize
 	return
 }
 
@@ -699,6 +749,7 @@ func (z *ReplicateDecision) DecodeMsg(dc *msgp.Reader) (err error) {
 // EncodeMsg implements msgp.Encodable
 func (z ReplicateDecision) EncodeMsg(en *msgp.Writer) (err error) {
 	// map header, size 0
+	_ = z
 	err = en.Append(0x80)
 	if err != nil {
 		return
@@ -710,6 +761,7 @@ func (z ReplicateDecision) EncodeMsg(en *msgp.Writer) (err error) {
 func (z ReplicateDecision) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
 	// map header, size 0
+	_ = z
 	o = append(o, 0x80)
 	return
 }
@@ -1338,6 +1390,7 @@ func (z *ResyncDecision) DecodeMsg(dc *msgp.Reader) (err error) {
 // EncodeMsg implements msgp.Encodable
 func (z ResyncDecision) EncodeMsg(en *msgp.Writer) (err error) {
 	// map header, size 0
+	_ = z
 	err = en.Append(0x80)
 	if err != nil {
 		return
@@ -1349,6 +1402,7 @@ func (z ResyncDecision) EncodeMsg(en *msgp.Writer) (err error) {
 func (z ResyncDecision) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
 	// map header, size 0
+	_ = z
 	o = append(o, 0x80)
 	return
 }

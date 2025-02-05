@@ -20,30 +20,39 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
-	"fmt"
+	"errors"
 	"hash"
 	"io"
-	"strings"
 	"sync"
 
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/ringbuffer"
 )
 
 // Calculates bitrot in chunks and writes the hash into the stream.
 type streamingBitrotWriter struct {
 	iow          io.WriteCloser
-	closeWithErr func(err error) error
+	closeWithErr func(err error)
 	h            hash.Hash
 	shardSize    int64
 	canClose     *sync.WaitGroup
+	byteBuf      []byte
+	finished     bool
 }
 
 func (b *streamingBitrotWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if b.finished {
+		return 0, errors.New("bitrot write not allowed")
+	}
+	if int64(len(p)) > b.shardSize {
+		return 0, errors.New("unexpected bitrot buffer size")
+	}
+	if int64(len(p)) < b.shardSize {
+		b.finished = true
 	}
 	b.h.Reset()
 	b.h.Write(p)
@@ -66,7 +75,10 @@ func (b *streamingBitrotWriter) Write(p []byte) (int, error) {
 }
 
 func (b *streamingBitrotWriter) Close() error {
+	// Close the underlying writer.
+	// This will also flush the ring buffer if used.
 	err := b.iow.Close()
+
 	// Wait for all data to be written before returning else it causes race conditions.
 	// Race condition is because of io.PipeWriter implementation. i.e consider the following
 	// sequent of operations:
@@ -77,33 +89,45 @@ func (b *streamingBitrotWriter) Close() error {
 	if b.canClose != nil {
 		b.canClose.Wait()
 	}
+
+	// Recycle the buffer.
+	if b.byteBuf != nil {
+		globalBytePoolCap.Load().Put(b.byteBuf)
+		b.byteBuf = nil
+	}
 	return err
 }
 
 // newStreamingBitrotWriterBuffer returns streaming bitrot writer implementation.
 // The output is written to the supplied writer w.
 func newStreamingBitrotWriterBuffer(w io.Writer, algo BitrotAlgorithm, shardSize int64) io.Writer {
-	return &streamingBitrotWriter{iow: ioutil.NopCloser(w), h: algo.New(), shardSize: shardSize, canClose: nil, closeWithErr: func(err error) error {
-		// Similar to CloseWithError on pipes we always return nil.
-		return nil
-	}}
+	return &streamingBitrotWriter{iow: ioutil.NopCloser(w), h: algo.New(), shardSize: shardSize, canClose: nil, closeWithErr: func(err error) {}}
 }
 
 // Returns streaming bitrot writer implementation.
-func newStreamingBitrotWriter(disk StorageAPI, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64) io.Writer {
-	r, w := io.Pipe()
+func newStreamingBitrotWriter(disk StorageAPI, origvolume, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64) io.Writer {
 	h := algo.New()
+	buf := globalBytePoolCap.Load().Get()
+	rb := ringbuffer.NewBuffer(buf[:cap(buf)]).SetBlocking(true)
 
-	bw := &streamingBitrotWriter{iow: w, closeWithErr: w.CloseWithError, h: h, shardSize: shardSize, canClose: &sync.WaitGroup{}}
+	bw := &streamingBitrotWriter{
+		iow:          ioutil.NewDeadlineWriter(rb.WriteCloser(), globalDriveConfig.GetMaxTimeout()),
+		closeWithErr: rb.CloseWithError,
+		h:            h,
+		shardSize:    shardSize,
+		canClose:     &sync.WaitGroup{},
+		byteBuf:      buf,
+	}
 	bw.canClose.Add(1)
 	go func() {
+		defer bw.canClose.Done()
+
 		totalFileSize := int64(-1) // For compressed objects length will be unknown (represented by length=-1)
 		if length != -1 {
 			bitrotSumsTotalSize := ceilFrac(length, shardSize) * int64(h.Size()) // Size used for storing bitrot checksums.
 			totalFileSize = bitrotSumsTotalSize + length
 		}
-		r.CloseWithError(disk.CreateFile(context.TODO(), volume, filePath, totalFileSize, r))
-		bw.canClose.Done()
+		rb.CloseWithError(disk.CreateFile(context.TODO(), origvolume, volume, filePath, totalFileSize, rb))
 	}()
 	return bw
 }
@@ -127,14 +151,8 @@ func (b *streamingBitrotReader) Close() error {
 		return nil
 	}
 	if closer, ok := b.rc.(io.Closer); ok {
-		// drain the body for connection re-use at network layer.
-		xhttp.DrainBody(struct {
-			io.Reader
-			io.Closer
-		}{
-			Reader: b.rc,
-			Closer: closeWrapper(func() error { return nil }),
-		})
+		// drain the body for connection reuse at network layer.
+		xhttp.DrainBody(io.NopCloser(b.rc))
 		return closer.Close()
 	}
 	return nil
@@ -147,29 +165,12 @@ func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
 		// Can never happen unless there are programmer bugs
 		return 0, errUnexpected
 	}
-	ignoredErrs := []error{
-		errDiskNotFound,
-	}
-	if strings.HasPrefix(b.volume, minioMetaBucket) {
-		ignoredErrs = append(ignoredErrs,
-			errFileNotFound,
-			errVolumeNotFound,
-			errFileVersionNotFound,
-		)
-	}
 	if b.rc == nil {
 		// For the first ReadAt() call we need to open the stream for reading.
 		b.currOffset = offset
 		streamOffset := (offset/b.shardSize)*int64(b.h.Size()) + offset
 		if len(b.data) == 0 && b.tillOffset != streamOffset {
 			b.rc, err = b.disk.ReadFileStream(context.TODO(), b.volume, b.filePath, streamOffset, b.tillOffset-streamOffset)
-			if err != nil {
-				if !IsErr(err, ignoredErrs...) {
-					logger.LogIf(GlobalContext,
-						fmt.Errorf("Reading erasure shards at (%s: %s/%s) returned '%w', will attempt to reconstruct if we have quorum",
-							b.disk, b.volume, b.filePath, err))
-				}
-			}
 		} else {
 			b.rc = io.NewSectionReader(bytes.NewReader(b.data), streamOffset, b.tillOffset-streamOffset)
 		}
@@ -191,10 +192,7 @@ func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
 		return 0, err
 	}
 	b.h.Write(buf)
-
 	if !bytes.Equal(b.h.Sum(nil), b.hashBytes) {
-		logger.LogIf(GlobalContext, fmt.Errorf("Drive: %s  -> %s/%s - content hash does not match - expected %s, got %s",
-			b.disk, b.volume, b.filePath, hex.EncodeToString(b.hashBytes), hex.EncodeToString(b.h.Sum(nil))))
 		return 0, errFileCorrupt
 	}
 	b.currOffset += int64(len(buf))

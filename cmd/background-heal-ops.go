@@ -19,9 +19,13 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"runtime"
+	"strconv"
+	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/pkg/v3/env"
 )
 
 // healTask represents what to heal along with options
@@ -56,27 +60,57 @@ func activeListeners() int {
 	return int(globalHTTPListen.Subscribers()) + int(globalTrace.Subscribers())
 }
 
-func waitForLowHTTPReq() {
-	var currentIO func() int
-	if httpServer := newHTTPServerFn(); httpServer != nil {
-		currentIO = httpServer.GetRequestCount
+func waitForLowIO(maxIO int, maxWait time.Duration, currentIO func() int) {
+	// No need to wait run at full speed.
+	if maxIO <= 0 {
+		return
 	}
 
-	globalHealConfig.Wait(currentIO, activeListeners)
+	const waitTick = 100 * time.Millisecond
+
+	tmpMaxWait := maxWait
+
+	for currentIO() >= maxIO {
+		if tmpMaxWait > 0 {
+			if tmpMaxWait < waitTick {
+				time.Sleep(tmpMaxWait)
+				return
+			}
+			time.Sleep(waitTick)
+			tmpMaxWait -= waitTick
+		}
+		if tmpMaxWait <= 0 {
+			return
+		}
+	}
+}
+
+func currentHTTPIO() int {
+	httpServer := newHTTPServerFn()
+	if httpServer == nil {
+		return 0
+	}
+
+	return httpServer.GetRequestCount() - activeListeners()
+}
+
+func waitForLowHTTPReq() {
+	maxIO, maxWait, _ := globalHealConfig.Clone()
+	waitForLowIO(maxIO, maxWait, currentHTTPIO)
 }
 
 func initBackgroundHealing(ctx context.Context, objAPI ObjectLayer) {
+	bgSeq := newBgHealSequence()
 	// Run the background healer
-	globalBackgroundHealRoutine = newHealRoutine()
 	for i := 0; i < globalBackgroundHealRoutine.workers; i++ {
-		go globalBackgroundHealRoutine.AddWorker(ctx, objAPI)
+		go globalBackgroundHealRoutine.AddWorker(ctx, objAPI, bgSeq)
 	}
 
-	globalBackgroundHealState.LaunchNewHealSequence(newBgHealSequence(), objAPI)
+	globalBackgroundHealState.LaunchNewHealSequence(bgSeq, objAPI)
 }
 
 // Wait for heal requests and process them
-func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
+func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer, bgSeq *healSequence) {
 	for {
 		select {
 		case task, ok := <-h.tasks:
@@ -101,8 +135,18 @@ func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
 
 			if task.respCh != nil {
 				task.respCh <- healResult{result: res, err: err}
+				continue
 			}
 
+			// when respCh is not set caller is not waiting but we
+			// update the relevant metrics for them
+			if bgSeq != nil {
+				if err == nil {
+					bgSeq.countHealed(res.Type)
+				} else {
+					bgSeq.countFailed(res.Type)
+				}
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -111,9 +155,19 @@ func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
 
 func newHealRoutine() *healRoutine {
 	workers := runtime.GOMAXPROCS(0) / 2
+
+	if envHealWorkers := env.Get("_MINIO_HEAL_WORKERS", ""); envHealWorkers != "" {
+		if numHealers, err := strconv.Atoi(envHealWorkers); err != nil {
+			bugLogIf(context.Background(), fmt.Errorf("invalid _MINIO_HEAL_WORKERS value: %w", err))
+		} else {
+			workers = numHealers
+		}
+	}
+
 	if workers == 0 {
 		workers = 4
 	}
+
 	return &healRoutine{
 		tasks:   make(chan healTask),
 		workers: workers,

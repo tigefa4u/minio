@@ -20,9 +20,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"net"
 	"reflect"
-	"runtime"
 	"testing"
 
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -133,23 +131,31 @@ func TestGetHostIP(t *testing.T) {
 		expectedErr    error
 	}{
 		{"localhost", set.CreateStringSet("127.0.0.1"), nil},
-		{"example.org", set.CreateStringSet("93.184.216.34"), nil},
 	}
 
 	for _, testCase := range testCases {
 		ipList, err := getHostIP(testCase.host)
-		if testCase.expectedErr == nil {
+		switch {
+		case testCase.expectedErr == nil:
 			if err != nil {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
 			}
-		} else if err == nil {
+		case err == nil:
 			t.Fatalf("error: expected = %v, got = <nil>", testCase.expectedErr)
-		} else if testCase.expectedErr.Error() != err.Error() {
+		case testCase.expectedErr.Error() != err.Error():
 			t.Fatalf("error: expected = %v, got = %v", testCase.expectedErr, err)
 		}
 
-		if testCase.expectedIPList != nil && testCase.expectedIPList.Intersection(ipList).IsEmpty() {
-			t.Fatalf("host: expected = %v, got = %v", testCase.expectedIPList, ipList)
+		if testCase.expectedIPList != nil {
+			var found bool
+			for _, ip := range ipList.ToSlice() {
+				if testCase.expectedIPList.Contains(ip) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("host: expected = %v, got = %v", testCase.expectedIPList, ipList)
+			}
 		}
 	}
 }
@@ -179,60 +185,6 @@ func TestGetAPIEndpoints(t *testing.T) {
 	}
 }
 
-// Ask the kernel for a free open port.
-func getFreePort() string {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		panic(err)
-	}
-
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		panic(err)
-	}
-	defer l.Close()
-	return fmt.Sprintf("%d", l.Addr().(*net.TCPAddr).Port)
-}
-
-// Tests for port availability logic written for server startup sequence.
-func TestCheckPortAvailability(t *testing.T) {
-	// Make a port is not available.
-	port := getFreePort()
-	listener, err := net.Listen("tcp", net.JoinHostPort("", port))
-	if err != nil {
-		t.Fatalf("Unable to listen on port %v", port)
-	}
-	defer listener.Close()
-
-	testCases := []struct {
-		host        string
-		port        string
-		expectedErr error
-	}{
-		{"", port, fmt.Errorf("listen tcp :%v: bind: address already in use", port)},
-		{"127.0.0.1", port, fmt.Errorf("listen tcp 127.0.0.1:%v: bind: address already in use", port)},
-		{"", getFreePort(), nil},
-	}
-
-	for _, testCase := range testCases {
-		// On MS Windows and Mac, skip checking error case due to https://github.com/golang/go/issues/7598
-		if (runtime.GOOS == globalWindowsOSName || runtime.GOOS == globalMacOSName || runtime.GOOS == "solaris") && testCase.expectedErr != nil {
-			continue
-		}
-
-		err := checkPortAvailability(testCase.host, testCase.port)
-		if testCase.expectedErr == nil {
-			if err != nil {
-				t.Fatalf("error: expected = <nil>, got = %v", err)
-			}
-		} else if err == nil {
-			t.Fatalf("error: expected = %v, got = <nil>", testCase.expectedErr)
-		} else if testCase.expectedErr.Error() != err.Error() {
-			t.Fatalf("error: expected = %v, got = %v", testCase.expectedErr, err)
-		}
-	}
-}
-
 func TestCheckLocalServerAddr(t *testing.T) {
 	testCases := []struct {
 		serverAddr  string
@@ -252,13 +204,14 @@ func TestCheckLocalServerAddr(t *testing.T) {
 		testCase := testCase
 		t.Run("", func(t *testing.T) {
 			err := CheckLocalServerAddr(testCase.serverAddr)
-			if testCase.expectedErr == nil {
+			switch {
+			case testCase.expectedErr == nil:
 				if err != nil {
 					t.Errorf("error: expected = <nil>, got = %v", err)
 				}
-			} else if err == nil {
+			case err == nil:
 				t.Errorf("error: expected = %v, got = <nil>", testCase.expectedErr)
-			} else if testCase.expectedErr.Error() != err.Error() {
+			case testCase.expectedErr.Error() != err.Error():
 				t.Errorf("error: expected = %v, got = %v", testCase.expectedErr, err)
 			}
 		})

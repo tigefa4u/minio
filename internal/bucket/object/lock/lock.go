@@ -34,8 +34,16 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/env"
+	"github.com/minio/pkg/v3/env"
 )
+
+const (
+	logSubsys = "locking"
+)
+
+func lockLogIf(ctx context.Context, err error) {
+	logger.LogIf(ctx, logSubsys, err)
+}
 
 // Enabled indicates object locking is enabled
 const Enabled = "Enabled"
@@ -153,7 +161,7 @@ type Retention struct {
 func (r Retention) Retain(created time.Time) bool {
 	t, err := UTCNowNTP()
 	if err != nil {
-		logger.LogIf(context.Background(), err)
+		lockLogIf(context.Background(), err)
 		// Retain
 		return true
 	}
@@ -229,6 +237,30 @@ type Config struct {
 	} `xml:"Rule,omitempty"`
 }
 
+// String returns the human readable format of object lock configuration, used in audit logs.
+func (config Config) String() string {
+	parts := []string{
+		fmt.Sprintf("Enabled: %v", config.Enabled()),
+	}
+	if config.Rule != nil {
+		if config.Rule.DefaultRetention.Mode != "" {
+			parts = append(parts, fmt.Sprintf("Mode: %s", config.Rule.DefaultRetention.Mode))
+		}
+		if config.Rule.DefaultRetention.Days != nil {
+			parts = append(parts, fmt.Sprintf("Days: %d", *config.Rule.DefaultRetention.Days))
+		}
+		if config.Rule.DefaultRetention.Years != nil {
+			parts = append(parts, fmt.Sprintf("Years: %d", *config.Rule.DefaultRetention.Years))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// Enabled returns true if config.ObjectLockEnabled is set to Enabled
+func (config *Config) Enabled() bool {
+	return config.ObjectLockEnabled == Enabled
+}
+
 // UnmarshalXML - decodes XML data.
 func (config *Config) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	// Make subtype to avoid recursive UnmarshalXML().
@@ -257,7 +289,7 @@ func (config *Config) ToRetention() Retention {
 
 		t, err := UTCNowNTP()
 		if err != nil {
-			logger.LogIf(context.Background(), err)
+			lockLogIf(context.Background(), err)
 			// Do not change any configuration
 			// upon NTP failure.
 			return r
@@ -336,6 +368,10 @@ type ObjectRetention struct {
 	RetainUntilDate RetentionDate `xml:"RetainUntilDate,omitempty"`
 }
 
+func (o ObjectRetention) String() string {
+	return fmt.Sprintf("Mode: %s, RetainUntilDate: %s", o.Mode, o.RetainUntilDate.Time)
+}
+
 // Maximum 4KiB size per object retention config.
 const maxObjectRetentionSize = 1 << 12
 
@@ -359,7 +395,7 @@ func ParseObjectRetention(reader io.Reader) (*ObjectRetention, error) {
 
 	t, err := UTCNowNTP()
 	if err != nil {
-		logger.LogIf(context.Background(), err)
+		lockLogIf(context.Background(), err)
 		return &ret, ErrPastObjectLockRetainDate
 	}
 
@@ -422,7 +458,7 @@ func ParseObjectLockRetentionHeaders(h http.Header) (rmode RetMode, r RetentionD
 
 	t, err := UTCNowNTP()
 	if err != nil {
-		logger.LogIf(context.Background(), err)
+		lockLogIf(context.Background(), err)
 		return rmode, r, ErrPastObjectLockRetainDate
 	}
 
@@ -514,8 +550,7 @@ func (l *ObjectLegalHold) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (
 			return err
 		}
 
-		switch se := t.(type) {
-		case xml.StartElement:
+		if se, ok := t.(xml.StartElement); ok {
 			switch se.Name.Local {
 			case "Status":
 				var st LegalHoldStatus
@@ -560,6 +595,7 @@ func FilterObjectLockMetadata(metadata map[string]string, filterRetention, filte
 	dst := metadata
 	var copied bool
 	delKey := func(key string) {
+		key = strings.ToLower(key)
 		if _, ok := metadata[key]; !ok {
 			return
 		}

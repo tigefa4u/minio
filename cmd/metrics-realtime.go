@@ -19,10 +19,16 @@ package cmd
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/disk"
+	"github.com/minio/minio/internal/net"
+	c "github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/load"
 )
 
 type collectMetricsOpts struct {
@@ -37,10 +43,20 @@ func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m ma
 		return
 	}
 
+	byHostName := globalMinioAddr
 	if len(opts.hosts) > 0 {
-		if _, ok := opts.hosts[globalMinioAddr]; !ok {
+		server := getLocalServerProperty(globalEndpoints, &http.Request{
+			Host: globalLocalNodeName,
+		}, false)
+		if _, ok := opts.hosts[server.Endpoint]; ok {
+			byHostName = server.Endpoint
+		} else {
 			return
 		}
+	}
+
+	if strings.HasPrefix(byHostName, ":") && !strings.HasPrefix(globalLocalNodeName, ":") {
+		byHostName = globalLocalNodeName
 	}
 
 	if types.Contains(madmin.MetricsDisk) {
@@ -69,11 +85,67 @@ func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m ma
 	if types.Contains(madmin.MetricsSiteResync) {
 		m.Aggregated.SiteResync = globalSiteResyncMetrics.report(opts.depID)
 	}
+	if types.Contains(madmin.MetricNet) {
+		m.Aggregated.Net = &madmin.NetMetrics{
+			CollectedAt:   UTCNow(),
+			InterfaceName: globalInternodeInterface,
+		}
+		netStats, err := net.GetInterfaceNetStats(globalInternodeInterface)
+		if err != nil {
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v  (nicstats)", byHostName, err.Error()))
+		} else {
+			m.Aggregated.Net.NetStats = netStats
+		}
+	}
+	if types.Contains(madmin.MetricsMem) {
+		m.Aggregated.Mem = &madmin.MemMetrics{
+			CollectedAt: UTCNow(),
+		}
+		m.Aggregated.Mem.Info = madmin.GetMemInfo(GlobalContext, byHostName)
+	}
+	if types.Contains(madmin.MetricsCPU) {
+		m.Aggregated.CPU = &madmin.CPUMetrics{
+			CollectedAt: UTCNow(),
+		}
+		cm, err := c.Times(false)
+		if err != nil {
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v (cpuTimes)", byHostName, err.Error()))
+		} else {
+			// not collecting per-cpu stats, so there will be only one element
+			if len(cm) == 1 {
+				m.Aggregated.CPU.TimesStat = &cm[0]
+			} else {
+				m.Errors = append(m.Errors, fmt.Sprintf("%s: Expected one CPU stat, got %d", byHostName, len(cm)))
+			}
+		}
+		cpuCount, err := c.Counts(true)
+		if err != nil {
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v (cpuCount)", byHostName, err.Error()))
+		} else {
+			m.Aggregated.CPU.CPUCount = cpuCount
+		}
+
+		loadStat, err := load.Avg()
+		if err != nil {
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v (loadStat)", byHostName, err.Error()))
+		} else {
+			m.Aggregated.CPU.LoadStat = loadStat
+		}
+	}
+	if types.Contains(madmin.MetricsRPC) {
+		gr := globalGrid.Load()
+		if gr == nil {
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: Grid not initialized", byHostName))
+		} else {
+			stats := gr.ConnStats()
+			m.Aggregated.RPC = &stats
+		}
+	}
 	// Add types...
 
 	// ByHost is a shallow reference, so careful about sharing.
-	m.ByHost = map[string]madmin.Metrics{globalMinioAddr: m.Aggregated}
-	m.Hosts = append(m.Hosts, globalMinioAddr)
+	m.ByHost = map[string]madmin.Metrics{byHostName: m.Aggregated}
+	m.Hosts = append(m.Hosts, byHostName)
 
 	return m
 }
@@ -85,13 +157,7 @@ func collectLocalDisksMetrics(disks map[string]struct{}) map[string]madmin.DiskM
 	}
 
 	metrics := make(map[string]madmin.DiskMetric)
-
-	procStats, procErr := disk.GetAllDrivesIOStats()
-	if procErr != nil {
-		return metrics
-	}
-
-	storageInfo := objLayer.LocalStorageInfo(GlobalContext)
+	storageInfo := objLayer.LocalStorageInfo(GlobalContext, true)
 	for _, d := range storageInfo.Disks {
 		if len(disks) != 0 {
 			_, ok := disks[d.Endpoint]
@@ -125,9 +191,8 @@ func collectLocalDisksMetrics(disks map[string]struct{}) map[string]madmin.DiskM
 			}
 		}
 
-		// get disk
-		if procErr == nil {
-			st := procStats[disk.DevID{Major: d.Major, Minor: d.Minor}]
+		st, err := disk.GetDriveStats(d.Major, d.Minor)
+		if err == nil {
 			dm.IOStats = madmin.DiskIOStats{
 				ReadIOs:        st.ReadIOs,
 				ReadMerges:     st.ReadMerges,

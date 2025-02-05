@@ -24,10 +24,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/klauspost/compress/gzhttp"
-	"github.com/minio/madmin-go/v2"
+	internalAudit "github.com/minio/minio/internal/logger/message/audit"
+	"github.com/minio/minio/internal/mcontext"
+	"github.com/minio/pkg/v3/logger/message/audit"
+
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger/message/audit"
 )
 
 const contextAuditKey = contextKeyType("audit-entry")
@@ -35,7 +36,7 @@ const contextAuditKey = contextKeyType("audit-entry")
 // SetAuditEntry sets Audit info in the context.
 func SetAuditEntry(ctx context.Context, audit *audit.Entry) context.Context {
 	if ctx == nil {
-		LogIf(context.Background(), fmt.Errorf("context is nil"))
+		LogIf(context.Background(), "audit", fmt.Errorf("context is nil"))
 		return nil
 	}
 	return context.WithValue(ctx, contextAuditKey, audit)
@@ -49,7 +50,7 @@ func GetAuditEntry(ctx context.Context) *audit.Entry {
 			return r
 		}
 		r = &audit.Entry{
-			Version:      audit.Version,
+			Version:      internalAudit.Version,
 			DeploymentID: xhttp.GlobalDeploymentID,
 			Time:         time.Now().UTC(),
 		}
@@ -74,7 +75,7 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 		reqInfo.RLock()
 		defer reqInfo.RUnlock()
 
-		entry = audit.ToEntry(w, r, reqClaims, xhttp.GlobalDeploymentID)
+		entry = internalAudit.ToEntry(w, r, reqClaims, xhttp.GlobalDeploymentID)
 		// indicates all requests for this API call are inbound
 		entry.Trigger = "incoming"
 
@@ -93,28 +94,17 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 			headerBytes     int64
 		)
 
-		var st *xhttp.ResponseRecorder
-		switch v := w.(type) {
-		case *xhttp.ResponseRecorder:
-			st = v
-		case *gzhttp.GzipResponseWriter:
-			// the writer may be obscured by gzip response writer
-			if rw, ok := v.ResponseWriter.(*xhttp.ResponseRecorder); ok {
-				st = rw
-			}
-		case *gzhttp.NoGzipResponseWriter:
-			// the writer may be obscured by no-gzip response writer
-			if rw, ok := v.ResponseWriter.(*xhttp.ResponseRecorder); ok {
-				st = rw
-			}
+		tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
+		if ok {
+			statusCode = tc.ResponseRecorder.StatusCode
+			outputBytes = int64(tc.ResponseRecorder.Size())
+			headerBytes = int64(tc.ResponseRecorder.HeaderSize())
+			timeToResponse = time.Now().UTC().Sub(tc.ResponseRecorder.StartTime)
+			timeToFirstByte = tc.ResponseRecorder.TTFB()
 		}
-		if st != nil {
-			statusCode = st.StatusCode
-			timeToResponse = time.Now().UTC().Sub(st.StartTime)
-			timeToFirstByte = st.TimeToFirstByte
-			outputBytes = int64(st.Size())
-			headerBytes = int64(st.HeaderSize())
-		}
+
+		entry.AccessKey = reqInfo.Cred.AccessKey
+		entry.ParentUser = reqInfo.Cred.ParentUser
 
 		entry.API.Name = reqInfo.API
 		entry.API.Bucket = reqInfo.BucketName
@@ -132,10 +122,17 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 		entry.API.OutputBytes = outputBytes
 		entry.API.HeaderBytes = headerBytes
 		entry.API.TimeToResponse = strconv.FormatInt(timeToResponse.Nanoseconds(), 10) + "ns"
-		entry.Tags = reqInfo.GetTagsMap()
-		// ttfb will be recorded only for GET requests, Ignore such cases where ttfb will be empty.
+		entry.API.TimeToResponseInNS = strconv.FormatInt(timeToResponse.Nanoseconds(), 10)
+		// We hold the lock, so we cannot call reqInfo.GetTagsMap().
+		tags := make(map[string]interface{}, len(reqInfo.tags))
+		for _, t := range reqInfo.tags {
+			tags[t.Key] = t.Val
+		}
+		entry.Tags = tags
+		// ignore cases for ttfb when its zero.
 		if timeToFirstByte != 0 {
 			entry.API.TimeToFirstByte = strconv.FormatInt(timeToFirstByte.Nanoseconds(), 10) + "ns"
+			entry.API.TimeToFirstByteInNS = strconv.FormatInt(timeToFirstByte.Nanoseconds(), 10)
 		}
 	} else {
 		auditEntry := GetAuditEntry(ctx)
@@ -146,8 +143,8 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 
 	// Send audit logs only to http targets.
 	for _, t := range auditTgts {
-		if err := t.Send(entry); err != nil {
-			LogAlwaysIf(context.Background(), fmt.Errorf("event(%v) was not sent to Audit target (%v): %v", entry, t, err), madmin.LogKindAll)
+		if err := t.Send(ctx, entry); err != nil {
+			LogOnceIf(ctx, "logging", fmt.Errorf("Unable to send audit event(s) to the target `%v`: %v", t, err), "send-audit-event-failure")
 		}
 	}
 }

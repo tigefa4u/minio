@@ -26,7 +26,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 // Tests maximum object size.
@@ -288,40 +287,6 @@ func TestToS3ETag(t *testing.T) {
 	}
 }
 
-// Test contains
-func TestContains(t *testing.T) {
-	testErr := errors.New("test err")
-
-	testCases := []struct {
-		slice interface{}
-		elem  interface{}
-		found bool
-	}{
-		{nil, nil, false},
-		{"1", "1", false},
-		{nil, "1", false},
-		{[]string{"1"}, nil, false},
-		{[]string{}, "1", false},
-		{[]string{"1"}, "1", true},
-		{[]string{"2"}, "1", false},
-		{[]string{"1", "2"}, "1", true},
-		{[]string{"2", "1"}, "1", true},
-		{[]string{"2", "1", "3"}, "1", true},
-		{[]int{1, 2, 3}, "1", false},
-		{[]int{1, 2, 3}, 2, true},
-		{[]int{1, 2, 3, 4, 5, 6}, 7, false},
-		{[]error{errors.New("new err")}, testErr, false},
-		{[]error{errors.New("new err"), testErr}, testErr, true},
-	}
-
-	for i, testCase := range testCases {
-		found := contains(testCase.slice, testCase.elem)
-		if found != testCase.found {
-			t.Fatalf("Test %v: expected: %v, got: %v", i+1, testCase.found, found)
-		}
-	}
-}
-
 // Test ceilFrac
 func TestCeilFrac(t *testing.T) {
 	cases := []struct {
@@ -433,33 +398,4 @@ func TestGetMinioMode(t *testing.T) {
 
 	globalIsDistErasure, globalIsErasure = false, false
 	testMinioMode(globalMinioModeFS)
-}
-
-func TestTimedValue(t *testing.T) {
-	var cache timedValue
-	t.Parallel()
-	cache.Once.Do(func() {
-		cache.TTL = 2 * time.Second
-		cache.Update = func() (interface{}, error) {
-			return time.Now(), nil
-		}
-	})
-
-	i, _ := cache.Get()
-	t1 := i.(time.Time)
-
-	j, _ := cache.Get()
-	t2 := j.(time.Time)
-
-	if !t1.Equal(t2) {
-		t.Fatalf("expected time to be equal: %s != %s", t1, t2)
-	}
-
-	time.Sleep(3 * time.Second)
-	k, _ := cache.Get()
-	t3 := k.(time.Time)
-
-	if t1.Equal(t3) {
-		t.Fatalf("expected time to be un-equal: %s == %s", t1, t3)
-	}
 }

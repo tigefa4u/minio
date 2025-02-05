@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -24,8 +24,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
-	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,11 +40,6 @@ var (
 )
 
 const (
-	serverShutdownPoll = 500 * time.Millisecond
-
-	// DefaultShutdownTimeout - default shutdown timeout to gracefully shutdown server.
-	DefaultShutdownTimeout = 5 * time.Second
-
 	// DefaultIdleTimeout for idle inactive connections
 	DefaultIdleTimeout = 30 * time.Second
 
@@ -60,12 +53,12 @@ const (
 // Server - extended http.Server supports multiple addresses to serve and enhanced connection handling.
 type Server struct {
 	http.Server
-	Addrs           []string      // addresses on which the server listens for new connection.
-	ShutdownTimeout time.Duration // timeout used for graceful server shutdown.
-	listenerMutex   sync.Mutex    // to guard 'listener' field.
-	listener        *httpListener // HTTP listener for all 'Addrs' field.
-	inShutdown      uint32        // indicates whether the server is in shutdown or not
-	requestCount    int32         // counter holds no. of request in progress.
+	Addrs         []string      // addresses on which the server listens for new connection.
+	TCPOptions    TCPOptions    // all the configurable TCP conn specific configurable options.
+	listenerMutex sync.Mutex    // to guard 'listener' field.
+	listener      *httpListener // HTTP listener for all 'Addrs' field.
+	inShutdown    uint32        // indicates whether the server is in shutdown or not
+	requestCount  int32         // counter holds no. of request in progress.
 }
 
 // GetRequestCount - returns number of request in progress.
@@ -73,8 +66,8 @@ func (srv *Server) GetRequestCount() int {
 	return int(atomic.LoadInt32(&srv.requestCount))
 }
 
-// Start - start HTTP server
-func (srv *Server) Start(ctx context.Context) (err error) {
+// Init - init HTTP server
+func (srv *Server) Init(listenCtx context.Context, listenErrCallback func(listenAddr string, err error)) (serve func() error, err error) {
 	// Take a copy of server fields.
 	var tlsConfig *tls.Config
 	if srv.TLSConfig != nil {
@@ -84,12 +77,22 @@ func (srv *Server) Start(ctx context.Context) (err error) {
 
 	// Create new HTTP listener.
 	var listener *httpListener
-	listener, err = newHTTPListener(
-		ctx,
+	listener, listenErrs := newHTTPListener(
+		listenCtx,
 		srv.Addrs,
+		srv.TCPOptions,
 	)
-	if err != nil {
-		return err
+
+	var interfaceFound bool
+	for i := range listenErrs {
+		if listenErrs[i] != nil {
+			listenErrCallback(srv.Addrs[i], listenErrs[i])
+		} else {
+			interfaceFound = true
+		}
+	}
+	if !interfaceFound {
+		return nil, errors.New("no available interface found")
 	}
 
 	// Wrap given handler to do additional
@@ -97,8 +100,12 @@ func (srv *Server) Start(ctx context.Context) (err error) {
 	wrappedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// If server is in shutdown.
 		if atomic.LoadUint32(&srv.inShutdown) != 0 {
-			// To indicate disable keep-alives
+			// To indicate disable keep-alive, server is shutting down.
 			w.Header().Set("Connection", "close")
+
+			// Add 1 minute retry header, incase-client wants to honor it
+			w.Header().Set(RetryAfter, "60")
+
 			w.WriteHeader(http.StatusServiceUnavailable)
 			w.Write([]byte(http.ErrServerClosed.Error()))
 			return
@@ -116,11 +123,16 @@ func (srv *Server) Start(ctx context.Context) (err error) {
 	srv.listener = listener
 	srv.listenerMutex.Unlock()
 
-	// Start servicing with listener.
+	var l net.Listener = listener
 	if tlsConfig != nil {
-		return srv.Server.Serve(tls.NewListener(listener, tlsConfig))
+		l = tls.NewListener(listener, tlsConfig)
 	}
-	return srv.Server.Serve(listener)
+
+	serve = func() error {
+		return srv.Server.Serve(l)
+	}
+
+	return
 }
 
 // Shutdown - shuts down HTTP server.
@@ -146,33 +158,7 @@ func (srv *Server) Shutdown() error {
 	}
 
 	// Wait for opened connection to be closed up to Shutdown timeout.
-	shutdownTimeout := srv.ShutdownTimeout
-	shutdownTimer := time.NewTimer(shutdownTimeout)
-	ticker := time.NewTicker(serverShutdownPoll)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-shutdownTimer.C:
-			// Write all running goroutines.
-			tmp, err := os.CreateTemp("", "minio-goroutines-*.txt")
-			if err == nil {
-				_ = pprof.Lookup("goroutine").WriteTo(tmp, 1)
-				tmp.Close()
-				return errors.New("timed out. some connections are still active. goroutines written to " + tmp.Name())
-			}
-			return errors.New("timed out. some connections are still active")
-		case <-ticker.C:
-			if atomic.LoadInt32(&srv.requestCount) <= 0 {
-				return nil
-			}
-		}
-	}
-}
-
-// UseShutdownTimeout configure server shutdown timeout
-func (srv *Server) UseShutdownTimeout(d time.Duration) *Server {
-	srv.ShutdownTimeout = d
-	return srv
+	return nil
 }
 
 // UseIdleTimeout configure idle connection timeout
@@ -181,9 +167,21 @@ func (srv *Server) UseIdleTimeout(d time.Duration) *Server {
 	return srv
 }
 
+// UseReadTimeout configure connection request read timeout.
+func (srv *Server) UseReadTimeout(d time.Duration) *Server {
+	srv.ReadTimeout = d
+	return srv
+}
+
 // UseReadHeaderTimeout configure read header timeout
 func (srv *Server) UseReadHeaderTimeout(d time.Duration) *Server {
 	srv.ReadHeaderTimeout = d
+	return srv
+}
+
+// UseWriteTimeout configure connection response write timeout.
+func (srv *Server) UseWriteTimeout(d time.Duration) *Server {
+	srv.WriteTimeout = d
 	return srv
 }
 
@@ -210,6 +208,12 @@ func (srv *Server) UseBaseContext(ctx context.Context) *Server {
 // UseCustomLogger use customized logger for this HTTP *Server
 func (srv *Server) UseCustomLogger(l *log.Logger) *Server {
 	srv.ErrorLog = l
+	return srv
+}
+
+// UseTCPOptions use custom TCP options on raw socket
+func (srv *Server) UseTCPOptions(opts TCPOptions) *Server {
+	srv.TCPOptions = opts
 	return srv
 }
 

@@ -21,7 +21,10 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"runtime"
 	"syscall"
+
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
 // Type of service signals currently supported.
@@ -37,18 +40,11 @@ const (
 )
 
 // Global service signal channel.
-var globalServiceSignalCh chan serviceSignal
+var globalServiceSignalCh = make(chan serviceSignal)
 
 // GlobalContext context that is canceled when server is requested to shut down.
-var GlobalContext context.Context
-
 // cancelGlobalContext can be used to indicate server shutdown.
-var cancelGlobalContext context.CancelFunc
-
-func initGlobalContext() {
-	GlobalContext, cancelGlobalContext = context.WithCancel(context.Background())
-	globalServiceSignalCh = make(chan serviceSignal)
-}
+var GlobalContext, cancelGlobalContext = context.WithCancel(context.Background())
 
 // restartProcess starts a new process passing it the active fd's. It
 // doesn't fork, but starts a new process using the same environment and
@@ -56,6 +52,19 @@ func initGlobalContext() {
 // deployed binary to be started. It returns the pid of the newly started
 // process when successful.
 func restartProcess() error {
+	if runtime.GOOS == globalWindowsOSName {
+		cmd := exec.Command(os.Args[0], os.Args[1:]...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		cmd.Env = os.Environ()
+		err := cmd.Run()
+		if err == nil {
+			os.Exit(0)
+		}
+		return err
+	}
+
 	// Use the original binary location. This works with symlinks such that if
 	// the file it points to has been changed we will use the updated symlink.
 	argv0, err := exec.LookPath(os.Args[0])
@@ -90,12 +99,12 @@ func unfreezeServices() {
 	// Close when we reach 0
 	globalServiceFreezeCnt--
 	if globalServiceFreezeCnt <= 0 {
-		// Ensure we only close once.
-		if val := globalServiceFreeze.Load(); val != nil {
-			var _ch chan struct{}
-			if ch, ok := val.(chan struct{}); ok {
-				globalServiceFreeze.Store(_ch)
-				close(ch)
+		// Set to a nil channel.
+		var _ch chan struct{}
+		if val := globalServiceFreeze.Swap(_ch); val != nil {
+			if ch, ok := val.(chan struct{}); ok && ch != nil {
+				// Close previous non-nil channel.
+				xioutil.SafeClose(ch)
 			}
 		}
 		globalServiceFreezeCnt = 0 // Don't risk going negative.

@@ -28,8 +28,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/minio/internal/bucket/lifecycle"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/grid"
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
 func renameAllBucketMetacache(epPath string) error {
@@ -39,7 +39,7 @@ func renameAllBucketMetacache(epPath string) error {
 		if typ == os.ModeDir {
 			tmpMetacacheOld := pathutil.Join(epPath, minioMetaTmpDeletedBucket, mustGetUUID())
 			if err := renameAll(pathJoin(epPath, minioMetaBucket, metacachePrefixForID(name, slashSeparator)),
-				tmpMetacacheOld); err != nil && err != errFileNotFound {
+				tmpMetacacheOld, epPath); err != nil && err != errFileNotFound {
 				return fmt.Errorf("unable to rename (%s -> %s) %w",
 					pathJoin(epPath, minioMetaBucket+metacachePrefixForID(minioMetaBucket, slashSeparator)),
 					tmpMetacacheOld,
@@ -58,8 +58,13 @@ func renameAllBucketMetacache(epPath string) error {
 // Other important fields are Limit, Marker.
 // List ID always derived from the Marker.
 func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (entries metaCacheEntriesSorted, err error) {
-	if err := checkListObjsArgs(ctx, o.Bucket, o.Prefix, o.Marker, z); err != nil {
+	if err := checkListObjsArgs(ctx, o.Bucket, o.Prefix, o.Marker); err != nil {
 		return entries, err
+	}
+
+	// Marker points to before the prefix, just ignore it.
+	if o.Marker < o.Prefix {
+		o.Marker = ""
 	}
 
 	// Marker is set validate pre-condition.
@@ -96,7 +101,9 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 
 	// Decode and get the optional list id from the marker.
 	o.parseMarker()
-	o.BaseDir = baseDirFromPrefix(o.Prefix)
+	if o.BaseDir == "" {
+		o.BaseDir = baseDirFromPrefix(o.Prefix)
+	}
 	o.Transient = o.Transient || isReservedOrInvalidBucket(o.Bucket, false)
 	o.SetFilter()
 	if o.Transient {
@@ -127,8 +134,9 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 				// request canceled, no entries to return
 				return entries, io.EOF
 			}
-			if !errors.Is(err, context.DeadlineExceeded) {
-				o.debugln("listPath: got error", err)
+			if !IsErr(err, context.DeadlineExceeded, grid.ErrDisconnected) {
+				// Report error once per bucket, but continue listing.x
+				storageLogOnceIf(ctx, err, "GetMetacacheListing:"+o.Bucket)
 			}
 			o.Transient = true
 			o.Create = false
@@ -145,19 +153,7 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 			} else {
 				// Continue listing
 				o.ID = c.id
-				go func(meta metacache) {
-					// Continuously update while we wait.
-					t := time.NewTicker(metacacheMaxClientWait / 10)
-					defer t.Stop()
-					select {
-					case <-ctx.Done():
-						// Request is done, stop updating.
-						return
-					case <-t.C:
-						meta.lastHandout = time.Now()
-						meta, _ = rpc.UpdateMetacacheListing(ctx, meta)
-					}
-				}(*c)
+				go c.keepAlive(ctx, rpc)
 			}
 		}
 	}
@@ -209,12 +205,11 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 			}
 		}()
 		o.ID = ""
-
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Resuming listing from drives failed %w, proceeding to do raw listing", err))
-		}
 	}
 
+	if contextCanceled(ctx) {
+		return entries, ctx.Err()
+	}
 	// Do listing in-place.
 	// Create output for our results.
 	// Create filter for results.
@@ -287,20 +282,21 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 	}
 	mu.Unlock()
 
-	// Do lifecycle filtering.
-	if o.Lifecycle != nil || o.Replication.Config != nil {
-		filterIn := make(chan metaCacheEntry, 10)
-		go applyBucketActions(ctx, o, filterIn, results)
-		// Replace results.
-		results = filterIn
-	}
-
 	// Gather results to a single channel.
 	// Quorum is one since we are merging across sets.
 	err := mergeEntryChannels(ctx, inputs, results, 1)
 
 	cancelList()
 	wg.Wait()
+
+	// we should return 'errs' from per disk
+	if isAllNotFound(errs) {
+		if isAllVolumeNotFound(errs) {
+			return errVolumeNotFound
+		}
+		return nil
+	}
+
 	if err != nil {
 		return err
 	}
@@ -309,19 +305,15 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 		return ctx.Err()
 	}
 
-	if isAllNotFound(errs) {
-		return nil
-	}
-
 	for _, err := range errs {
-		if err == nil || contextCanceled(ctx) {
+		if errors.Is(err, io.EOF) {
+			continue
+		}
+		if err == nil || contextCanceled(ctx) || errors.Is(err, context.Canceled) {
 			allAtEOF = false
 			continue
 		}
-		if err.Error() == io.EOF.Error() {
-			continue
-		}
-		logger.LogIf(ctx, err)
+		storageLogIf(ctx, err)
 		return err
 	}
 	if allAtEOF {
@@ -330,56 +322,50 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 	return nil
 }
 
-// applyBucketActions applies lifecycle and replication actions on the listing
-// It will filter out objects if the most recent version should be deleted by lifecycle.
-// Entries that failed replication will be queued if no lifecycle rules got applied.
-// out will be closed when there are no more results.
-// When 'in' is closed or the context is canceled the
-// function closes 'out' and exits.
-func applyBucketActions(ctx context.Context, o listPathOptions, in <-chan metaCacheEntry, out chan<- metaCacheEntry) {
-	defer close(out)
+// triggerExpiryAndRepl applies lifecycle and replication actions on the listing
+// It returns true if the listing is non-versioned and the given object is expired.
+func triggerExpiryAndRepl(ctx context.Context, o listPathOptions, obj metaCacheEntry) (skip bool) {
+	versioned := o.Versioning != nil && o.Versioning.Versioned(obj.name)
 
-	vcfg, _ := globalBucketVersioningSys.Get(o.Bucket)
-	for {
-		var obj metaCacheEntry
-		var ok bool
-		select {
-		case <-ctx.Done():
-			return
-		case obj, ok = <-in:
-			if !ok {
-				return
-			}
-		}
-
+	// skip latest object from listing only for regular
+	// listObjects calls, versioned based listing cannot
+	// filter out between versions 'obj' cannot be truncated
+	// in such a manner, so look for skipping an object only
+	// for regular ListObjects() call only.
+	if !o.Versioned && !o.V1 {
 		fi, err := obj.fileInfo(o.Bucket)
 		if err != nil {
-			continue
+			return
 		}
-
-		versioned := vcfg != nil && vcfg.Versioned(obj.name)
-
 		objInfo := fi.ToObjectInfo(o.Bucket, obj.name, versioned)
 		if o.Lifecycle != nil {
-			evt := evalActionFromLifecycle(ctx, *o.Lifecycle, o.Retention, objInfo)
-			switch evt.Action {
-			case lifecycle.DeleteVersionAction, lifecycle.DeleteAction:
-				globalExpiryState.enqueueByDays(objInfo, false, evt.Action == lifecycle.DeleteVersionAction)
-				// Skip this entry.
-				continue
-			case lifecycle.DeleteRestoredAction, lifecycle.DeleteRestoredVersionAction:
-				globalExpiryState.enqueueByDays(objInfo, true, evt.Action == lifecycle.DeleteRestoredVersionAction)
-				// Skip this entry.
-				continue
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case out <- obj:
-			queueReplicationHeal(ctx, o.Bucket, objInfo, o.Replication)
+			act := evalActionFromLifecycle(ctx, *o.Lifecycle, o.Retention, o.Replication.Config, objInfo).Action
+			skip = act.Delete() && !act.DeleteRestored()
 		}
 	}
+
+	fiv, err := obj.fileInfoVersions(o.Bucket)
+	if err != nil {
+		return
+	}
+
+	// Expire all versions if needed, if not attempt to queue for replication.
+	for _, version := range fiv.Versions {
+		objInfo := version.ToObjectInfo(o.Bucket, obj.name, versioned)
+
+		if o.Lifecycle != nil {
+			evt := evalActionFromLifecycle(ctx, *o.Lifecycle, o.Retention, o.Replication.Config, objInfo)
+			if evt.Action.Delete() {
+				globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_s3ListObjects)
+				if !evt.Action.DeleteRestored() {
+					continue
+				} // queue version for replication upon expired restored copies if needed.
+			}
+		}
+
+		queueReplicationHeal(ctx, o.Bucket, objInfo, o.Replication, 0)
+	}
+	return
 }
 
 func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions) (entries metaCacheEntriesSorted, err error) {
@@ -442,17 +428,22 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 				funcReturnedMu.Unlock()
 				outCh <- entry
 				if returned {
-					close(outCh)
+					xioutil.SafeClose(outCh)
 				}
 			}
 			entry.reusable = returned
 			saveCh <- entry
 		}
 		if !returned {
-			close(outCh)
+			xioutil.SafeClose(outCh)
 		}
-		close(saveCh)
+		xioutil.SafeClose(saveCh)
 	}()
 
-	return filteredResults()
+	entries, err = filteredResults()
+	if err == nil {
+		// Check if listing recorded an error.
+		err = meta.getErr()
+	}
+	return entries, err
 }

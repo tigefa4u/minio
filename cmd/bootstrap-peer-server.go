@@ -19,100 +19,107 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/md5"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/url"
+	"math/rand"
+	"os"
 	"reflect"
-	"runtime"
+	"strings"
+	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/minio/minio-go/v7/pkg/set"
-	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/grid"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/rest"
-	"github.com/minio/pkg/env"
-)
-
-const (
-	bootstrapRESTVersion       = "v1"
-	bootstrapRESTVersionPrefix = SlashSeparator + bootstrapRESTVersion
-	bootstrapRESTPrefix        = minioReservedBucketPath + "/bootstrap"
-	bootstrapRESTPath          = bootstrapRESTPrefix + bootstrapRESTVersionPrefix
-)
-
-const (
-	bootstrapRESTMethodHealth = "/health"
-	bootstrapRESTMethodVerify = "/verify"
+	"github.com/minio/pkg/v3/env"
 )
 
 // To abstract a node over network.
 type bootstrapRESTServer struct{}
 
+//go:generate msgp -file=$GOFILE
+
 // ServerSystemConfig - captures information about server configuration.
 type ServerSystemConfig struct {
-	MinioPlatform  string
-	MinioEndpoints EndpointServerPools
-	MinioEnv       map[string]string
+	NEndpoints int
+	CmdLines   []string
+	MinioEnv   map[string]string
+	Checksum   string
 }
 
 // Diff - returns error on first difference found in two configs.
-func (s1 ServerSystemConfig) Diff(s2 ServerSystemConfig) error {
-	if s1.MinioPlatform != s2.MinioPlatform {
-		return fmt.Errorf("Expected platform '%s', found to be running '%s'",
-			s1.MinioPlatform, s2.MinioPlatform)
+func (s1 *ServerSystemConfig) Diff(s2 *ServerSystemConfig) error {
+	if s1.Checksum != s2.Checksum {
+		return fmt.Errorf("Expected MinIO binary checksum: %s, seen: %s", s1.Checksum, s2.Checksum)
 	}
 
-	if s1.MinioEndpoints.NEndpoints() != s2.MinioEndpoints.NEndpoints() {
-		return fmt.Errorf("Expected number of endpoints %d, seen %d", s1.MinioEndpoints.NEndpoints(),
-			s2.MinioEndpoints.NEndpoints())
+	ns1 := s1.NEndpoints
+	ns2 := s2.NEndpoints
+	if ns1 != ns2 {
+		return fmt.Errorf("Expected number of endpoints %d, seen %d", ns1, ns2)
 	}
 
-	for i, ep := range s1.MinioEndpoints {
-		if ep.SetCount != s2.MinioEndpoints[i].SetCount {
-			return fmt.Errorf("Expected set count %d, seen %d", ep.SetCount,
-				s2.MinioEndpoints[i].SetCount)
-		}
-		if ep.DrivesPerSet != s2.MinioEndpoints[i].DrivesPerSet {
-			return fmt.Errorf("Expected drives pet set %d, seen %d", ep.DrivesPerSet,
-				s2.MinioEndpoints[i].DrivesPerSet)
-		}
-		for j, endpoint := range ep.Endpoints {
-			if endpoint.String() != s2.MinioEndpoints[i].Endpoints[j].String() {
-				return fmt.Errorf("Expected endpoint %s, seen %s", endpoint,
-					s2.MinioEndpoints[i].Endpoints[j])
-			}
+	for i, cmdLine := range s1.CmdLines {
+		if cmdLine != s2.CmdLines[i] {
+			return fmt.Errorf("Expected command line argument %s, seen %s", cmdLine,
+				s2.CmdLines[i])
 		}
 	}
-	if !reflect.DeepEqual(s1.MinioEnv, s2.MinioEnv) {
-		var missing []string
-		var mismatching []string
-		for k, v := range s1.MinioEnv {
-			ev, ok := s2.MinioEnv[k]
-			if !ok {
-				missing = append(missing, k)
-			} else if v != ev {
-				mismatching = append(mismatching, k)
-			}
-		}
-		if len(mismatching) > 0 {
-			return fmt.Errorf(`Expected same MINIO_ environment variables and values across all servers: Missing environment values: %s / Mismatch environment values: %s`, missing, mismatching)
-		}
-		return fmt.Errorf(`Expected same MINIO_ environment variables and values across all servers: Missing environment values: %s`, missing)
+
+	if reflect.DeepEqual(s1.MinioEnv, s2.MinioEnv) {
+		return nil
 	}
-	return nil
+
+	// Report differences in environment variables.
+	var missing []string
+	var mismatching []string
+	for k, v := range s1.MinioEnv {
+		ev, ok := s2.MinioEnv[k]
+		if !ok {
+			missing = append(missing, k)
+		} else if v != ev {
+			mismatching = append(mismatching, k)
+		}
+	}
+	var extra []string
+	for k := range s2.MinioEnv {
+		_, ok := s1.MinioEnv[k]
+		if !ok {
+			extra = append(extra, k)
+		}
+	}
+	msg := "Expected MINIO_* environment name and values across all servers to be same: "
+	if len(missing) > 0 {
+		msg += fmt.Sprintf(`Missing environment values: %v. `, missing)
+	}
+	if len(mismatching) > 0 {
+		msg += fmt.Sprintf(`Mismatching environment values: %v. `, mismatching)
+	}
+	if len(extra) > 0 {
+		msg += fmt.Sprintf(`Extra environment values: %v. `, extra)
+	}
+
+	return errors.New(strings.TrimSpace(msg))
 }
 
 var skipEnvs = map[string]struct{}{
-	"MINIO_OPTS":         {},
-	"MINIO_CERT_PASSWD":  {},
-	"MINIO_SERVER_DEBUG": {},
-	"MINIO_DSYNC_TRACE":  {},
+	"MINIO_OPTS":                   {},
+	"MINIO_CERT_PASSWD":            {},
+	"MINIO_SERVER_DEBUG":           {},
+	"MINIO_DSYNC_TRACE":            {},
+	"MINIO_ROOT_USER":              {},
+	"MINIO_ROOT_PASSWORD":          {},
+	"MINIO_ACCESS_KEY":             {},
+	"MINIO_SECRET_KEY":             {},
+	"MINIO_OPERATOR_VERSION":       {},
+	"MINIO_VSPHERE_PLUGIN_VERSION": {},
+	"MINIO_CI_CD":                  {},
 }
 
-func getServerSystemCfg() ServerSystemConfig {
+func getServerSystemCfg() *ServerSystemConfig {
 	envs := env.List("MINIO_")
 	envValues := make(map[string]string, len(envs))
 	for _, envK := range envs {
@@ -123,118 +130,137 @@ func getServerSystemCfg() ServerSystemConfig {
 		if _, ok := skipEnvs[envK]; ok {
 			continue
 		}
-		envValues[envK] = env.Get(envK, "")
+		envValues[envK] = logger.HashString(env.Get(envK, ""))
 	}
-	return ServerSystemConfig{
-		MinioPlatform:  fmt.Sprintf("OS: %s | Arch: %s", runtime.GOOS, runtime.GOARCH),
-		MinioEndpoints: globalEndpoints,
-		MinioEnv:       envValues,
+	scfg := &ServerSystemConfig{NEndpoints: globalEndpoints.NEndpoints(), MinioEnv: envValues, Checksum: binaryChecksum}
+	var cmdLines []string
+	for _, ep := range globalEndpoints {
+		cmdLines = append(cmdLines, ep.CmdLine)
 	}
+	scfg.CmdLines = cmdLines
+	return scfg
 }
 
-// HealthHandler returns success if request is valid
-func (b *bootstrapRESTServer) HealthHandler(w http.ResponseWriter, r *http.Request) {}
-
-func (b *bootstrapRESTServer) VerifyHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "VerifyHandler")
-	cfg := getServerSystemCfg()
-	logger.LogIf(ctx, json.NewEncoder(w).Encode(&cfg))
+func (s *bootstrapRESTServer) VerifyHandler(params *grid.MSS) (*ServerSystemConfig, *grid.RemoteErr) {
+	return getServerSystemCfg(), nil
 }
+
+var serverVerifyHandler = grid.NewSingleHandler[*grid.MSS, *ServerSystemConfig](grid.HandlerServerVerify, grid.NewMSS, func() *ServerSystemConfig { return &ServerSystemConfig{} })
 
 // registerBootstrapRESTHandlers - register bootstrap rest router.
-func registerBootstrapRESTHandlers(router *mux.Router) {
+func registerBootstrapRESTHandlers(gm *grid.Manager) {
 	server := &bootstrapRESTServer{}
-	subrouter := router.PathPrefix(bootstrapRESTPrefix).Subrouter()
-
-	subrouter.Methods(http.MethodPost).Path(bootstrapRESTVersionPrefix + bootstrapRESTMethodHealth).HandlerFunc(
-		httpTraceHdrs(server.HealthHandler))
-
-	subrouter.Methods(http.MethodPost).Path(bootstrapRESTVersionPrefix + bootstrapRESTMethodVerify).HandlerFunc(
-		httpTraceHdrs(server.VerifyHandler))
+	logger.FatalIf(serverVerifyHandler.Register(gm, server.VerifyHandler), "unable to register handler")
 }
 
 // client to talk to bootstrap NEndpoints.
 type bootstrapRESTClient struct {
-	endpoint   Endpoint
-	restClient *rest.Client
+	gridConn *grid.Connection
 }
 
-// Wrapper to restClient.Call to handle network errors, in case of network error the connection is marked disconnected
-// permanently. The only way to restore the connection is at the xl-sets layer by xlsets.monitorAndConnectEndpoints()
-// after verifying format.json
-func (client *bootstrapRESTClient) callWithContext(ctx context.Context, method string, values url.Values, body io.Reader, length int64) (respBody io.ReadCloser, err error) {
-	if values == nil {
-		values = make(url.Values)
+// Verify function verifies the server config.
+func (client *bootstrapRESTClient) Verify(ctx context.Context, srcCfg *ServerSystemConfig) (err error) {
+	if newObjectLayerFn() != nil {
+		return nil
 	}
 
-	respBody, err = client.restClient.Call(ctx, method, values, body, length)
-	if err == nil {
-		return respBody, nil
+	recvCfg, err := serverVerifyHandler.Call(ctx, client.gridConn, grid.NewMSS())
+	if err != nil {
+		return err
 	}
+	// We do not need the response after returning.
+	defer serverVerifyHandler.PutResponse(recvCfg)
 
-	return nil, err
+	return srcCfg.Diff(recvCfg)
 }
 
 // Stringer provides a canonicalized representation of node.
 func (client *bootstrapRESTClient) String() string {
-	return client.endpoint.String()
+	return client.gridConn.String()
 }
 
-// Verify - fetches system server config.
-func (client *bootstrapRESTClient) Verify(ctx context.Context, srcCfg ServerSystemConfig) (err error) {
-	if newObjectLayerFn() != nil {
-		return nil
-	}
-	respBody, err := client.callWithContext(ctx, bootstrapRESTMethodVerify, nil, nil, -1)
+var binaryChecksum = getBinaryChecksum()
+
+func getBinaryChecksum() string {
+	mw := md5.New()
+	binPath, err := os.Executable()
 	if err != nil {
-		return
+		logger.Error("Calculating checksum failed: %s", err)
+		return "00000000000000000000000000000000"
 	}
-	defer xhttp.DrainBody(respBody)
-	recvCfg := ServerSystemConfig{}
-	if err = json.NewDecoder(respBody).Decode(&recvCfg); err != nil {
-		return err
+	b, err := os.Open(binPath)
+	if err != nil {
+		logger.Error("Calculating checksum failed: %s", err)
+		return "00000000000000000000000000000000"
 	}
-	return srcCfg.Diff(recvCfg)
+
+	defer b.Close()
+	io.Copy(mw, b)
+	return hex.EncodeToString(mw.Sum(nil))
 }
 
-func verifyServerSystemConfig(ctx context.Context, endpointServerPools EndpointServerPools) error {
+func verifyServerSystemConfig(ctx context.Context, endpointServerPools EndpointServerPools, gm *grid.Manager) error {
 	srcCfg := getServerSystemCfg()
-	clnts := newBootstrapRESTClients(endpointServerPools)
+	clnts := newBootstrapRESTClients(endpointServerPools, gm)
 	var onlineServers int
 	var offlineEndpoints []error
 	var incorrectConfigs []error
 	var retries int
+	var mu sync.Mutex
 	for onlineServers < len(clnts)/2 {
+		var wg sync.WaitGroup
+		wg.Add(len(clnts))
+		onlineServers = 0
 		for _, clnt := range clnts {
-			if err := clnt.Verify(ctx, srcCfg); err != nil {
-				if !isNetworkError(err) {
-					logger.LogOnceIf(ctx, fmt.Errorf("%s has incorrect configuration: %w", clnt.String(), err), clnt.String())
-					incorrectConfigs = append(incorrectConfigs, fmt.Errorf("%s has incorrect configuration: %w", clnt.String(), err))
-				} else {
-					offlineEndpoints = append(offlineEndpoints, fmt.Errorf("%s is unreachable: %w", clnt.String(), err))
+			go func(clnt *bootstrapRESTClient) {
+				defer wg.Done()
+
+				if clnt.gridConn.State() != grid.StateConnected {
+					mu.Lock()
+					offlineEndpoints = append(offlineEndpoints, fmt.Errorf("%s is unreachable: %w", clnt, grid.ErrDisconnected))
+					mu.Unlock()
+					return
 				}
-				continue
-			}
-			onlineServers++
+
+				ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				defer cancel()
+
+				err := clnt.Verify(ctx, srcCfg)
+				mu.Lock()
+				if err != nil {
+					bootstrapTraceMsg(fmt.Sprintf("bootstrapVerify: %v, endpoint: %s", err, clnt))
+					if !isNetworkError(err) {
+						bootLogOnceIf(context.Background(), fmt.Errorf("%s has incorrect configuration: %w", clnt, err), "incorrect_"+clnt.String())
+						incorrectConfigs = append(incorrectConfigs, fmt.Errorf("%s has incorrect configuration: %w", clnt, err))
+					} else {
+						offlineEndpoints = append(offlineEndpoints, fmt.Errorf("%s is unreachable: %w", clnt, err))
+					}
+				} else {
+					onlineServers++
+				}
+				mu.Unlock()
+			}(clnt)
 		}
+		wg.Wait()
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			// Sleep for a while - so that we don't go into
-			// 100% CPU when half the endpoints are offline.
-			time.Sleep(100 * time.Millisecond)
+			// Sleep and stagger to avoid blocked CPU and thundering
+			// herd upon start up sequence.
+			time.Sleep(25*time.Millisecond + time.Duration(rand.Int63n(int64(100*time.Millisecond))))
 			retries++
 			// after 20 retries start logging that servers are not reachable yet
 			if retries >= 20 {
-				logger.Info(fmt.Sprintf("Waiting for atleast %d remote servers with valid configuration to be online", len(clnts)/2))
+				logger.Info(fmt.Sprintf("Waiting for at least %d remote servers with valid configuration to be online", len(clnts)/2))
 				if len(offlineEndpoints) > 0 {
 					logger.Info(fmt.Sprintf("Following servers are currently offline or unreachable %s", offlineEndpoints))
 				}
 				if len(incorrectConfigs) > 0 {
-					logger.Info(fmt.Sprintf("Following servers mismatch in their configuration %s", incorrectConfigs))
+					logger.Info(fmt.Sprintf("Following servers have mismatching configuration %s", incorrectConfigs))
 				}
-				retries = 0 // reset to log again after 5 retries.
+				retries = 0 // reset to log again after 20 retries.
 			}
 			offlineEndpoints = nil
 			incorrectConfigs = nil
@@ -243,35 +269,20 @@ func verifyServerSystemConfig(ctx context.Context, endpointServerPools EndpointS
 	return nil
 }
 
-func newBootstrapRESTClients(endpointServerPools EndpointServerPools) []*bootstrapRESTClient {
-	seenHosts := set.NewStringSet()
+func newBootstrapRESTClients(endpointServerPools EndpointServerPools, gm *grid.Manager) []*bootstrapRESTClient {
+	seenClient := set.NewStringSet()
 	var clnts []*bootstrapRESTClient
 	for _, ep := range endpointServerPools {
 		for _, endpoint := range ep.Endpoints {
-			if seenHosts.Contains(endpoint.Host) {
+			if endpoint.IsLocal {
 				continue
 			}
-			seenHosts.Add(endpoint.Host)
-
-			// Only proceed for remote endpoints.
-			if !endpoint.IsLocal {
-				clnts = append(clnts, newBootstrapRESTClient(endpoint))
+			if seenClient.Contains(endpoint.Host) {
+				continue
 			}
+			seenClient.Add(endpoint.Host)
+			clnts = append(clnts, &bootstrapRESTClient{gm.Connection(endpoint.GridHost())})
 		}
 	}
 	return clnts
-}
-
-// Returns a new bootstrap client.
-func newBootstrapRESTClient(endpoint Endpoint) *bootstrapRESTClient {
-	serverURL := &url.URL{
-		Scheme: endpoint.Scheme,
-		Host:   endpoint.Host,
-		Path:   bootstrapRESTPath,
-	}
-
-	restClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
-	restClient.HealthCheckFn = nil
-
-	return &bootstrapRESTClient{endpoint: endpoint, restClient: restClient}
 }

@@ -19,19 +19,24 @@ package cmd
 
 import (
 	"context"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/pkg/randreader"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
+	"github.com/minio/pkg/v3/randreader"
 )
 
 // SpeedTestResult return value of the speedtest function
@@ -68,7 +73,7 @@ func (f *firstByteRecorder) Read(p []byte) (n int, err error) {
 }
 
 // Runs the speedtest on local MinIO process.
-func selfSpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, error) {
+func selfSpeedTest(ctx context.Context, opts speedTestOpts) (res SpeedTestResult, err error) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
 		return SpeedTestResult{}, errServerNotInitialized
@@ -82,13 +87,8 @@ func selfSpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, er
 
 	objCountPerThread := make([]uint64, opts.concurrency)
 
-	uploadsCtx, uploadsCancel := context.WithCancel(context.Background())
+	uploadsCtx, uploadsCancel := context.WithTimeout(ctx, opts.duration)
 	defer uploadsCancel()
-
-	go func() {
-		time.Sleep(opts.duration)
-		uploadsCancel()
-	}()
 
 	objNamePrefix := pathJoin(speedTest, mustGetUUID())
 
@@ -96,8 +96,25 @@ func selfSpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, er
 	userMetadata[globalObjectPerfUserMetadata] = "true" // Bypass S3 API freeze
 	popts := minio.PutObjectOptions{
 		UserMetadata:         userMetadata,
-		DisableContentSha256: true,
-		DisableMultipart:     true,
+		DisableContentSha256: !opts.enableSha256,
+		DisableMultipart:     !opts.enableMultipart,
+	}
+
+	clnt := globalMinioClient
+	if !globalAPIConfig.permitRootAccess() {
+		region := globalSite.Region()
+		if region == "" {
+			region = "us-east-1"
+		}
+		clnt, err = minio.New(globalLocalNodeName, &minio.Options{
+			Creds:     credentials.NewStaticV4(opts.creds.AccessKey, opts.creds.SecretKey, opts.creds.SessionToken),
+			Secure:    globalIsTLS,
+			Transport: globalRemoteTargetTransport,
+			Region:    region,
+		})
+		if err != nil {
+			return res, err
+		}
 	}
 
 	var mu sync.Mutex
@@ -110,7 +127,7 @@ func selfSpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, er
 				t := time.Now()
 				reader := newRandomReader(opts.objectSize)
 				tmpObjName := pathJoin(objNamePrefix, fmt.Sprintf("%d/%d", i, objCountPerThread[i]))
-				info, err := globalMinioClient.PutObject(uploadsCtx, opts.bucketName, tmpObjName, reader, int64(opts.objectSize), popts)
+				info, err := clnt.PutObject(uploadsCtx, opts.bucketName, tmpObjName, reader, int64(opts.objectSize), popts)
 				if err != nil {
 					if !contextCanceled(uploadsCtx) && !errors.Is(err, context.Canceled) {
 						errOnce.Do(func() {
@@ -141,12 +158,8 @@ func selfSpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, er
 		}, nil
 	}
 
-	downloadsCtx, downloadsCancel := context.WithCancel(context.Background())
+	downloadsCtx, downloadsCancel := context.WithTimeout(ctx, opts.duration)
 	defer downloadsCancel()
-	go func() {
-		time.Sleep(opts.duration)
-		downloadsCancel()
-	}()
 
 	gopts := minio.GetObjectOptions{}
 	gopts.Set(globalObjectPerfUserMetadata, "true") // Bypass S3 API freeze
@@ -154,6 +167,8 @@ func selfSpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, er
 	var downloadTimes madmin.TimeDurations
 	var downloadTTFB madmin.TimeDurations
 	wg.Add(opts.concurrency)
+
+	c := minio.Core{Client: clnt}
 	for i := 0; i < opts.concurrency; i++ {
 		go func(i int) {
 			defer wg.Done()
@@ -167,7 +182,8 @@ func selfSpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, er
 				}
 				tmpObjName := pathJoin(objNamePrefix, fmt.Sprintf("%d/%d", i, j))
 				t := time.Now()
-				r, err := globalMinioClient.GetObject(downloadsCtx, opts.bucketName, tmpObjName, gopts)
+
+				r, _, _, err := c.GetObject(downloadsCtx, opts.bucketName, tmpObjName, gopts)
 				if err != nil {
 					errResp, ok := err.(minio.ErrorResponse)
 					if ok && errResp.StatusCode == http.StatusNotFound {
@@ -184,7 +200,7 @@ func selfSpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, er
 				fbr := firstByteRecorder{
 					r: r,
 				}
-				n, err := io.Copy(io.Discard, &fbr)
+				n, err := xioutil.Copy(xioutil.Discard, &fbr)
 				r.Close()
 				if err == nil {
 					response := time.Since(t)
@@ -240,7 +256,7 @@ func (n *netPerfRX) Connect() {
 	n.Lock()
 	defer n.Unlock()
 	n.activeConnections++
-	atomic.StoreUint64(&globalNetPerfRX.RX, 0)
+	atomic.StoreUint64(&n.RX, 0)
 	n.lastToConnect = time.Now()
 }
 
@@ -312,7 +328,7 @@ func netperf(ctx context.Context, duration time.Duration) madmin.NetperfNodeResu
 					defer wg.Done()
 					err := globalNotificationSys.peerClients[index].DevNull(ctx, r)
 					if err != nil {
-						errStr = err.Error()
+						errStr = fmt.Sprintf("error with %s: %s", globalNotificationSys.peerClients[index].String(), err.Error())
 					}
 				}()
 			}
@@ -320,7 +336,7 @@ func netperf(ctx context.Context, duration time.Duration) madmin.NetperfNodeResu
 	}
 
 	time.Sleep(duration)
-	close(r.eof)
+	xioutil.SafeClose(r.eof)
 	wg.Wait()
 	for {
 		if globalNetPerfRX.ActiveConnections() == 0 {
@@ -337,4 +353,109 @@ func netperf(ctx context.Context, duration time.Duration) madmin.NetperfNodeResu
 
 	globalNetPerfRX.Reset()
 	return madmin.NetperfNodeResult{Endpoint: "", TX: r.n / uint64(duration.Seconds()), RX: uint64(rx / delta.Seconds()), Error: errStr}
+}
+
+func siteNetperf(ctx context.Context, duration time.Duration) madmin.SiteNetPerfNodeResult {
+	r := &netperfReader{eof: make(chan struct{})}
+	r.buf = make([]byte, 128*humanize.KiByte)
+	rand.Read(r.buf)
+
+	clusterInfos, err := globalSiteReplicationSys.GetClusterInfo(ctx)
+	if err != nil {
+		return madmin.SiteNetPerfNodeResult{Error: err.Error()}
+	}
+
+	// Scale the number of connections from 32 -> 4 from small to large clusters.
+	connectionsPerPeer := 3 + (29+len(clusterInfos.Sites)-1)/len(clusterInfos.Sites)
+
+	errStr := ""
+	var wg sync.WaitGroup
+
+	for _, info := range clusterInfos.Sites {
+		// skip self
+		if globalDeploymentID() == info.DeploymentID {
+			continue
+		}
+		info := info
+		wg.Add(connectionsPerPeer)
+		for i := 0; i < connectionsPerPeer; i++ {
+			go func() {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(ctx, duration+10*time.Second)
+				defer cancel()
+				perfNetRequest(
+					ctx,
+					info.DeploymentID,
+					adminPathPrefix+adminAPIVersionPrefix+adminAPISiteReplicationDevNull,
+					r,
+				)
+			}()
+		}
+	}
+
+	time.Sleep(duration)
+	xioutil.SafeClose(r.eof)
+	wg.Wait()
+	for {
+		if globalSiteNetPerfRX.ActiveConnections() == 0 || contextCanceled(ctx) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	rx := float64(globalSiteNetPerfRX.RXSample)
+	delta := globalSiteNetPerfRX.firstToDisconnect.Sub(globalSiteNetPerfRX.lastToConnect)
+	// If the first disconnected before the last connected, we likely had a network issue.
+	if delta <= 0 {
+		rx = 0
+		errStr = "detected network disconnections, possibly an unstable network"
+	}
+
+	globalSiteNetPerfRX.Reset()
+	return madmin.SiteNetPerfNodeResult{
+		Endpoint:        "",
+		TX:              r.n,
+		TXTotalDuration: duration,
+		RX:              uint64(rx),
+		RXTotalDuration: delta,
+		Error:           errStr,
+		TotalConn:       uint64(connectionsPerPeer),
+	}
+}
+
+// perfNetRequest - reader for http.request.body
+func perfNetRequest(ctx context.Context, deploymentID, reqPath string, reader io.Reader) (result madmin.SiteNetPerfNodeResult) {
+	result = madmin.SiteNetPerfNodeResult{}
+	cli, err := globalSiteReplicationSys.getAdminClient(ctx, deploymentID)
+	if err != nil {
+		result.Error = err.Error()
+		return
+	}
+	rp := cli.GetEndpointURL()
+	reqURL := &url.URL{
+		Scheme: rp.Scheme,
+		Host:   rp.Host,
+		Path:   reqPath,
+	}
+	result.Endpoint = rp.String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL.String(), reader)
+	if err != nil {
+		result.Error = err.Error()
+		return
+	}
+	client := &http.Client{
+		Transport: globalRemoteTargetTransport,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		result.Error = err.Error()
+		return
+	}
+	defer xhttp.DrainBody(resp.Body)
+	err = gob.NewDecoder(resp.Body).Decode(&result)
+	// endpoint have been overwritten
+	result.Endpoint = rp.String()
+	if err != nil {
+		result.Error = err.Error()
+	}
+	return
 }

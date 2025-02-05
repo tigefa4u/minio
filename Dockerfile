@@ -1,8 +1,8 @@
 FROM minio/minio:latest
 
-ENV PATH=/opt/bin:$PATH
+RUN chmod -R 777 /usr/bin
 
-COPY ./minio /opt/bin/minio
+COPY ./minio /usr/bin/minio
 COPY dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
 
 ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]

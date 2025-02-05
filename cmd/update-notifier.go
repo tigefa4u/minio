@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"fmt"
-	"math"
 	"runtime"
 	"strings"
 	"time"
@@ -39,9 +38,9 @@ func prepareUpdateMessage(downloadURL string, older time.Duration) string {
 	// Compute friendly duration string to indicate time
 	// difference between newer and current release.
 	t := time.Time{}
-	newerThan := humanize.RelTime(t, t.Add(older), "ago", "")
+	newerThan := humanize.RelTime(t, t.Add(older), "before the latest release", "")
 
-	if globalCLIContext.JSON {
+	if globalServerCtxt.JSON {
 		return fmt.Sprintf("You are running an older version of MinIO released %s, update: %s", newerThan, downloadURL)
 	}
 
@@ -64,7 +63,7 @@ func colorizeUpdateMessage(updateString string, newerThan string) string {
 	line2InColor := fmt.Sprintf(msgLine2Fmt, color.CyanBold(updateString))
 
 	// calculate the rectangular box size.
-	maxContentWidth := int(math.Max(float64(line1Length), float64(line2Length)))
+	maxContentWidth := max(line1Length, line2Length)
 
 	// termWidth is set to a default one to use when we are
 	// not able to calculate terminal width via OS syscalls
@@ -96,8 +95,8 @@ func colorizeUpdateMessage(updateString string, newerThan string) string {
 
 	lines := []string{
 		color.YellowBold(topLeftChar + strings.Repeat(horizBarChar, maxContentWidth) + topRightChar),
-		vertBarChar + line1InColor + strings.Repeat(" ", maxContentWidth-line1Length) + vertBarChar,
-		vertBarChar + line2InColor + strings.Repeat(" ", maxContentWidth-line2Length) + vertBarChar,
+		color.YellowBold(vertBarChar) + line1InColor + strings.Repeat(" ", maxContentWidth-line1Length) + color.YellowBold(vertBarChar),
+		color.YellowBold(vertBarChar) + line2InColor + strings.Repeat(" ", maxContentWidth-line2Length) + color.YellowBold(vertBarChar),
 		color.YellowBold(bottomLeftChar + strings.Repeat(horizBarChar, maxContentWidth) + bottomRightChar),
 	}
 	return "\n" + strings.Join(lines, "\n") + "\n"

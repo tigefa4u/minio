@@ -84,7 +84,7 @@ func TestParseLegalHoldStatus(t *testing.T) {
 }
 
 // TestUnmarshalDefaultRetention checks if default retention
-// marshaling and unmarshaling work as expected
+// marshaling and unmarshalling work as expected
 func TestUnmarshalDefaultRetention(t *testing.T) {
 	days := uint64(4)
 	years := uint64(1)
@@ -606,8 +606,77 @@ func TestFilterObjectLockMetadata(t *testing.T) {
 
 	for i, tt := range tests {
 		o := FilterObjectLockMetadata(tt.metadata, tt.filterRetention, tt.filterLegalHold)
-		if !reflect.DeepEqual(o, tt.metadata) {
+		if !reflect.DeepEqual(o, tt.expected) {
 			t.Fatalf("Case %d expected %v, got %v", i, tt.metadata, o)
+		}
+	}
+}
+
+func TestToString(t *testing.T) {
+	days := uint64(30)
+	daysPtr := &days
+	years := uint64(2)
+	yearsPtr := &years
+
+	tests := []struct {
+		name string
+		c    Config
+		want string
+	}{
+		{
+			name: "happy case",
+			c: Config{
+				ObjectLockEnabled: "Enabled",
+			},
+			want: "Enabled: true",
+		},
+		{
+			name: "with default retention days",
+			c: Config{
+				ObjectLockEnabled: "Enabled",
+				Rule: &struct {
+					DefaultRetention DefaultRetention `xml:"DefaultRetention"`
+				}{
+					DefaultRetention: DefaultRetention{
+						Mode: RetGovernance,
+						Days: daysPtr,
+					},
+				},
+			},
+			want: "Enabled: true, Mode: GOVERNANCE, Days: 30",
+		},
+		{
+			name: "with default retention years",
+			c: Config{
+				ObjectLockEnabled: "Enabled",
+				Rule: &struct {
+					DefaultRetention DefaultRetention `xml:"DefaultRetention"`
+				}{
+					DefaultRetention: DefaultRetention{
+						Mode:  RetCompliance,
+						Years: yearsPtr,
+					},
+				},
+			},
+			want: "Enabled: true, Mode: COMPLIANCE, Years: 2",
+		},
+		{
+			name: "disabled case",
+			c: Config{
+				ObjectLockEnabled: "Disabled",
+			},
+			want: "Enabled: false",
+		},
+		{
+			name: "empty case",
+			c:    Config{},
+			want: "Enabled: false",
+		},
+	}
+	for _, tt := range tests {
+		got := tt.c.String()
+		if got != tt.want {
+			t.Errorf("test: %s, got: '%v', want: '%v'", tt.name, got, tt.want)
 		}
 	}
 }

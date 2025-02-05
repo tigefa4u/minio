@@ -28,18 +28,9 @@ const (
 	queueLimitComment = `maximum limit for undelivered messages, defaults to '100000'`
 )
 
-var enableHelp = config.HelpKV{
-	Key:         config.Enable,
-	Description: "Enable or disable notifications",
-	Type:        "on|off",
-	Sensitive:   false,
-	Optional:    true,
-}
-
 // Help template inputs for all notification targets
 var (
 	HelpWebhook = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.WebhookEndpoint,
 			Description: "webhook server endpoint e.g. http://localhost:8080/minio/events",
@@ -52,6 +43,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.WebhookQueueDir,
@@ -88,7 +80,6 @@ var (
 	}
 
 	HelpAMQP = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.AmqpURL,
 			Description: "AMQP server endpoint e.g. `amqp://myuser:mypassword@localhost:5672`",
@@ -152,7 +143,7 @@ var (
 		},
 		config.HelpKV{
 			Key:         target.AmqpPublisherConfirms,
-			Description: "enable consumer acknowlegement and publisher confirms, use this along with queue_dir for guaranteed delivery of all events",
+			Description: "enable consumer acknowledgement and publisher confirms, use this along with queue_dir for guaranteed delivery of all events",
 			Optional:    true,
 			Type:        "on|off",
 		},
@@ -177,7 +168,6 @@ var (
 	}
 
 	HelpKafka = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.KafkaBrokers,
 			Description: "comma separated list of Kafka broker addresses",
@@ -202,6 +192,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.KafkaSASLMechanism,
@@ -271,10 +262,33 @@ var (
 			Optional:    true,
 			Type:        "sentence",
 		},
+		config.HelpKV{
+			Key:         target.KafkaCompressionCodec,
+			Description: "specify compression_codec of the Kafka cluster",
+			Optional:    true,
+			Type:        "none|snappy|gzip|lz4|zstd",
+		},
+		config.HelpKV{
+			Key:         target.KafkaCompressionLevel,
+			Description: "specify compression level of the Kafka cluster",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         target.KafkaBatchSize,
+			Description: "batch size of the events; used only when queue_dir is set",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         target.KafkaBatchCommitTimeout,
+			Description: "commit timeout set for the batch; used only when batch_size > 1",
+			Optional:    true,
+			Type:        "duration",
+		},
 	}
 
 	HelpMQTT = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.MqttBroker,
 			Description: "MQTT server endpoint e.g. `tcp://localhost:1883`",
@@ -299,6 +313,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.MqttQoS,
@@ -339,7 +354,6 @@ var (
 	}
 
 	HelpPostgres = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.PostgresConnectionString,
 			Description: `Postgres server connection-string e.g. "host=localhost port=5432 dbname=minio_events user=postgres password=password sslmode=disable"`,
@@ -383,7 +397,6 @@ var (
 	}
 
 	HelpMySQL = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.MySQLDSNString,
 			Description: `MySQL data-source-name connection string e.g. "<user>:<password>@tcp(<host>:<port>)/<database>"`,
@@ -428,7 +441,6 @@ var (
 	}
 
 	HelpNATS = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.NATSAddress,
 			Description: "NATS server address e.g. '0.0.0.0:4222'",
@@ -453,6 +465,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.NATSToken,
@@ -460,6 +473,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         target.NATSTLS,
@@ -551,7 +565,6 @@ var (
 	}
 
 	HelpNSQ = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.NSQAddress,
 			Description: "NSQ server address e.g. '127.0.0.1:4150'",
@@ -596,7 +609,6 @@ var (
 	}
 
 	HelpES = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.ElasticURL,
 			Description: "Elasticsearch server's address, with optional authentication info",
@@ -638,6 +650,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         config.Comment,
@@ -648,7 +661,6 @@ var (
 	}
 
 	HelpRedis = config.HelpKVS{
-		enableHelp,
 		config.HelpKV{
 			Key:         target.RedisAddress,
 			Description: "Redis server's address. For example: `localhost:6379`",
@@ -672,6 +684,13 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
+		},
+		config.HelpKV{
+			Key:         target.RedisUser,
+			Description: "Redis server user for the auth",
+			Optional:    true,
+			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         target.RedisQueueDir,

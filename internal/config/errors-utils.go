@@ -58,9 +58,20 @@ func (u Err) Error() string {
 }
 
 // Msg - Replace the current error's message
-func (u Err) Msg(m string, args ...interface{}) Err {
+func (u Err) Msg(m string) Err {
 	e := u.Clone()
-	e.msg = fmt.Sprintf(m, args...)
+	e.msg = m
+	return e
+}
+
+// Msgf - Replace the current error's message
+func (u Err) Msgf(m string, args ...interface{}) Err {
+	e := u.Clone()
+	if len(args) == 0 {
+		e.msg = m
+	} else {
+		e.msg = fmt.Sprintf(m, args...)
+	}
 	return e
 }
 
@@ -107,9 +118,8 @@ func ErrorToErr(err error) Err {
 	if errors.Is(err, syscall.EADDRINUSE) {
 		return ErrPortAlreadyInUse(err).Msg("Specified port is already in use")
 	} else if errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
-		switch err.(type) {
-		case *net.OpError:
-			return ErrPortAccess(err).Msg("Insufficient permissions to use specified port")
+		if netErr, ok := err.(*net.OpError); ok {
+			return ErrPortAccess(netErr).Msg("Insufficient permissions to use specified port")
 		}
 	}
 

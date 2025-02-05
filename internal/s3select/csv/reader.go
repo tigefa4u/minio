@@ -69,7 +69,7 @@ func (r *Reader) Read(dst sql.Record) (sql.Record, error) {
 			r.err = io.EOF
 			return nil, r.err
 		}
-		//lint:ignore SA6002 Using pointer would allocate more since we would have to copy slice header before taking a pointer.
+		//nolint:staticcheck // SA6002 Using pointer would allocate more since we would have to copy slice header before taking a pointer.
 		r.csvDstPool.Put(r.current)
 		r.current = <-item.dst
 		r.err = item.err
@@ -269,7 +269,7 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 					in.err = err
 				}
 				// We don't need the input any more.
-				//lint:ignore SA6002 Using pointer would allocate more since we would have to copy slice header before taking a pointer.
+				//nolint:staticcheck // SA6002 Using pointer would allocate more since we would have to copy slice header before taking a pointer.
 				r.bufferPool.Put(in.input)
 				in.input = nil
 				in.dst <- all
@@ -307,7 +307,7 @@ func NewReader(readCloser io.ReadCloser, args *ReaderArgs) (*Reader, error) {
 		ret.Comment = []rune(args.CommentCharacter)[0]
 		ret.Quote = []rune{}
 		if len([]rune(args.QuoteCharacter)) > 0 {
-			// Add the first rune of args.QuoteChracter
+			// Add the first rune of args.QuoteCharacter
 			ret.Quote = append(ret.Quote, []rune(args.QuoteCharacter)[0])
 		}
 		ret.QuoteEscape = []rune(args.QuoteEscapeCharacter)[0]

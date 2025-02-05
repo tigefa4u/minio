@@ -20,18 +20,20 @@ package console
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/logger/message/log"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/logger/message/log"
 )
 
 // Target implements loggerTarget to send log
 // in plain or json format to the standard output.
-type Target struct{}
+type Target struct {
+	output io.Writer
+}
 
 // Validate - validate if the tty can be written to
 func (c *Target) Validate() error {
@@ -48,7 +50,7 @@ func (c *Target) String() string {
 }
 
 // Send log message 'e' to console
-func (c *Target) Send(e interface{}, logKind string) error {
+func (c *Target) Send(e interface{}) error {
 	entry, ok := e.(log.Entry)
 	if !ok {
 		return fmt.Errorf("Uexpected log entry structure %#v", e)
@@ -58,7 +60,12 @@ func (c *Target) Send(e interface{}, logKind string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println(string(logJSON))
+		fmt.Fprintln(c.output, string(logJSON))
+		return nil
+	}
+
+	if entry.Level == logger.EventKind {
+		fmt.Fprintln(c.output, entry.Message)
 		return nil
 	}
 
@@ -83,22 +90,25 @@ func (c *Target) Send(e interface{}, logKind string) error {
 
 	var apiString string
 	if entry.API != nil {
-		apiString = "API: " + entry.API.Name + "("
+		apiString = "API: " + entry.API.Name
 		if entry.API.Args != nil {
+			args := ""
 			if entry.API.Args.Bucket != "" {
-				apiString = apiString + "bucket=" + entry.API.Args.Bucket
+				args = args + "bucket=" + entry.API.Args.Bucket
 			}
 			if entry.API.Args.Object != "" {
-				apiString = apiString + ", object=" + entry.API.Args.Object
+				args = args + ", object=" + entry.API.Args.Object
 			}
 			if entry.API.Args.VersionID != "" {
-				apiString = apiString + ", versionId=" + entry.API.Args.VersionID
+				args = args + ", versionId=" + entry.API.Args.VersionID
 			}
 			if len(entry.API.Args.Objects) > 0 {
-				apiString = apiString + ", multiObject=true, numberOfObjects=" + strconv.Itoa(len(entry.API.Args.Objects))
+				args = args + ", multiObject=true, numberOfObjects=" + strconv.Itoa(len(entry.API.Args.Objects))
+			}
+			if len(args) > 0 {
+				apiString += "(" + args + ")"
 			}
 		}
-		apiString += ")"
 	} else {
 		apiString = "INTERNAL"
 	}
@@ -138,13 +148,13 @@ func (c *Target) Send(e interface{}, logKind string) error {
 		apiString, timeString, deploymentID, requestID, remoteHost, host, userAgent,
 		msg, tagString, strings.Join(trace, "\n"))
 
-	console.Println(output)
+	fmt.Fprintln(c.output, output)
 	return nil
 }
 
 // New initializes a new logger target
 // which prints log directly in the standard
 // output.
-func New() *Target {
-	return &Target{}
+func New(w io.Writer) *Target {
+	return &Target{output: w}
 }

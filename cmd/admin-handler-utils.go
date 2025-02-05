@@ -23,18 +23,18 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/minio/kes"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/kms-go/kes"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // validateAdminReq will validate request against and return whether it is allowed.
 // If any of the supplied actions are allowed it will be successful.
 // If nil ObjectLayer is returned, the operation is not permitted.
 // When nil ObjectLayer has been returned an error has always been sent to w.
-func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Request, actions ...iampolicy.AdminAction) (ObjectLayer, auth.Credentials) {
+func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Request, actions ...policy.AdminAction) (ObjectLayer, auth.Credentials) {
 	// Get current object layer instance.
 	objectAPI := newObjectLayerFn()
 	if objectAPI == nil || globalNotificationSys == nil {
@@ -78,7 +78,7 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 
 	var apiErr APIError
 	switch e := err.(type) {
-	case iampolicy.Error:
+	case policy.Error:
 		apiErr = APIError{
 			Code:           "XMinioMalformedIAMPolicy",
 			Description:    e.Error(),
@@ -154,15 +154,9 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusForbidden,
 			}
-		case errors.Is(err, errIAMServiceAccount):
+		case errors.Is(err, errIAMServiceAccountNotAllowed):
 			apiErr = APIError{
-				Code:           "XMinioIAMServiceAccount",
-				Description:    err.Error(),
-				HTTPStatusCode: http.StatusBadRequest,
-			}
-		case errors.Is(err, errIAMServiceAccountUsed):
-			apiErr = APIError{
-				Code:           "XMinioIAMServiceAccountUsed",
+				Code:           "XMinioIAMServiceAccountNotAllowed",
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
@@ -174,8 +168,14 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 			}
 		case errors.Is(err, errPolicyInUse):
 			apiErr = APIError{
-				Code:           "XMinioAdminPolicyInUse",
+				Code:           "XMinioIAMPolicyInUse",
 				Description:    "The policy cannot be removed, as it is in use",
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case errors.Is(err, errSessionPolicyTooLarge):
+			apiErr = APIError{
+				Code:           "XMinioIAMServiceAccountSessionPolicyTooLarge",
+				Description:    err.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
 		case errors.Is(err, kes.ErrKeyExists):
@@ -216,6 +216,12 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
+		case errors.Is(err, errTierInvalidConfig):
+			apiErr = APIError{
+				Code:           "XMinioAdminTierInvalidConfig",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
 		default:
 			apiErr = errorCodes.ToAPIErrWithErr(toAdminAPIErrCode(ctx, err), err)
 		}
@@ -226,12 +232,10 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 // toAdminAPIErrCode - converts errErasureWriteQuorum error to admin API
 // specific error.
 func toAdminAPIErrCode(ctx context.Context, err error) APIErrorCode {
-	switch err {
-	case errErasureWriteQuorum:
+	if errors.Is(err, errErasureWriteQuorum) {
 		return ErrAdminConfigNoQuorum
-	default:
-		return toAPIErrorCode(ctx, err)
 	}
+	return toAPIErrorCode(ctx, err)
 }
 
 // wraps export error for more context

@@ -106,8 +106,8 @@ func (ssekms) IsEncrypted(metadata map[string]string) bool {
 // UnsealObjectKey extracts and decrypts the sealed object key
 // from the metadata using KMS and returns the decrypted object
 // key.
-func (s3 ssekms) UnsealObjectKey(KMS kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
-	if KMS == nil {
+func (s3 ssekms) UnsealObjectKey(k *kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	if k == nil {
 		return key, Errorf("KMS not configured")
 	}
 
@@ -120,7 +120,11 @@ func (s3 ssekms) UnsealObjectKey(KMS kms.KMS, metadata map[string]string, bucket
 	} else if _, ok := ctx[bucket]; !ok {
 		ctx[bucket] = path.Join(bucket, object)
 	}
-	unsealKey, err := KMS.DecryptKey(keyID, kmsKey, ctx)
+	unsealKey, err := k.Decrypt(context.TODO(), &kms.DecryptRequest{
+		Name:           keyID,
+		Ciphertext:     kmsKey,
+		AssociatedData: ctx,
+	})
 	if err != nil {
 		return key, err
 	}
@@ -137,7 +141,7 @@ func (ssekms) CreateMetadata(metadata map[string]string, keyID string, kmsKey []
 		logger.CriticalIf(context.Background(), Errorf("The seal algorithm '%s' is invalid for SSE-S3", sealedKey.Algorithm))
 	}
 
-	// There are two possibilites:
+	// There are two possibilities:
 	// - We use a KMS -> There must be non-empty key ID and a KMS data key.
 	// - We use a K/V -> There must be no key ID and no KMS data key.
 	// Otherwise, the caller has passed an invalid argument combination.
@@ -187,7 +191,7 @@ func (ssekms) ParseMetadata(metadata map[string]string) (keyID string, kmsKey []
 		return keyID, kmsKey, sealedKey, ctx, Errorf("The object metadata is missing the internal sealed key for SSE-S3")
 	}
 
-	// There are two possibilites:
+	// There are two possibilities:
 	// - We use a KMS -> There must be a key ID and a KMS data key.
 	// - We use a K/V -> There must be no key ID and no KMS data key.
 	// Otherwise, the metadata is corrupted.

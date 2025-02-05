@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -26,15 +26,19 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "github.com/lib/pq" // Register postgres driver
 
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/minio/internal/once"
+	"github.com/minio/minio/internal/store"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 const (
@@ -99,6 +103,10 @@ func (p PostgreSQLArgs) Validate() error {
 	if p.Table == "" {
 		return fmt.Errorf("empty table name")
 	}
+	if err := validatePsqlTableName(p.Table); err != nil {
+		return err
+	}
+
 	if p.Format != "" {
 		f := strings.ToLower(p.Format)
 		if f != event.NamespaceFormat && f != event.AccessFormat {
@@ -137,7 +145,7 @@ func (p PostgreSQLArgs) Validate() error {
 
 // PostgreSQLTarget - PostgreSQL target.
 type PostgreSQLTarget struct {
-	lazyInit lazyInit
+	initOnce once.Init
 
 	id         event.TargetID
 	args       PostgreSQLArgs
@@ -145,7 +153,7 @@ type PostgreSQLTarget struct {
 	deleteStmt *sql.Stmt
 	insertStmt *sql.Stmt
 	db         *sql.DB
-	store      Store
+	store      store.Store[event.Event]
 	firstPing  bool
 	connString string
 	loggerOnce logger.LogOnce
@@ -155,6 +163,11 @@ type PostgreSQLTarget struct {
 // ID - returns target ID.
 func (target *PostgreSQLTarget) ID() event.TargetID {
 	return target.id
+}
+
+// Name - returns the Name of the target.
+func (target *PostgreSQLTarget) Name() string {
+	return target.ID().String()
 }
 
 // Store returns any underlying store if set.
@@ -173,7 +186,7 @@ func (target *PostgreSQLTarget) IsActive() (bool, error) {
 func (target *PostgreSQLTarget) isActive() (bool, error) {
 	if err := target.db.Ping(); err != nil {
 		if IsConnErr(err) {
-			return false, errNotConnected
+			return false, store.ErrNotConnected
 		}
 		return false, err
 	}
@@ -182,13 +195,15 @@ func (target *PostgreSQLTarget) isActive() (bool, error) {
 
 // Save - saves the events to the store if questore is configured, which will be replayed when the PostgreSQL connection is active.
 func (target *PostgreSQLTarget) Save(eventData event.Event) error {
+	if target.store != nil {
+		_, err := target.store.Put(eventData)
+		return err
+	}
+
 	if err := target.init(); err != nil {
 		return err
 	}
 
-	if target.store != nil {
-		return target.store.Put(eventData)
-	}
 	_, err := target.isActive()
 	if err != nil {
 		return err
@@ -198,7 +213,7 @@ func (target *PostgreSQLTarget) Save(eventData event.Event) error {
 
 // IsConnErr - To detect a connection error.
 func IsConnErr(err error) bool {
-	return IsConnRefusedErr(err) || err.Error() == "sql: database is closed" || err.Error() == "sql: statement is closed" || err.Error() == "invalid connection"
+	return xnet.IsConnRefusedErr(err) || err.Error() == "sql: database is closed" || err.Error() == "sql: statement is closed" || err.Error() == "invalid connection"
 }
 
 // send - sends an event to the PostgreSQL.
@@ -242,8 +257,8 @@ func (target *PostgreSQLTarget) send(eventData event.Event) error {
 	return nil
 }
 
-// Send - reads an event from store and sends it to PostgreSQL.
-func (target *PostgreSQLTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to PostgreSQL.
+func (target *PostgreSQLTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
@@ -255,13 +270,13 @@ func (target *PostgreSQLTarget) Send(eventKey string) error {
 	if !target.firstPing {
 		if err := target.executeStmts(); err != nil {
 			if IsConnErr(err) {
-				return errNotConnected
+				return store.ErrNotConnected
 			}
 			return err
 		}
 	}
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and wouldve been already been sent successfully.
@@ -273,13 +288,13 @@ func (target *PostgreSQLTarget) Send(eventKey string) error {
 
 	if err := target.send(eventData); err != nil {
 		if IsConnErr(err) {
-			return errNotConnected
+			return store.ErrNotConnected
 		}
 		return err
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - closes underneath connections to PostgreSQL database.
@@ -300,7 +315,11 @@ func (target *PostgreSQLTarget) Close() error {
 		_ = target.insertStmt.Close()
 	}
 
-	return target.db.Close()
+	if target.db != nil {
+		target.db.Close()
+	}
+
+	return nil
 }
 
 // Executes the table creation statements.
@@ -338,7 +357,7 @@ func (target *PostgreSQLTarget) executeStmts() error {
 }
 
 func (target *PostgreSQLTarget) init() error {
-	return target.lazyInit.Do(target.initPostgreSQL)
+	return target.initOnce.Do(target.initPostgreSQL)
 }
 
 func (target *PostgreSQLTarget) initPostgreSQL() error {
@@ -357,7 +376,7 @@ func (target *PostgreSQLTarget) initPostgreSQL() error {
 
 	err = target.db.Ping()
 	if err != nil {
-		if !(IsConnRefusedErr(err) || IsConnResetErr(err)) {
+		if !(xnet.IsConnRefusedErr(err) || xnet.IsConnResetErr(err)) {
 			target.loggerOnce(context.Background(), err, target.ID().String())
 		}
 	} else {
@@ -378,7 +397,7 @@ func (target *PostgreSQLTarget) initPostgreSQL() error {
 		return err
 	}
 	if !yes {
-		return errNotConnected
+		return store.ErrNotConnected
 	}
 
 	return nil
@@ -407,11 +426,11 @@ func NewPostgreSQLTarget(id string, args PostgreSQLArgs, loggerOnce logger.LogOn
 	}
 	connStr := strings.Join(params, " ")
 
-	var store Store
+	var queueStore store.Store[event.Event]
 	if args.QueueDir != "" {
 		queueDir := filepath.Join(args.QueueDir, storePrefix+"-postgresql-"+id)
-		store = NewQueueStore(queueDir, args.QueueLimit)
-		if err := store.Open(); err != nil {
+		queueStore = store.NewQueueStore[event.Event](queueDir, args.QueueLimit, event.StoreExtension)
+		if err := queueStore.Open(); err != nil {
 			return nil, fmt.Errorf("unable to initialize the queue store of PostgreSQL `%s`: %w", id, err)
 		}
 	}
@@ -420,15 +439,55 @@ func NewPostgreSQLTarget(id string, args PostgreSQLArgs, loggerOnce logger.LogOn
 		id:         event.TargetID{ID: id, Name: "postgresql"},
 		args:       args,
 		firstPing:  false,
-		store:      store,
+		store:      queueStore,
 		connString: connStr,
 		loggerOnce: loggerOnce,
 		quitCh:     make(chan struct{}),
 	}
 
 	if target.store != nil {
-		streamEventsFromStore(target.store, target, target.quitCh, target.loggerOnce)
+		store.StreamItems(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
 	return target, nil
+}
+
+var errInvalidPsqlTablename = errors.New("invalid PostgreSQL table")
+
+func validatePsqlTableName(name string) error {
+	// check for quoted string (string may not contain a quote)
+	if match, err := regexp.MatchString("^\"[^\"]+\"$", name); err != nil {
+		return err
+	} else if match {
+		return nil
+	}
+
+	// normalize the name to letters, digits, _ or $
+	valid := true
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsLetter(r):
+			return 'a'
+		case unicode.IsDigit(r):
+			return '0'
+		case r == '_', r == '$':
+			return r
+		default:
+			valid = false
+			return -1
+		}
+	}, name)
+
+	if valid {
+		// check for simple name or quoted name
+		// - letter/underscore followed by one or more letter/digit/underscore
+		// - any text between quotes (text cannot contain a quote itself)
+		if match, err := regexp.MatchString("^[a_][a0_$]*$", cleaned); err != nil {
+			return err
+		} else if match {
+			return nil
+		}
+	}
+
+	return errInvalidPsqlTablename
 }
